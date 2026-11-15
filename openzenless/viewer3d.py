@@ -301,10 +301,10 @@ def load_glb_scene(path: Path) -> GLScene:
                     double_sided = True
                     if alpha_mode == "OPAQUE" and tex_data is not None:
                         alpha_mode = "BLEND"
-                elif alpha_mode == "OPAQUE" and tex_data is not None:
+                elif alpha_mode == "OPAQUE" and tex_data is not None and is_cutout:
                     a_min = int(np.frombuffer(tex_data[0], dtype=np.uint8)[3::4].min())
                     if a_min < 250:
-                        alpha_mode = "MASK" if is_cutout else "BLEND"
+                        alpha_mode = "MASK"
 
                 gm = _match_game_material(game_mats, mat_name, mesh.name or "", node.name or "")
                 toon_smooth = 0.08

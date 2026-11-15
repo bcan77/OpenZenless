@@ -63,6 +63,14 @@ def load_stage_index() -> dict[str, list[str]]:
                     for b in info.get("blocks", []):
                         if b not in blks:
                             blks.append(b)
+        for sname, blks in list(stages.items()):
+            parts = sname.split("_")
+            for k in range(len(parts) - 1, 1, -1):
+                parent = "_".join(parts[:k])
+                if parent in stages:
+                    for b in stages[parent]:
+                        if b not in blks:
+                            blks.append(b)
     return stages
 
 
