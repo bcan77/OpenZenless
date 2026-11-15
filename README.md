@@ -1,6 +1,7 @@
 <div align="center">
   <img src="assets/OpenZenless_Header.png" alt="OpenZenless Logo" width="460" />
   <p><strong>Zenless Zone Zero asset viewer & extractor, for the people who don't want to study MiHoYo encryption.</strong></p>
+  
 
   <p>
     <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
@@ -11,6 +12,7 @@
 </div>
 
 ---
+*NOTE : This program is HIGHLY EXPERIMENTAL, and may not work on your device. Please report any issues in the issues page!*
 
 ## How the program works;
 
