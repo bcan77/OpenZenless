@@ -319,6 +319,7 @@ def load_character_index() -> dict[str, list[str]]:
     for cand in (
         EXTRACTOR_ROOT / "data" / "asset_map" / "character_index_lean.json",
         EXTRACTOR_ROOT / "data" / "asset_map" / "character_index_rich.json",
+        CACHE_DIR / "asset_map" / "character_index_fallback.json",
     ):
         if cand.exists():
             try:
@@ -331,14 +332,17 @@ def load_character_index() -> dict[str, list[str]]:
 
 
 def load_stage_index() -> dict[str, list[str]]:
-    inv = EXTRACTOR_ROOT / "data" / "all_maps_inventory.json"
-    if not inv.exists():
-        return {}
-    try:
-        data = json.loads(inv.read_text())
-        return {k: v.get("blocks", []) for k, v in (data.get("stages") or {}).items()}
-    except Exception:
-        return {}
+    for inv in (
+        EXTRACTOR_ROOT / "data" / "all_maps_inventory.json",
+        CACHE_DIR / "asset_map" / "stage_index_fallback.json",
+    ):
+        if inv.exists():
+            try:
+                data = json.loads(inv.read_text())
+                return {k: v.get("blocks", []) for k, v in (data.get("stages") or {}).items()}
+            except Exception:
+                pass
+    return {}
 
 
 def load_curated_map_index() -> dict[str, list[str]]:
@@ -394,6 +398,108 @@ def load_texture_sections() -> dict[str, dict]:
         return json.loads(SECTIONS_INDEX_FILE.read_text())
     except Exception:
         return {}
+
+
+def has_asset_map(game_root: Path) -> bool:
+    files_root = resolve_files_root(game_root)
+    has_ext_chars = any(
+        (EXTRACTOR_ROOT / "data" / "asset_map" / name).is_file()
+        for name in ("character_index_lean.json", "character_index_rich.json")
+    )
+    has_ext_maps = (EXTRACTOR_ROOT / "data" / "all_maps_inventory.json").is_file()
+    if has_ext_chars and has_ext_maps:
+        return True
+    manifest = CACHE_DIR / "asset_map" / "manifest.json"
+    if manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text())
+            if data.get("files_root") == str(files_root):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def build_asset_map(game_root: Path, log_cb=None, progress_cb=None) -> dict:
+    import time
+
+    files_root = resolve_files_root(game_root)
+    map_dir = CACHE_DIR / "asset_map"
+    map_dir.mkdir(parents=True, exist_ok=True)
+
+    def _prog(pct: int, msg: str):
+        if progress_cb is not None:
+            progress_cb(pct, msg)
+        _emit(log_cb, msg)
+
+    _prog(5, f"Mapping assets for {files_root}...")
+
+    # 1. Run external Extractor mapping/catalog scripts if available
+    lib_dir = EXTRACTOR_ROOT / "lib"
+    ran_scripts = []
+    for script_name in ("build_asset_map.py", "map_assets.py", "build_character_catalog.py", "build_viewer_data.py"):
+        s = lib_dir / script_name
+        if s.is_file():
+            _prog(20, f"Running {script_name}...")
+            rc = run_streaming_cmd([sys.executable, str(s)], log_cb=log_cb)
+            ran_scripts.append({"script": script_name, "rc": rc})
+
+    # 2. Scan .blk and .pck containers under files_root
+    _prog(45, "Scanning .blk containers...")
+    blk_files = sorted(files_root.rglob("*.blk")) if files_root.exists() else []
+    blk_names = {p.name for p in blk_files}
+    blk_stems = {p.stem for p in blk_files}
+
+    _prog(65, "Scanning .pck audio archives...")
+    pck_files = sorted(files_root.rglob("*.pck")) if files_root.exists() else []
+
+    # 3. Derive fallback character & stage indexes from texture_sections_index.json if Extractor indexes are absent
+    _prog(80, "Indexing sections & cross-referencing containers...")
+    sections = load_texture_sections()
+    chars_fallback: dict[str, dict] = {}
+    stages_fallback: dict[str, dict] = {}
+
+    for sec, info in sections.items():
+        blks = [b for b in info.get("blocks", []) if (b in blk_names or Path(b).stem in blk_stems)]
+        if not blks and blk_names:
+            continue
+        use_blks = blks or info.get("blocks", [])
+        if sec.startswith("Char/"):
+            cname = sec.split("/", 1)[1].split("/")[0]
+            if cname:
+                entry = chars_fallback.setdefault(cname, {"blocks": []})
+                for b in use_blks:
+                    if b not in entry["blocks"]:
+                        entry["blocks"].append(b)
+        elif sec.startswith(("Scenes/", "Stage/", "StageLogic/")):
+            sname = sec.split("/", 1)[1].split("/")[0]
+            if sname:
+                entry = stages_fallback.setdefault(sname, {"blocks": []})
+                for b in use_blks:
+                    if b not in entry["blocks"]:
+                        entry["blocks"].append(b)
+
+    if not (EXTRACTOR_ROOT / "data" / "asset_map" / "character_index_lean.json").is_file():
+        (map_dir / "character_index_fallback.json").write_text(
+            json.dumps({"characters": chars_fallback}, indent=2)
+        )
+    if not (EXTRACTOR_ROOT / "data" / "all_maps_inventory.json").is_file():
+        (map_dir / "stage_index_fallback.json").write_text(
+            json.dumps({"stages": stages_fallback}, indent=2)
+        )
+
+    manifest = {
+        "files_root": str(files_root),
+        "blk_count": len(blk_files),
+        "pck_count": len(pck_files),
+        "fallback_characters": len(chars_fallback),
+        "fallback_stages": len(stages_fallback),
+        "ran_scripts": ran_scripts,
+        "built_at": int(time.time()),
+    }
+    (map_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    _prog(100, f"Asset map ready: {len(blk_files)} .blk, {len(pck_files)} .pck, {len(chars_fallback)} char sections, {len(stages_fallback)} stage sections")
+    return manifest
 
 
 def _emit(log_cb, msg: str):
@@ -759,7 +865,7 @@ def launch_gui(root_path: Path):
     from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap, QShortcut
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
-        QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+        QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
         QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
         QProgressBar, QPushButton, QSpinBox, QSplitter, QStackedWidget,
         QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser,
@@ -932,6 +1038,87 @@ def launch_gui(root_path: Path):
             except Exception as exc:
                 self.failed.emit(str(exc))
 
+    class AssetMapWorker(QThread):
+        progress = Signal(int, str)
+        log_line = Signal(str)
+        finished_ok = Signal(dict)
+        failed = Signal(str)
+
+        def __init__(self, game_root: Path):
+            super().__init__()
+            self.game_root = game_root
+
+        def run(self):
+            try:
+                manifest = build_asset_map(
+                    self.game_root,
+                    log_cb=lambda line: self.log_line.emit(line),
+                    progress_cb=lambda pct, msg: self.progress.emit(pct, msg),
+                )
+                self.finished_ok.emit(manifest)
+            except Exception as exc:
+                self.failed.emit(str(exc))
+
+    class AssetMapDialog(QDialog):
+        def __init__(self, game_root: Path, parent=None):
+            super().__init__(parent)
+            self.game_root = game_root
+            self.setWindowTitle("OpenZenless — Building Asset Map")
+            self.resize(640, 380)
+            lay = QVBoxLayout(self)
+            lay.setSpacing(10)
+
+            title = QLabel("Indexing Game Assets Before Opening Viewer")
+            title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f59e0b;")
+            lay.addWidget(title)
+
+            self.status_lbl = QLabel(f"Scanning {resolve_files_root(game_root)}...")
+            self.status_lbl.setStyleSheet("color: #94a3b8;")
+            self.status_lbl.setWordWrap(True)
+            lay.addWidget(self.status_lbl)
+
+            self.pbar = QProgressBar()
+            self.pbar.setRange(0, 100)
+            self.pbar.setValue(0)
+            lay.addWidget(self.pbar)
+
+            self.log_box = QPlainTextEdit()
+            self.log_box.setReadOnly(True)
+            self.log_box.setFont(QFont("JetBrains Mono, Consolas, monospace", 10))
+            lay.addWidget(self.log_box, 1)
+
+            btns = QHBoxLayout()
+            self.btn_skip = QPushButton("Skip")
+            self.btn_skip.clicked.connect(self.accept)
+            btns.addStretch()
+            btns.addWidget(self.btn_skip)
+            lay.addLayout(btns)
+
+            self.worker = AssetMapWorker(game_root)
+            self.worker.progress.connect(self._on_progress)
+            self.worker.log_line.connect(self.log_box.appendPlainText)
+            self.worker.finished_ok.connect(self._on_done)
+            self.worker.failed.connect(self._on_failed)
+            self.worker.start()
+
+        def _on_progress(self, pct: int, msg: str):
+            self.pbar.setValue(pct)
+            self.status_lbl.setText(msg)
+
+        def _on_done(self, _manifest: dict):
+            self.pbar.setValue(100)
+            self.accept()
+
+        def _on_failed(self, msg: str):
+            self.status_lbl.setText(f"Mapping warning: {msg}")
+            self.log_box.appendPlainText(f"[ERROR] {msg}")
+            self.btn_skip.setText("Continue Anyway")
+
+        def closeEvent(self, event):
+            if self.worker.isRunning():
+                self.worker.wait(500)
+            super().closeEvent(event)
+
     class ExportDialog(QDialog):
         SCOPES = [
             ("character", "Whole Character (FBX + Textures + Optional GLB)"),
@@ -965,9 +1152,14 @@ def launch_gui(root_path: Path):
 
             src_row = QHBoxLayout()
             self.source_edit = QLineEdit()
-            self.btn_browse_src = QPushButton("Browse File/Dir...")
+            self.btn_browse_file = QPushButton("File...")
+            self.btn_browse_file.setToolTip("Select a single .blk or .pck file")
+            self.btn_browse_file.clicked.connect(self._browse_source_file)
+            self.btn_browse_src = QPushButton("Dir...")
+            self.btn_browse_src.setToolTip("Select a source folder")
             self.btn_browse_src.clicked.connect(self._browse_source)
             src_row.addWidget(self.source_edit, 1)
+            src_row.addWidget(self.btn_browse_file)
             src_row.addWidget(self.btn_browse_src)
             form.addRow("Source (.blk/.pck/Dir):", src_row)
 
@@ -992,8 +1184,9 @@ def launch_gui(root_path: Path):
             lay.addLayout(form)
 
             opts = QGroupBox("Options")
-            opts_lay = QVBoxLayout(opts)
-            row1 = QHBoxLayout()
+            opts_lay = QGridLayout(opts)
+            opts_lay.setHorizontalSpacing(14)
+            opts_lay.setVerticalSpacing(8)
             self.chk_glb = QCheckBox("Convert Character to GLB + Facial Morphs (Blender)")
             self.chk_resume = QCheckBox("Resume Map Checkpoints")
             self.chk_resume.setChecked(True)
@@ -1001,23 +1194,42 @@ def launch_gui(root_path: Path):
             self.spin_workers = QSpinBox()
             self.spin_workers.setRange(1, 8)
             self.spin_workers.setValue(1)
-            row1.addWidget(self.chk_glb)
-            row1.addWidget(self.chk_resume)
-            row1.addWidget(self.chk_dry)
-            row1.addWidget(QLabel("Map Workers:"))
-            row1.addWidget(self.spin_workers)
-            row1.addStretch()
+            workers_row = QHBoxLayout()
+            workers_row.setContentsMargins(0, 0, 0, 0)
+            workers_row.addWidget(QLabel("Map Workers:"))
+            workers_row.addWidget(self.spin_workers)
+            workers_row.addStretch()
 
-            row2 = QHBoxLayout()
             self.chk_wwise_map = QCheckBox("Auto-name && Organize Voices via AnimeWwise (nap.map)")
             self.chk_wwise_map.setChecked(True)
             self.chk_wav = QCheckBox("Decode .wem -> .wav (vgmstream-cli)")
-            row2.addWidget(self.chk_wwise_map)
-            row2.addWidget(self.chk_wav)
-            row2.addStretch()
 
-            opts_lay.addLayout(row1)
-            opts_lay.addLayout(row2)
+            self.chk_inc_chars = QCheckBox("Include Characters")
+            self.chk_inc_chars.setChecked(True)
+            self.chk_inc_scenes = QCheckBox("Include Curated Maps")
+            self.chk_inc_scenes.setChecked(True)
+            self.chk_inc_fonts = QCheckBox("Include Fonts")
+            self.chk_inc_fonts.setChecked(True)
+            self.chk_inc_audio = QCheckBox("Include Audio (.pck)")
+            self.chk_inc_audio.setChecked(True)
+
+            opts_lay.addWidget(self.chk_glb, 0, 0)
+            opts_lay.addWidget(self.chk_resume, 0, 1)
+            opts_lay.addLayout(workers_row, 0, 2)
+            opts_lay.addWidget(self.chk_wwise_map, 1, 0)
+            opts_lay.addWidget(self.chk_wav, 1, 1)
+            opts_lay.addWidget(self.chk_dry, 1, 2)
+
+            full_row = QHBoxLayout()
+            full_row.setContentsMargins(0, 4, 0, 0)
+            full_row.setSpacing(14)
+            full_row.addWidget(QLabel("Full Export:"))
+            full_row.addWidget(self.chk_inc_chars)
+            full_row.addWidget(self.chk_inc_scenes)
+            full_row.addWidget(self.chk_inc_fonts)
+            full_row.addWidget(self.chk_inc_audio)
+            full_row.addStretch()
+            opts_lay.addLayout(full_row, 2, 0, 1, 3)
             lay.addWidget(opts)
 
             self.log_box = QPlainTextEdit()
@@ -1030,13 +1242,22 @@ def launch_gui(root_path: Path):
             self.btn_run.setObjectName("primaryBtn")
             self.btn_run.clicked.connect(self._start_export)
             self.btn_close = QPushButton("Close")
-            self.btn_close.clicked.connect(self.accept)
+            self.btn_close.clicked.connect(self._safe_close)
             btns.addStretch()
             btns.addWidget(self.btn_run)
             btns.addWidget(self.btn_close)
             lay.addLayout(btns)
 
             self._on_scope_changed()
+
+        def _browse_source_file(self):
+            f, _ = QFileDialog.getOpenFileName(
+                self, "Select Source Container (.blk / .pck)",
+                str(self.parent_win.files_root),
+                "ZZZ Containers (*.blk *.pck);;All Files (*)",
+            )
+            if f:
+                self.source_edit.setText(f)
 
         def _browse_source(self):
             d = QFileDialog.getExistingDirectory(self, "Select Source Directory", str(self.parent_win.files_root))
@@ -1064,26 +1285,36 @@ def launch_gui(root_path: Path):
                 )
             )
             self.source_edit.setText(default_src)
+            if self.target_combo.lineEdit():
+                self.target_combo.lineEdit().setPlaceholderText("")
             if scope in ("character", "animations"):
                 self.target_combo.addItems(chars)
+                if not chars and self.target_combo.lineEdit():
+                    self.target_combo.lineEdit().setPlaceholderText("No characters mapped yet — check Game/Extractor root")
                 self.target_combo.setEnabled(True)
                 self.source_edit.setEnabled(False)
+                self.btn_browse_file.setEnabled(False)
                 self.btn_browse_src.setEnabled(False)
             elif scope == "map":
                 self.target_combo.addItem("all")
                 self.target_combo.addItems(curated_maps)
                 self.target_combo.setEnabled(True)
                 self.source_edit.setEnabled(False)
+                self.btn_browse_file.setEnabled(False)
                 self.btn_browse_src.setEnabled(False)
             elif scope == "stage":
                 self.target_combo.addItems(stages)
+                if not stages and self.target_combo.lineEdit():
+                    self.target_combo.lineEdit().setPlaceholderText("No stages mapped yet — check Game/Extractor root")
                 self.target_combo.setEnabled(True)
                 self.source_edit.setEnabled(False)
+                self.btn_browse_file.setEnabled(False)
                 self.btn_browse_src.setEnabled(False)
             else:
                 self.target_combo.addItem("(Uses Source Path)")
                 self.target_combo.setEnabled(False)
                 self.source_edit.setEnabled(scope != "full")
+                self.btn_browse_file.setEnabled(scope != "full")
                 self.btn_browse_src.setEnabled(scope != "full")
 
             self.types_edit.setEnabled(scope == "assets")
@@ -1095,15 +1326,34 @@ def launch_gui(root_path: Path):
             self.chk_dry.setEnabled(scope == "full")
             self.chk_wwise_map.setEnabled(scope in ("audio", "full"))
             self.chk_wav.setEnabled(scope in ("audio", "full"))
+            for chk in (self.chk_inc_chars, self.chk_inc_scenes, self.chk_inc_fonts, self.chk_inc_audio):
+                chk.setEnabled(scope == "full")
 
         def _start_export(self):
+            if self.worker is not None and self.worker.isRunning():
+                return
             scope = self.scope_combo.currentData()
             target = self.target_combo.currentText().strip()
-            src = Path(self.source_edit.text().strip())
+            src_text = self.source_edit.text().strip()
+            src = Path(src_text) if src_text else Path(".")
             out_text = self.out_edit.text().strip()
             if not out_text:
                 QMessageBox.warning(self, "Export Error", "Please specify a Destination Folder.")
                 return
+            if scope in ("character", "animations", "map", "stage") and not target:
+                QMessageBox.warning(self, "Export Error", f"Please select or enter a Target for '{scope}' export.")
+                return
+            if scope in ("fonts", "assets", "audio") and (not src_text or not src.exists()):
+                QMessageBox.warning(self, "Export Error", f"Source path does not exist:\n{src_text}")
+                return
+            inc_chars = self.chk_inc_chars.isChecked()
+            inc_scenes = self.chk_inc_scenes.isChecked()
+            inc_fonts = self.chk_inc_fonts.isChecked()
+            inc_audio = self.chk_inc_audio.isChecked()
+            if scope == "full" and not any((inc_chars, inc_scenes, inc_fonts, inc_audio)):
+                QMessageBox.warning(self, "Export Error", "Select at least one Full Export scope.")
+                return
+
             out = Path(out_text)
             game_root = self.parent_win.game_root
             convert_glb = self.chk_glb.isChecked()
@@ -1137,7 +1387,8 @@ def launch_gui(root_path: Path):
                     )
                 return export_full_game(
                     game_root, out,
-                    include_chars=True, include_scenes=True, include_fonts=True, include_audio=True,
+                    include_chars=inc_chars, include_scenes=inc_scenes,
+                    include_fonts=inc_fonts, include_audio=inc_audio,
                     convert_glb=convert_glb, use_wwise_map=use_wwise, decode_wav=decode_wav,
                     dry_run=dry_run, log_cb=cb,
                 )
@@ -1151,11 +1402,27 @@ def launch_gui(root_path: Path):
         def _on_done(self, rc: int):
             self.btn_run.setEnabled(True)
             self.log_box.appendPlainText(f"\n[Finished with exit code {rc}]")
+            if rc == 0:
+                self.parent_win.curated_maps = load_curated_map_index()
+                self.parent_win._populate_basic_categories()
 
         def _on_err(self, msg: str):
             self.btn_run.setEnabled(True)
             self.log_box.appendPlainText(f"\n[ERROR] {msg}")
             QMessageBox.warning(self, "Export Error", msg)
+
+        def _safe_close(self):
+            if self.worker is not None and self.worker.isRunning():
+                QMessageBox.information(self, "Export Running", "Please wait for the current export to finish.")
+                return
+            self.accept()
+
+        def closeEvent(self, event):
+            if self.worker is not None and self.worker.isRunning():
+                QMessageBox.information(self, "Export Running", "Please wait for the current export to finish.")
+                event.ignore()
+                return
+            super().closeEvent(event)
 
     class BlkExplorerWindow(QMainWindow):
         def __init__(self, initial_root: Path):
@@ -1189,25 +1456,10 @@ def launch_gui(root_path: Path):
                 self.open_directory(self.files_root)
 
         def _load_stage_blocks(self) -> dict[str, list[str]]:
-            inv = EXTRACTOR_ROOT / "data" / "all_maps_inventory.json"
-            if not inv.exists():
-                return {}
-            try:
-                data = json.loads(inv.read_text())
-                return {k: v.get("blocks", []) for k, v in (data.get("stages") or {}).items()}
-            except Exception:
-                return {}
+            return load_stage_index()
 
         def _load_char_blocks(self) -> dict[str, list[str]]:
-            idx = EXTRACTOR_ROOT / "data" / "asset_map" / "character_index_lean.json"
-            if not idx.exists():
-                return {}
-            try:
-                data = json.loads(idx.read_text())
-                chars = data.get("characters", data)
-                return {k: v.get("blocks", []) for k, v in chars.items() if isinstance(v, dict)}
-            except Exception:
-                return {}
+            return load_character_index()
 
         def _build_ui(self):
             root_widget = QWidget()
@@ -1929,6 +2181,12 @@ def launch_gui(root_path: Path):
                 self.game_root = Path(d)
                 save_user_config({"game_root": str(self.game_root)})
                 self.files_root = resolve_files_root(self.game_root)
+                if not has_asset_map(self.game_root) and self.files_root.exists():
+                    AssetMapDialog(self.game_root, self).exec()
+                self.stage_blocks = self._load_stage_blocks()
+                self.curated_maps = load_curated_map_index()
+                self.char_blocks = self._load_char_blocks()
+                self.char_names = load_character_names()
                 self._populate_tree()
                 self._populate_basic_categories()
                 self._refresh_version_badge()
@@ -2252,6 +2510,11 @@ def launch_gui(root_path: Path):
 
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_QSS)
+    files_root = resolve_files_root(root_path)
+    if not has_asset_map(root_path) and files_root.exists():
+        has_containers = any(files_root.rglob("*.blk")) or any(files_root.rglob("*.pck"))
+        if has_containers or (EXTRACTOR_ROOT / "lib").is_dir():
+            AssetMapDialog(root_path).exec()
     win = BlkExplorerWindow(root_path)
     win.show()
     sys.exit(app.exec())
