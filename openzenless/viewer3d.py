@@ -11,15 +11,17 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from pygltflib import GLTF2
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtOpenGL import QOpenGLShader, QOpenGLShaderProgram
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QSlider,
     QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
@@ -73,6 +75,26 @@ class GLSubMesh:
 
 
 @dataclass
+class GLBone:
+    name: str
+    parent: int
+    translation: np.ndarray
+    rotation: np.ndarray
+    scale: np.ndarray
+    rest_world: np.ndarray
+
+
+@dataclass
+class UnityAnimClip:
+    name: str
+    path: Path
+    duration: float
+    rot_curves: dict[str, tuple[np.ndarray, np.ndarray]]
+    pos_curves: dict[str, tuple[np.ndarray, np.ndarray]]
+    scale_curves: dict[str, tuple[np.ndarray, np.ndarray]]
+
+
+@dataclass
 class GLScene:
     source_path: Path
     submeshes: list[GLSubMesh]
@@ -81,6 +103,158 @@ class GLScene:
     bmin_y: float
     vertex_count: int
     triangle_count: int
+    bones: list[GLBone] | None = None
+
+
+def _parse_unity_anim_section(lines: list[str], start_idx: int, is_quat: bool) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], int]:
+    """Parse one Unity YAML curve list (m_RotationCurves / m_PositionCurves / m_ScaleCurves)."""
+    curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    i = start_idx + 1
+    n = len(lines)
+    base_indent = len(lines[start_idx]) - len(lines[start_idx].lstrip())
+    cur_times: list[float] = []
+    cur_vals: list[tuple[float, ...]] = []
+    cur_time: float | None = None
+
+    while i < n:
+        ln = lines[i]
+        stripped = ln.strip()
+        if not stripped:
+            i += 1
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        if indent <= base_indent and not stripped.startswith("-"):
+            break
+        if stripped.startswith("- curve:"):
+            cur_times, cur_vals, cur_time = [], [], None
+        elif stripped.startswith("time:"):
+            try:
+                cur_time = float(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                cur_time = None
+        elif stripped.startswith("value:") and cur_time is not None:
+            m = re.findall(r"([xyzw]):\s*([-+0-9.eE]+)", stripped)
+            if m:
+                d = {k: float(v) for k, v in m}
+                cur_times.append(cur_time)
+                if is_quat:
+                    cur_vals.append((d.get("x", 0.0), d.get("y", 0.0), d.get("z", 0.0), d.get("w", 1.0)))
+                else:
+                    cur_vals.append((d.get("x", 0.0), d.get("y", 0.0), d.get("z", 0.0)))
+            cur_time = None
+        elif stripped.startswith("path:"):
+            raw_path = stripped.split(":", 1)[1].strip().strip("'\"")
+            if cur_times:
+                t_arr = np.asarray(cur_times, dtype=np.float32)
+                v_arr = np.asarray(cur_vals, dtype=np.float32)
+                curves[raw_path] = (t_arr, v_arr)
+                leaf = raw_path.rsplit("/", 1)[-1]
+                if leaf and leaf not in curves:
+                    curves[leaf] = (t_arr, v_arr)
+            cur_times, cur_vals, cur_time = [], [], None
+        i += 1
+    return curves, i
+
+
+def load_unity_anim(path: Path) -> UnityAnimClip:
+    """Parse a Unity YAML .anim file exported by AnimeStudio/AssetStudio."""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+    name = path.stem
+    stop_time = 0.0
+    rot_curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    pos_curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    scale_curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        s = lines[i].strip()
+        if s.startswith("m_Name:") and name == path.stem:
+            val = s.split(":", 1)[1].strip().strip("'\"")
+            if val:
+                name = val
+        elif s.startswith("m_StopTime:"):
+            try:
+                stop_time = max(stop_time, float(s.split(":", 1)[1].strip()))
+            except ValueError:
+                pass
+        elif s.startswith("m_RotationCurves:"):
+            c, i = _parse_unity_anim_section(lines, i, is_quat=True)
+            rot_curves.update(c)
+            continue
+        elif s.startswith("m_PositionCurves:"):
+            c, i = _parse_unity_anim_section(lines, i, is_quat=False)
+            pos_curves.update(c)
+            continue
+        elif s.startswith("m_ScaleCurves:"):
+            c, i = _parse_unity_anim_section(lines, i, is_quat=False)
+            scale_curves.update(c)
+            continue
+        i += 1
+
+    max_t = stop_time
+    for d in (rot_curves, pos_curves, scale_curves):
+        for t_arr, _ in d.values():
+            if len(t_arr):
+                max_t = max(max_t, float(t_arr[-1]))
+    return UnityAnimClip(
+        name=name,
+        path=path,
+        duration=max(max_t, 0.001),
+        rot_curves=rot_curves,
+        pos_curves=pos_curves,
+        scale_curves=scale_curves,
+    )
+
+
+def _eval_vec3_curve(times: np.ndarray, vals: np.ndarray, t: float) -> np.ndarray:
+    if len(times) == 1 or t <= times[0]:
+        return vals[0]
+    if t >= times[-1]:
+        return vals[-1]
+    idx = int(np.searchsorted(times, t, side="right")) - 1
+    idx = max(0, min(idx, len(times) - 2))
+    dt = float(times[idx + 1] - times[idx])
+    a = (t - float(times[idx])) / dt if dt > 1e-6 else 0.0
+    return vals[idx] * (1.0 - a) + vals[idx + 1] * a
+
+
+def _eval_quat_curve(times: np.ndarray, vals: np.ndarray, t: float) -> np.ndarray:
+    if len(times) == 1 or t <= times[0]:
+        q = vals[0]
+    elif t >= times[-1]:
+        q = vals[-1]
+    else:
+        idx = int(np.searchsorted(times, t, side="right")) - 1
+        idx = max(0, min(idx, len(times) - 2))
+        dt = float(times[idx + 1] - times[idx])
+        a = (t - float(times[idx])) / dt if dt > 1e-6 else 0.0
+        q0, q1 = vals[idx], vals[idx + 1]
+        if float(np.dot(q0, q1)) < 0.0:
+            q1 = -q1
+        q = q0 * (1.0 - a) + q1 * a
+    norm = float(np.linalg.norm(q))
+    return q / norm if norm > 1e-6 else np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+
+def _trs_to_mat4(t: np.ndarray, q: np.ndarray, s: np.ndarray) -> np.ndarray:
+    x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    m = np.eye(4, dtype=np.float32)
+    m[0, 0] = (1.0 - 2.0 * (yy + zz)) * s[0]
+    m[0, 1] = (2.0 * (xy - wz)) * s[1]
+    m[0, 2] = (2.0 * (xz + wy)) * s[2]
+    m[1, 0] = (2.0 * (xy + wz)) * s[0]
+    m[1, 1] = (1.0 - 2.0 * (xx + zz)) * s[1]
+    m[1, 2] = (2.0 * (yz - wx)) * s[2]
+    m[2, 0] = (2.0 * (xz - wy)) * s[0]
+    m[2, 1] = (2.0 * (yz + wx)) * s[1]
+    m[2, 2] = (1.0 - 2.0 * (xx + yy)) * s[2]
+    m[:3, 3] = t
+    return m
 
 
 def _read_accessor(gltf: GLTF2, blob: bytes, acc_idx: int) -> np.ndarray:
@@ -360,6 +534,36 @@ def load_glb_scene(path: Path) -> GLScene:
         for ch in (node.children or ()):
             _visit(ch, world)
 
+    bones: list[GLBone] = []
+
+    def _visit_bone(node_idx: int, parent_world: np.ndarray, parent_bone: int) -> int:
+        node = gltf.nodes[node_idx]
+        if node.matrix:
+            loc = np.array(node.matrix, dtype=np.float32).reshape(4, 4).T
+            t = loc[:3, 3].copy()
+            s = np.linalg.norm(loc[:3, :3], axis=0).astype(np.float32)
+            q = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        else:
+            t = np.array(node.translation or [0.0, 0.0, 0.0], dtype=np.float32)
+            q = np.array(node.rotation or [0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            s = np.array(node.scale or [1.0, 1.0, 1.0], dtype=np.float32)
+            loc = _trs_to_mat4(t, q, s)
+        world = parent_world @ loc
+        b_idx = -1
+        if node.mesh is None:
+            b_idx = len(bones)
+            bones.append(GLBone(
+                name=node.name or f"node_{node_idx}",
+                parent=parent_bone,
+                translation=t,
+                rotation=q,
+                scale=s,
+                rest_world=world,
+            ))
+        for ch in (node.children or ()):
+            _visit_bone(ch, world, b_idx if b_idx >= 0 else parent_bone)
+        return b_idx
+
     if gltf.scenes:
         sc = gltf.scenes[gltf.scene or 0]
         root_nodes = sc.nodes or []
@@ -369,6 +573,7 @@ def load_glb_scene(path: Path) -> GLScene:
     ident = np.eye(4, dtype=np.float32)
     for rn in root_nodes:
         _visit(rn, ident)
+        _visit_bone(rn, ident, -1)
 
     if not submeshes or not np.all(np.isfinite(bmin)):
         center = np.zeros(3, dtype=np.float32)
@@ -387,6 +592,7 @@ def load_glb_scene(path: Path) -> GLScene:
         bmin_y=bmin_y,
         vertex_count=total_verts,
         triangle_count=total_tris,
+        bones=bones,
     )
 
 
@@ -522,6 +728,9 @@ class GLBViewport(QOpenGLWidget):
         self.show_textures = True
         self.show_grid = True
         self.toon_enabled = True
+        self.show_skeleton = True
+        self.anim_clip: UnityAnimClip | None = None
+        self.anim_time: float = 0.0
         self._toon_prog: QOpenGLShaderProgram | None = None
         self.yaw = 35.0
         self.pitch = 20.0
@@ -535,9 +744,20 @@ class GLBViewport(QOpenGLWidget):
         self.makeCurrent()
         self._free_textures()
         self.scene = scene
+        self.anim_clip = None
+        self.anim_time = 0.0
         self._upload_textures()
         self.reset_camera()
         self.doneCurrent()
+        self.update()
+
+    def set_animation(self, clip: UnityAnimClip | None):
+        self.anim_clip = clip
+        self.anim_time = 0.0
+        self.update()
+
+    def set_anim_time(self, t: float):
+        self.anim_time = max(0.0, float(t))
         self.update()
 
     def reset_camera(self):
@@ -725,6 +945,9 @@ class GLBViewport(QOpenGLWidget):
         gl.glDisable(gl.GL_TEXTURE_2D)
         gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
 
+        if self.show_skeleton and self.scene and self.scene.bones and self.anim_clip is not None:
+            self._draw_skeleton()
+
     @staticmethod
     def _glu_look_at(ex, ey, ez, tx, ty, tz):
         f = np.array([tx - ex, ty - ey, tz - ez], dtype=np.float32)
@@ -766,6 +989,61 @@ class GLBViewport(QOpenGLWidget):
         gl.glEnd()
         gl.glEnable(gl.GL_LIGHTING)
 
+    def _eval_animated_bones(self) -> list[np.ndarray]:
+        bones = self.scene.bones if self.scene and self.scene.bones else []
+        clip = self.anim_clip
+        if not bones or clip is None:
+            return []
+        t = self.anim_time % max(clip.duration, 0.001)
+        worlds: list[np.ndarray] = []
+        ident = np.eye(4, dtype=np.float32)
+        for b in bones:
+            pos = b.translation
+            rot = b.rotation
+            scl = b.scale
+            if b.name in clip.pos_curves:
+                p = _eval_vec3_curve(*clip.pos_curves[b.name], t)
+                pos = np.array([-p[0], p[1], p[2]], dtype=np.float32)
+            if b.name in clip.rot_curves:
+                q = _eval_quat_curve(*clip.rot_curves[b.name], t)
+                rot = np.array([-q[0], q[1], q[2], -q[3]], dtype=np.float32)
+            if b.name in clip.scale_curves:
+                scl = _eval_vec3_curve(*clip.scale_curves[b.name], t)
+            loc = _trs_to_mat4(pos, rot, scl)
+            pw = worlds[b.parent] if b.parent >= 0 else ident
+            worlds.append(pw @ loc)
+        return worlds
+
+    def _draw_skeleton(self):
+        bones = self.scene.bones if self.scene and self.scene.bones else []
+        if not bones:
+            return
+        worlds = self._eval_animated_bones()
+        if not worlds:
+            return
+        gl.glDisable(gl.GL_LIGHTING)
+        gl.glDisable(gl.GL_TEXTURE_2D)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glLineWidth(2.0)
+        gl.glBegin(gl.GL_LINES)
+        gl.glColor4f(0.20, 0.92, 1.0, 0.95)
+        for idx, b in enumerate(bones):
+            if b.parent >= 0:
+                p0 = worlds[b.parent][:3, 3]
+                p1 = worlds[idx][:3, 3]
+                gl.glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))
+                gl.glVertex3f(float(p1[0]), float(p1[1]), float(p1[2]))
+        gl.glEnd()
+        gl.glPointSize(4.5)
+        gl.glBegin(gl.GL_POINTS)
+        gl.glColor4f(1.0, 0.78, 0.20, 1.0)
+        for w in worlds:
+            p = w[:3, 3]
+            gl.glVertex3f(float(p[0]), float(p[1]), float(p[2]))
+        gl.glEnd()
+        gl.glEnable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_LIGHTING)
+
     def mousePressEvent(self, event):
         self._last_pos = event.position()
         if event.button() == Qt.LeftButton and not (event.modifiers() & Qt.ShiftModifier):
@@ -804,6 +1082,11 @@ class NativeViewerWidget(QWidget):
         super().__init__(parent)
         self._choose_output_cb = choose_output_cb
         self._workers: list[QThread] = []
+        self._anim_clip: UnityAnimClip | None = None
+        self._anim_playing = False
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(33)
+        self._anim_timer.timeout.connect(self._on_anim_tick)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -840,6 +1123,39 @@ class NativeViewerWidget(QWidget):
         for b in (btn_open, btn_refresh, btn_reset, self.btn_wire, self.btn_tex, self.btn_toon):
             bar.addWidget(b)
         root.addLayout(bar)
+
+        anim_bar = QHBoxLayout()
+        anim_bar.addWidget(QLabel("Animation:"))
+        self.anim_combo = QComboBox()
+        self.anim_combo.setMinimumWidth(220)
+        self.anim_combo.currentIndexChanged.connect(self._on_anim_combo_changed)
+        anim_bar.addWidget(self.anim_combo)
+
+        btn_load_anim = QPushButton("Load .anim...")
+        btn_load_anim.clicked.connect(self._open_anim_dialog)
+        anim_bar.addWidget(btn_load_anim)
+
+        self.btn_anim_play = QPushButton("Play")
+        self.btn_anim_play.setEnabled(False)
+        self.btn_anim_play.clicked.connect(self._toggle_anim_play)
+        anim_bar.addWidget(self.btn_anim_play)
+
+        self.anim_slider = QSlider(Qt.Horizontal)
+        self.anim_slider.setRange(0, 1000)
+        self.anim_slider.setEnabled(False)
+        self.anim_slider.valueChanged.connect(self._on_anim_scrub)
+        anim_bar.addWidget(self.anim_slider, 1)
+
+        self.anim_time_lbl = QLabel("0.00 / 0.00s")
+        self.anim_time_lbl.setStyleSheet("color: #94a3b8;")
+        anim_bar.addWidget(self.anim_time_lbl)
+
+        self.btn_skel = QPushButton("Skeleton")
+        self.btn_skel.setCheckable(True)
+        self.btn_skel.setChecked(True)
+        self.btn_skel.toggled.connect(self._toggle_skeleton)
+        anim_bar.addWidget(self.btn_skel)
+        root.addLayout(anim_bar)
 
         splitter = QSplitter(Qt.Horizontal)
         left = QWidget()
@@ -939,8 +1255,120 @@ class NativeViewerWidget(QWidget):
         self._workers.append(w)
         w.start()
 
+    def _toggle_skeleton(self, checked: bool):
+        self.viewport.show_skeleton = checked
+        self.viewport.update()
+
+    def _populate_anim_combo(self, model_path: Path):
+        self.anim_combo.blockSignals(True)
+        self.anim_combo.clear()
+        self.anim_combo.addItem("(None — Rest Pose)", None)
+        anim_files: list[Path] = []
+        for cand_dir in (model_path.parent / "AnimationClip", model_path.parent):
+            if cand_dir.is_dir():
+                anim_files.extend(sorted(cand_dir.glob("*.anim")))
+        seen: set[Path] = set()
+        for af in anim_files:
+            rp = af.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            self.anim_combo.addItem(af.stem, str(af))
+        self.anim_combo.blockSignals(False)
+
+    def _open_anim_dialog(self):
+        start_dir = str(self.viewport.scene.source_path.parent) if self.viewport.scene else str(cfg.FINAL_ROOT)
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Load Unity AnimationClip (.anim)", start_dir, "AnimationClip (*.anim);;All Files (*)"
+        )
+        if not f:
+            return
+        af = Path(f)
+        self.anim_combo.blockSignals(True)
+        idx = self.anim_combo.findData(str(af))
+        if idx < 0:
+            self.anim_combo.addItem(af.stem, str(af))
+            idx = self.anim_combo.count() - 1
+        self.anim_combo.setCurrentIndex(idx)
+        self.anim_combo.blockSignals(False)
+        self.load_animation(af)
+
+    def _on_anim_combo_changed(self, idx: int):
+        p = self.anim_combo.itemData(idx)
+        if not p:
+            self._stop_animation()
+            self._anim_clip = None
+            self.viewport.set_animation(None)
+            self.btn_anim_play.setEnabled(False)
+            self.anim_slider.setEnabled(False)
+            self.anim_slider.setValue(0)
+            self.anim_time_lbl.setText("0.00 / 0.00s")
+            return
+        self.load_animation(Path(p))
+
+    def load_animation(self, path: Path):
+        try:
+            clip = load_unity_anim(path)
+        except Exception as e:
+            self.status_lbl.setText(f"Failed to load .anim {path.name}: {e}")
+            return
+        self._anim_clip = clip
+        self.viewport.set_animation(clip)
+        self.btn_anim_play.setEnabled(True)
+        self.anim_slider.setEnabled(True)
+        self.anim_slider.blockSignals(True)
+        self.anim_slider.setValue(0)
+        self.anim_slider.blockSignals(False)
+        self.anim_time_lbl.setText(f"0.00 / {clip.duration:.2f}s")
+        self._anim_playing = True
+        self.btn_anim_play.setText("Pause")
+        self._anim_timer.start()
+        bones_n = len(self.viewport.scene.bones) if self.viewport.scene and self.viewport.scene.bones else 0
+        self.status_lbl.setText(
+            f"Playing {clip.name} ({clip.duration:.2f}s) • {len(clip.rot_curves)} rot / {len(clip.pos_curves)} pos curves • {bones_n} bones"
+        )
+
+    def _stop_animation(self):
+        self._anim_playing = False
+        self._anim_timer.stop()
+        self.btn_anim_play.setText("Play")
+
+    def _toggle_anim_play(self):
+        if not self._anim_clip:
+            return
+        if self._anim_playing:
+            self._stop_animation()
+        else:
+            self._anim_playing = True
+            self.btn_anim_play.setText("Pause")
+            self._anim_timer.start()
+
+    def _on_anim_tick(self):
+        if not self._anim_clip or not self._anim_playing:
+            return
+        t = (self.viewport.anim_time + 0.033) % max(self._anim_clip.duration, 0.001)
+        self.viewport.set_anim_time(t)
+        self.anim_slider.blockSignals(True)
+        self.anim_slider.setValue(int((t / max(self._anim_clip.duration, 0.001)) * 1000))
+        self.anim_slider.blockSignals(False)
+        self.anim_time_lbl.setText(f"{t:.2f} / {self._anim_clip.duration:.2f}s")
+
+    def _on_anim_scrub(self, val: int):
+        if not self._anim_clip:
+            return
+        t = (val / 1000.0) * self._anim_clip.duration
+        self.viewport.set_anim_time(t)
+        self.anim_time_lbl.setText(f"{t:.2f} / {self._anim_clip.duration:.2f}s")
+
     def _on_scene_loaded(self, scene: GLScene):
+        self._stop_animation()
+        self._anim_clip = None
+        self.btn_anim_play.setEnabled(False)
+        self.anim_slider.setEnabled(False)
+        self.anim_slider.setValue(0)
+        self.anim_time_lbl.setText("0.00 / 0.00s")
         self.viewport.set_scene(scene)
+        self._populate_anim_combo(scene.source_path)
         self.status_lbl.setText(
             f"{scene.source_path.name} • {len(scene.submeshes)} meshes • "
             f"{scene.triangle_count:,} tris • {scene.vertex_count:,} verts "
