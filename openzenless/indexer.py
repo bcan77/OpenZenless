@@ -300,6 +300,8 @@ def build_asset_map(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
             assert proc.stdout is not None
@@ -340,7 +342,7 @@ def build_asset_map(
             ]
             proc = subprocess.Popen(
                 cmd, cwd=str(cfg.CLI_DIR), env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
             )
             assert proc.stdout is not None
             for line in proc.stdout:

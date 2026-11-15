@@ -133,7 +133,7 @@ def scan_blk_json(blk_path: Path, out_dir: Path | None = None, types: list[str] 
             "--group_assets", "ByType",
             "--export_type", "JSON",
         ]
-        proc = subprocess.run(cmd, cwd=cfg.CLI_DIR, env=env, capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(cmd, cwd=cfg.CLI_DIR, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
         log_text = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         existing = list(target_dir.rglob("*.json"))
         if proc.returncode != 0 and not existing:

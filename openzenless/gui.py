@@ -183,7 +183,7 @@ def launch_gui(root_path: Path):
                     "--group_assets", "ByType",
                     "--export_type", "Convert",
                 ]
-                proc = subprocess.run(cmd, cwd=cfg.CLI_DIR, env=env, capture_output=True, text=True, timeout=180)
+                proc = subprocess.run(cmd, cwd=cfg.CLI_DIR, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
                 files = [p for p in out_dir.rglob("*") if p.is_file() and self.asset_name.lower() in p.stem.lower()]
                 if not files:
                     files = [p for p in out_dir.rglob("*") if p.is_file()]

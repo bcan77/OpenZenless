@@ -28,6 +28,8 @@ def run_streaming_cmd(cmd: list[str], cwd: Path | None = None, env: dict | None 
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     assert proc.stdout is not None
@@ -456,7 +458,7 @@ def export_scene_map(
                         name_filter="",
                         log_cb=log_cb,
                     )
-                    if rc == 0:
+                    if rc == 0 or (dest.exists() and (any(dest.rglob("*.fbx")) or any(dest.rglob("*.obj")))):
                         rc_glb = _convert_dir_to_glb(dest, sname, log_cb=log_cb)
                         if rc_glb != 0:
                             rc = rc_glb
