@@ -40,8 +40,24 @@ _WWISE_MAPPER_CACHE = None
 
 
 def resolve_files_root(game_root: Path) -> Path:
-    cand = game_root / "com.HoYoverse.Nap" / "files"
-    return cand if cand.exists() else game_root
+    for cand in (
+        game_root / "com.HoYoverse.Nap" / "files",
+        game_root / "ZenlessZoneZero_Data" / "StreamingAssets",
+        game_root / "ZenlessZoneZero Game" / "ZenlessZoneZero_Data" / "StreamingAssets",
+        game_root / "StreamingAssets",
+    ):
+        if cand.exists():
+            return cand
+    return game_root
+
+
+def detect_build_platform(game_root: Path, files_root: Path) -> str:
+    s = f"{game_root} {files_root}"
+    if (files_root / "Audio" / "Windows").exists() or "ZenlessZoneZero_Data" in s or (game_root / "ZenlessZoneZero_Data").exists():
+        return "PC (Windows)"
+    if (files_root / "Audio" / "Android").exists() or "com.HoYoverse.Nap" in s:
+        return "Android"
+    return "Unknown"
 
 
 def human_size(n: int) -> str:
@@ -62,20 +78,29 @@ def _read_small_text(path: Path) -> str:
         return ""
 
 
+def _read_version_field(files_root: Path, name: str) -> str:
+    for base in (files_root, files_root.parent / "Persistent"):
+        val = _read_small_text(base / name)
+        if val:
+            return val
+    return "unknown"
+
+
 def collect_game_version(game_root: Path) -> dict:
     files_root = resolve_files_root(game_root)
     info = {
+        "platform": detect_build_platform(game_root, files_root),
         "game_root": str(game_root),
         "files_root": str(files_root),
         "exists": files_root.exists(),
-        "unity_version": _read_small_text(files_root / "psoversioncode") or "unknown",
-        "base_revision": _read_small_text(files_root / "base_revision") or "unknown",
-        "res_revision": _read_small_text(files_root / "res_revision") or "unknown",
-        "data_revision": _read_small_text(files_root / "data_revision") or "unknown",
-        "audio_revision": _read_small_text(files_root / "audio_revision") or "unknown",
-        "silence_revision": _read_small_text(files_root / "silence_revision") or "unknown",
-        "op_version": _read_small_text(files_root / "op_version") or "unknown",
-        "audio_lang": _read_small_text(files_root / "audio_lang") or "unknown",
+        "unity_version": _read_version_field(files_root, "psoversioncode"),
+        "base_revision": _read_version_field(files_root, "base_revision"),
+        "res_revision": _read_version_field(files_root, "res_revision"),
+        "data_revision": _read_version_field(files_root, "data_revision"),
+        "audio_revision": _read_version_field(files_root, "audio_revision"),
+        "silence_revision": _read_version_field(files_root, "silence_revision"),
+        "op_version": _read_version_field(files_root, "op_version"),
+        "audio_lang": _read_version_field(files_root, "audio_lang"),
         "blk_count": 0,
         "pck_count": 0,
         "cli_exists": CLI_EXE.exists(),
@@ -1573,12 +1598,13 @@ def launch_gui(root_path: Path):
         def _refresh_version_badge(self):
             v = collect_game_version(self.game_root)
             cli_tag = "CLI+Wine OK" if (v["cli_exists"] and v["wine_exists"]) else "CLI/Wine Missing"
-            txt = f"Unity {v['unity_version']} | res {v['res_revision']} | {v['blk_count']} .blk | {cli_tag}"
+            txt = f"{v['platform']} | Unity {v['unity_version']} | res {v['res_revision']} | {v['blk_count']} .blk | {cli_tag}"
             self.header_version_pill.setText(txt)
 
         def show_version_dialog(self):
             v = collect_game_version(self.game_root)
             lines = [
+                f"Platform:         {v['platform']}",
                 f"Game Root:        {v['game_root']}",
                 f"Files Root:       {v['files_root']} ({'OK' if v['exists'] else 'MISSING'})",
                 f"Unity Version:    {v['unity_version']}",
@@ -1615,11 +1641,24 @@ def launch_gui(root_path: Path):
         def _populate_tree(self):
             self.tree.clear()
             if self.files_root.exists():
-                root_item = QTreeWidgetItem(self.tree, ["Nap Files (Game Root)"])
+                plat = detect_build_platform(self.game_root, self.files_root)
+                lbl = f"Game Files ({plat})" if plat != "Unknown" else "Game Files (Root)"
+                root_item = QTreeWidgetItem(self.tree, [lbl])
                 root_item.setData(0, Qt.UserRole, ("dir", str(self.files_root)))
                 root_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
                 root_item.setExpanded(True)
                 self._populate_dir_node(root_item, self.files_root)
+
+            for pc_data in (
+                self.game_root / "ZenlessZoneZero_Data",
+                self.game_root / "ZenlessZoneZero Game" / "ZenlessZoneZero_Data",
+                self.files_root.parent if self.files_root.name == "StreamingAssets" else Path("/nonexistent"),
+            ):
+                if pc_data.exists() and pc_data.name == "ZenlessZoneZero_Data":
+                    pc_item = QTreeWidgetItem(self.tree, ["ZenlessZoneZero_Data (PC)"])
+                    pc_item.setData(0, Qt.UserRole, ("dir", str(pc_data)))
+                    pc_item.setChildIndicatorPolicy(QTreeWidgetItem.ShowIndicator)
+                    break
 
             apk_dir = self.game_root / "APKs" / "extracted"
             if apk_dir.exists():

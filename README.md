@@ -1,6 +1,6 @@
 <div align="center">
   <img src="assets/OpenZenless_Header.png" alt="OpenZenless Logo" width="460" />
-  <p><strong>OpenIV-style proprietary file explorer, Wwise audio organizer, batch pipeline exporter, and embedded 3D asset viewer for Zenless Zone Zero.</strong></p>
+  <p><strong>Zenless Zone Zero asset viever & extractor, for the people who don't want to study MiHoYo encryption.</strong></p>
 
   <p>
     <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
@@ -12,10 +12,10 @@
 
 ---
 
-## ✨ Features
+## How the program works;
 
-- **3-Mode Workspace (`Basic` | `Advanced` | `3D Viewer`)**
-  - **Basic Mode**: Browse cleanly organized **Characters**, **Curated Maps**, **Texture2D Sections** (UI, Comics, Story, Season 2, Effects, etc.), **Audio Archives**, and **Fonts** with one-click export.
+- **3 Viewer Model (`Basic` | `Advanced` | `3D Viewer`)**
+  - **Basic**: Browse organized **Characters**, **Curated Maps**, **Texture2D Sections** (UI, Comics, Story, Season 2, Effects, etc.), **Audio Archives**, and **Fonts** with options for neartly exporting them.
   - **Advanced Mode**: OpenIV-style raw archive browser for `.blk` containers, Wwise `.pck` (`AKPK`) packages, Unity asset JSON dumps, PNG texture previews, and a 4 KB paged Hex + ASCII viewer.
   - **3D Viewer**: Embedded `QWebEngineView` serving the interactive Three.js GLB + Catalog viewer for exported characters, animations, facial morphs, and maps.
 - **Scoped & Full Pipeline Exports**
@@ -84,4 +84,6 @@ pip install -r requirements.txt
 
 - **[GUI Guide](docs/GUI.md)** — Walkthrough of Basic Mode, Advanced Mode, 3D Viewer, Batch Export, and shortcuts.
 - **[CLI Reference](docs/CLI.md)** — Full command reference for `version`, `inspect`, `unpack-pck`, `scan-blk`, and `export`.
+- **[Mobile (Android) Extraction Guide](docs/MOBILE_EXTRACTION.md)** — How to copy your mobile ZZZ build (`com.HoYoverse.Nap`) to PC via ADB or Shizuku.
+- **[PC Copy Guide](docs/PC_GUIDE.md)** — How to browse and export directly from a PC (Windows) installation of ZZZ.
 - **[Assets](assets/README.md)** — Brand logo variants.
