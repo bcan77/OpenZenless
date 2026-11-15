@@ -18,7 +18,7 @@ rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/share/openzenless" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
 cp "$ROOT/openzenless.py" "$ROOT/README.md" "$ROOT/requirements.txt" "$ROOT/texture_sections_index.json" "$APPDIR/usr/share/openzenless/"
-cp -r "$ROOT/assets" "$ROOT/docs" "$APPDIR/usr/share/openzenless/"
+cp -r "$ROOT/openzenless" "$ROOT/assets" "$ROOT/docs" "$APPDIR/usr/share/openzenless/"
 
 # Generate a square 256x256 PNG icon from OpenZenless_WhiteText.png
 python3 - "$ROOT/assets/OpenZenless_WhiteText.png" "$APPDIR/openzenless.png" <<'PY'
