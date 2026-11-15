@@ -1,6 +1,6 @@
 <div align="center">
   <img src="assets/OpenZenless_Header.png" alt="OpenZenless Logo" width="460" />
-  <p><strong>Zenless Zone Zero asset viever & extractor, for the people who don't want to study MiHoYo encryption.</strong></p>
+  <p><strong>Zenless Zone Zero asset viewer & extractor, for the people who don't want to study MiHoYo encryption.</strong></p>
 
   <p>
     <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
@@ -15,7 +15,7 @@
 ## How the program works;
 
 - **3 Viewer Model (`Basic` | `Advanced` | `3D Viewer`)**
-  - **Basic**: Browse organized **Characters**, **Curated Maps**, **Texture2D Sections** (UI, Comics, Story, Season 2, Effects, etc.), **Audio Archives**, and **Fonts** with options for neartly exporting them.
+  - **Basic**: Browse organized **Characters**, **Curated Maps**, **Texture2D Sections** (UI, Comics, Story, Season 2, Effects, etc.), **Audio Archives**, and **Fonts** with options for neatly exporting them.
   - **Advanced Mode**: OpenIV-style raw archive browser for `.blk` containers, Wwise `.pck` (`AKPK`) packages, Unity asset JSON dumps, PNG texture previews, and a 4 KB paged Hex + ASCII viewer.
   - **3D Viewer**: Embedded `QWebEngineView` serving the interactive Three.js GLB + Catalog viewer for exported characters, animations, facial morphs, and maps.
 - **Scoped & Full Pipeline Exports**
