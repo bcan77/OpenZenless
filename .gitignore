@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+cache/
+Exports/
+*.blk
+*.pck
+*.bnk
+*.wem
+*.wav
+*.fbx
+*.glb
+.DS_Store
