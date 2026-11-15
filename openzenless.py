@@ -110,12 +110,19 @@ def set_final_root(new_root: Path):
 def resolve_files_root(game_root: Path) -> Path:
     for cand in (
         game_root / "com.HoYoverse.Nap" / "files",
+        game_root / "files",
         game_root / "ZenlessZoneZero_Data" / "StreamingAssets",
         game_root / "ZenlessZoneZero Game" / "ZenlessZoneZero_Data" / "StreamingAssets",
         game_root / "StreamingAssets",
     ):
         if cand.exists():
             return cand
+    if (game_root / "Blocks").exists() or (game_root / "Audio").exists():
+        return game_root
+    if game_root.name in ("Blocks", "Audio") and (
+        (game_root.parent / "Blocks").exists() or (game_root.parent / "Audio").exists()
+    ):
+        return game_root.parent
     return game_root
 
 
@@ -123,7 +130,12 @@ def detect_build_platform(game_root: Path, files_root: Path) -> str:
     s = f"{game_root} {files_root}"
     if (files_root / "Audio" / "Windows").exists() or "ZenlessZoneZero_Data" in s or (game_root / "ZenlessZoneZero_Data").exists():
         return "PC (Windows)"
-    if (files_root / "Audio" / "Android").exists() or "com.HoYoverse.Nap" in s:
+    if (
+        (files_root / "Audio" / "Android").exists()
+        or "com.HoYoverse.Nap" in s
+        or (files_root / "il2cpp").exists()
+        or (files_root / "hib").exists()
+    ):
         return "Android"
     return "Unknown"
 
@@ -364,6 +376,8 @@ def load_curated_map_index() -> dict[str, list[str]]:
                         curated[mid] = stages.get(mid, [])
             except Exception:
                 pass
+    if not curated and stages:
+        return dict(stages)
     return curated
 
 
@@ -414,7 +428,10 @@ def has_asset_map(game_root: Path) -> bool:
         try:
             data = json.loads(manifest.read_text())
             if data.get("files_root") == str(files_root):
-                return True
+                if (data.get("blk_count", 0) > 0 or data.get("pck_count", 0) > 0):
+                    return True
+                if not (files_root / "Blocks").exists() and not (files_root / "Audio").exists():
+                    return True
         except Exception:
             pass
     return False
@@ -453,7 +470,7 @@ def build_asset_map(game_root: Path, log_cb=None, progress_cb=None) -> dict:
     _prog(65, "Scanning .pck audio archives...")
     pck_files = sorted(files_root.rglob("*.pck")) if files_root.exists() else []
 
-    # 3. Derive fallback character & stage indexes from texture_sections_index.json if Extractor indexes are absent
+    # 3. Derive fallback character & stage indexes from texture_sections_index.json + exported Characters
     _prog(80, "Indexing sections & cross-referencing containers...")
     sections = load_texture_sections()
     chars_fallback: dict[str, dict] = {}
@@ -465,12 +482,22 @@ def build_asset_map(game_root: Path, log_cb=None, progress_cb=None) -> dict:
             continue
         use_blks = blks or info.get("blocks", [])
         if sec.startswith("Char/"):
-            cname = sec.split("/", 1)[1].split("/")[0]
-            if cname:
-                entry = chars_fallback.setdefault(cname, {"blocks": []})
-                for b in use_blks:
-                    if b not in entry["blocks"]:
-                        entry["blocks"].append(b)
+            found_avatars = False
+            for sample in info.get("samples", []):
+                for part in sample.replace("\\", "/").split("/"):
+                    if part.startswith("Avatar_") and "." not in part:
+                        entry = chars_fallback.setdefault(part, {"blocks": []})
+                        for b in use_blks:
+                            if b not in entry["blocks"]:
+                                entry["blocks"].append(b)
+                        found_avatars = True
+            if not found_avatars:
+                cname = sec.split("/", 1)[1].split("/")[0]
+                if cname and cname != "Avatar":
+                    entry = chars_fallback.setdefault(cname, {"blocks": []})
+                    for b in use_blks:
+                        if b not in entry["blocks"]:
+                            entry["blocks"].append(b)
         elif sec.startswith(("Scenes/", "Stage/", "StageLogic/")):
             sname = sec.split("/", 1)[1].split("/")[0]
             if sname:
@@ -478,6 +505,12 @@ def build_asset_map(game_root: Path, log_cb=None, progress_cb=None) -> dict:
                 for b in use_blks:
                     if b not in entry["blocks"]:
                         entry["blocks"].append(b)
+
+    chars_out_dir = FINAL_ROOT / "Characters"
+    if chars_out_dir.is_dir():
+        for ch_dir in sorted(chars_out_dir.iterdir()):
+            if ch_dir.is_dir():
+                chars_fallback.setdefault(ch_dir.name, {"blocks": []})
 
     if not (EXTRACTOR_ROOT / "data" / "asset_map" / "character_index_lean.json").is_file():
         (map_dir / "character_index_fallback.json").write_text(
