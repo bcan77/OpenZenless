@@ -635,42 +635,123 @@ def export_full_game(
     files_root = resolve_files_root(game_root)
     chars = sorted(load_character_index().keys())
     maps = sorted(load_curated_map_index().keys())
+
+    char_script = EXTRACTOR_ROOT / "lib" / "extract_character_v2.py"
+    map_script = EXTRACTOR_ROOT / "lib" / "export_maps_pipeline.py"
+    blocks_dir = files_root / "Blocks"
+    audio_dir = files_root / "Audio"
+    if not audio_dir.exists() and files_root.exists() and any(files_root.rglob("*.pck")):
+        audio_dir = files_root
+    has_pcks = audio_dir.exists() and any(audio_dir.rglob("*.pck"))
+    has_cli = CLI_EXE.is_file() and shutil.which("wine") is not None
+
+    chars_ready = include_chars and bool(chars) and char_script.is_file()
+    scenes_ready = include_scenes and map_script.is_file()
+    fonts_ready = include_fonts and blocks_dir.exists() and has_cli
+    audio_ready = include_audio and has_pcks
+
+    def _status_str(enabled: bool, ready: bool, detail: str, missing_reason: str) -> str:
+        if not enabled:
+            return "SKIPPED"
+        return f"{detail} (READY)" if ready else f"{detail} (UNAVAILABLE: {missing_reason})"
+
+    char_reason = (
+        f"missing {char_script.name}" if chars else "character_index_lean.json not found in Extractor/data/asset_map"
+    )
+    font_reason = "missing Blocks/" if not blocks_dir.exists() else "missing AnimeStudio.CLI.exe or wine"
+
     _emit(log_cb, "=== OpenZenless Full Export Plan ===")
-    _emit(log_cb, f"Game Root   : {files_root}")
+    _emit(log_cb, f"Game Root   : {files_root} ({'OK' if files_root.exists() else 'MISSING'})")
     _emit(log_cb, f"Output Root : {out_dir}")
-    _emit(log_cb, f"Characters  : {len(chars) if include_chars else 'SKIPPED'} (GLB={convert_glb})")
-    _emit(log_cb, f"Curated Maps: {len(maps) if include_scenes else 'SKIPPED'}")
-    _emit(log_cb, f"Fonts       : {'YES' if include_fonts else 'SKIPPED'}")
-    _emit(log_cb, f"Audio (.pck): {'YES' if include_audio else 'SKIPPED'} (AnimeWwise={use_wwise_map}, WAV={decode_wav})")
+    _emit(log_cb, f"Characters  : {_status_str(include_chars, chars_ready, f'{len(chars)} (GLB={convert_glb})', char_reason)}")
+    _emit(log_cb, f"Curated Maps: {_status_str(include_scenes, scenes_ready, f'{len(maps)}', f'missing {map_script.name}')}")
+    _emit(log_cb, f"Fonts       : {_status_str(include_fonts, fonts_ready, 'Blocks/*.blk', font_reason)}")
+    _emit(log_cb, f"Audio (.pck): {_status_str(include_audio, audio_ready, f'AnimeWwise={use_wwise_map}, WAV={decode_wav}', 'no .pck files found')}")
     if dry_run:
         _emit(log_cb, "[DRY RUN] No files were modified.")
         return 0
 
+    if not files_root.exists():
+        _emit(log_cb, f"[ERROR] Game root does not exist: {files_root}")
+        return 1
+
     out_dir.mkdir(parents=True, exist_ok=True)
+    ran_any = False
+    had_errors = False
+
     if include_chars:
-        for idx, ch in enumerate(chars, 1):
-            _emit(log_cb, f"[{idx}/{len(chars)}] Exporting character {ch}...")
-            export_character_full(ch, out_dir=out_dir / "Characters", convert_glb=convert_glb, log_cb=log_cb)
+        if not chars_ready:
+            _emit(log_cb, f"[SKIP] Characters: {char_reason}")
+        else:
+            ran_any = True
+            for idx, ch in enumerate(chars, 1):
+                _emit(log_cb, f"[{idx}/{len(chars)}] Exporting character {ch}...")
+                try:
+                    rc = export_character_full(ch, out_dir=out_dir / "Characters", convert_glb=convert_glb, log_cb=log_cb)
+                    if rc != 0:
+                        had_errors = True
+                        _emit(log_cb, f"[WARN] Character {ch} exited with code {rc}")
+                except Exception as exc:
+                    had_errors = True
+                    _emit(log_cb, f"[ERROR] Character {ch} failed: {exc}")
+
     if include_scenes:
-        _emit(log_cb, "Exporting curated maps...")
-        export_scene_map("all", resume=True, workers=1, out_dir=out_dir / "Maps_Combined", log_cb=log_cb)
+        if not scenes_ready:
+            _emit(log_cb, f"[SKIP] Curated Maps: missing {map_script}")
+        else:
+            ran_any = True
+            _emit(log_cb, "Exporting curated maps...")
+            try:
+                rc = export_scene_map("all", resume=True, workers=1, out_dir=out_dir / "Maps_Combined", log_cb=log_cb)
+                if rc != 0:
+                    had_errors = True
+                    _emit(log_cb, f"[WARN] Curated Maps exited with code {rc}")
+            except Exception as exc:
+                had_errors = True
+                _emit(log_cb, f"[ERROR] Curated Maps failed: {exc}")
+
     if include_fonts:
-        _emit(log_cb, "Exporting all Fonts from Blocks/...")
-        export_blk_asset_types(files_root / "Blocks", out_dir / "Fonts", ["Font"], "Convert", log_cb=log_cb)
+        if not fonts_ready:
+            _emit(log_cb, f"[SKIP] Fonts: {font_reason}")
+        else:
+            ran_any = True
+            _emit(log_cb, "Exporting all Fonts from Blocks/...")
+            try:
+                rc = export_blk_asset_types(blocks_dir, out_dir / "Fonts", ["Font"], "Convert", log_cb=log_cb)
+                if rc != 0:
+                    had_errors = True
+                    _emit(log_cb, f"[WARN] Fonts export exited with code {rc}")
+            except Exception as exc:
+                had_errors = True
+                _emit(log_cb, f"[ERROR] Fonts export failed: {exc}")
+
     if include_audio:
-        audio_dir = files_root / "Audio"
-        if audio_dir.exists():
+        if not audio_ready:
+            _emit(log_cb, f"[SKIP] Audio: no .pck files found under {files_root}")
+        else:
+            ran_any = True
             _emit(log_cb, "Unpacking & organizing Wwise .pck archives...")
-            export_audio_pck(
-                audio_dir, out_dir / "Audio",
-                use_wwise_map=use_wwise_map, decode_wav=decode_wav, log_cb=log_cb,
-            )
+            try:
+                rc = export_audio_pck(
+                    audio_dir, out_dir / "Audio",
+                    use_wwise_map=use_wwise_map, decode_wav=decode_wav, log_cb=log_cb,
+                )
+                if rc != 0:
+                    had_errors = True
+            except Exception as exc:
+                had_errors = True
+                _emit(log_cb, f"[ERROR] Audio export failed: {exc}")
+
     for lib_name in ("build_character_catalog.py", "build_viewer_data.py"):
         lib_script = EXTRACTOR_ROOT / "lib" / lib_name
         if lib_script.exists():
             run_streaming_cmd([sys.executable, str(lib_script)], log_cb=log_cb)
-    _emit(log_cb, "=== Full Export Complete ===")
-    return 0
+
+    if not ran_any:
+        _emit(log_cb, "=== Full Export Finished (no stages were runnable with current Game/Extractor roots) ===")
+        return 1
+    _emit(log_cb, f"=== Full Export Complete{' (with warnings/errors)' if had_errors else ''} ===")
+    return 1 if had_errors else 0
 
 
 def launch_gui(root_path: Path):
@@ -715,6 +796,27 @@ def launch_gui(root_path: Path):
         padding: 5px 10px; color: #e5e9f0; min-height: 20px;
     }
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #f59e0b; }
+    QComboBox QAbstractItemView {
+        background-color: #141822; border: 1px solid #2b3344; color: #e5e9f0;
+        selection-background-color: #26354d; selection-color: #ffffff;
+    }
+    QSpinBox::up-button, QSpinBox::down-button {
+        background-color: #1e2433; border-left: 1px solid #2b3344; width: 18px;
+    }
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #283044; }
+    QCheckBox { spacing: 8px; color: #e5e9f0; }
+    QCheckBox:disabled { color: #5b6478; }
+    QCheckBox::indicator {
+        width: 15px; height: 15px; border-radius: 4px;
+        border: 1px solid #475569; background-color: #0b0d12;
+    }
+    QCheckBox::indicator:hover { border-color: #f59e0b; }
+    QCheckBox::indicator:checked {
+        background-color: #f59e0b; border-color: #fbbf24;
+    }
+    QCheckBox::indicator:disabled {
+        border-color: #222736; background-color: #141822;
+    }
     QPushButton {
         background-color: #1e2433; border: 1px solid #323b50; border-radius: 6px;
         padding: 6px 12px; color: #e5e9f0; font-weight: 500;
@@ -907,7 +1009,7 @@ def launch_gui(root_path: Path):
             row1.addStretch()
 
             row2 = QHBoxLayout()
-            self.chk_wwise_map = QCheckBox("Auto-name & Organize Voices via AnimeWwise (nap.map)")
+            self.chk_wwise_map = QCheckBox("Auto-name && Organize Voices via AnimeWwise (nap.map)")
             self.chk_wwise_map.setChecked(True)
             self.chk_wav = QCheckBox("Decode .wem -> .wav (vgmstream-cli)")
             row2.addWidget(self.chk_wwise_map)
@@ -925,6 +1027,7 @@ def launch_gui(root_path: Path):
 
             btns = QHBoxLayout()
             self.btn_run = QPushButton("Run Export")
+            self.btn_run.setObjectName("primaryBtn")
             self.btn_run.clicked.connect(self._start_export)
             self.btn_close = QPushButton("Close")
             self.btn_close.clicked.connect(self.accept)
@@ -952,9 +1055,13 @@ def launch_gui(root_path: Path):
             curated_maps = sorted(self.parent_win.curated_maps.keys())
             stages = sorted(self.parent_win.stage_blocks.keys())
             default_src = (
-                str(self.parent_win.current_container)
-                if self.parent_win.current_container and self.parent_win.current_container.exists()
-                else str(self.parent_win.files_root / ("Audio" if scope == "audio" else "Blocks"))
+                str(self.parent_win.game_root)
+                if scope == "full"
+                else (
+                    str(self.parent_win.current_container)
+                    if self.parent_win.current_container and self.parent_win.current_container.exists()
+                    else str(self.parent_win.files_root / ("Audio" if scope == "audio" else "Blocks"))
+                )
             )
             self.source_edit.setText(default_src)
             if scope in ("character", "animations"):
@@ -993,7 +1100,11 @@ def launch_gui(root_path: Path):
             scope = self.scope_combo.currentData()
             target = self.target_combo.currentText().strip()
             src = Path(self.source_edit.text().strip())
-            out = Path(self.out_edit.text().strip())
+            out_text = self.out_edit.text().strip()
+            if not out_text:
+                QMessageBox.warning(self, "Export Error", "Please specify a Destination Folder.")
+                return
+            out = Path(out_text)
             game_root = self.parent_win.game_root
             convert_glb = self.chk_glb.isChecked()
             resume = self.chk_resume.isChecked()
@@ -1199,17 +1310,6 @@ def launch_gui(root_path: Path):
             self.path_bar.returnPressed.connect(self._on_path_entered)
             nav_row.addWidget(self.path_bar, 1)
 
-            self.search_box = QLineEdit()
-            self.search_box.setMaximumWidth(210)
-            self.search_box.setPlaceholderText("Filter... (Ctrl+F)")
-            self.search_box.textChanged.connect(self._apply_filter)
-            nav_row.addWidget(self.search_box)
-
-            self.type_filter = QComboBox()
-            self.type_filter.addItem("All Types")
-            self.type_filter.currentTextChanged.connect(self._apply_filter)
-            nav_row.addWidget(self.type_filter)
-
             self.btn_open_view = QPushButton("Open / View")
             self.btn_open_view.setToolTip("Open folder/container or view selected file (Enter)")
             self.btn_open_view.clicked.connect(self.open_selected_item)
@@ -1221,6 +1321,20 @@ def launch_gui(root_path: Path):
             self.btn_export.setEnabled(False)
             nav_row.addWidget(self.btn_export)
             center_lay.addLayout(nav_row)
+
+            filter_row = QHBoxLayout()
+            filter_row.setSpacing(6)
+            self.search_box = QLineEdit()
+            self.search_box.setPlaceholderText("Filter... (Ctrl+F)")
+            self.search_box.textChanged.connect(self._apply_filter)
+            filter_row.addWidget(self.search_box, 1)
+
+            self.type_filter = QComboBox()
+            self.type_filter.setMinimumWidth(140)
+            self.type_filter.addItem("All Types")
+            self.type_filter.currentTextChanged.connect(self._apply_filter)
+            filter_row.addWidget(self.type_filter)
+            center_lay.addLayout(filter_row)
 
             QShortcut(QKeySequence("Ctrl+F"), self, activated=self.search_box.setFocus)
             QShortcut(QKeySequence("Ctrl+E"), self, activated=self.open_batch_export_dialog)
@@ -1235,7 +1349,7 @@ def launch_gui(root_path: Path):
             self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
             self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
             self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-            self.table.setColumnWidth(0, 320)
+            self.table.setColumnWidth(0, 260)
             self.table.itemSelectionChanged.connect(self._on_table_selection)
             self.table.itemDoubleClicked.connect(self._on_table_double_click)
             center_lay.addWidget(self.table)
@@ -1289,7 +1403,7 @@ def launch_gui(root_path: Path):
             self.tabs.addTab(hex_w, "Hex Viewer")
 
             splitter.addWidget(self.tabs)
-            splitter.setSizes([280, 650, 530])
+            splitter.setSizes([250, 760, 490])
 
             self.viewer_page = self._build_viewer_page()
             self.mode_stack.addWidget(self.viewer_page)
@@ -1323,7 +1437,7 @@ def launch_gui(root_path: Path):
             btn_out = QPushButton("Output Folder...")
             btn_out.setToolTip("Point the 3D Viewer & Basic Mode at your exported output folder")
             btn_out.clicked.connect(self._choose_output_root)
-            btn_rebuild = QPushButton("Rebuild Catalog & Reload")
+            btn_rebuild = QPushButton("Rebuild Catalog && Reload")
             btn_rebuild.clicked.connect(self._rebuild_and_reload_viewer)
             btn_ext = QPushButton("Open in Browser")
             btn_ext.clicked.connect(self._open_viewer_external)
@@ -1344,10 +1458,14 @@ def launch_gui(root_path: Path):
 
         def apply_output_root(self, new_root: Path):
             set_final_root(new_root)
+            self.stage_blocks = self._load_stage_blocks()
+            self.curated_maps = load_curated_map_index()
+            self.char_blocks = self._load_char_blocks()
+            self.char_names = load_character_names()
+            self._populate_tree()
             self._populate_basic_categories()
+            self._refresh_version_badge()
             self._ensure_viewer_loaded()
-            if self._web_view is not None:
-                self._web_view.reload()
             self.status.showMessage(f"Output Root set to {FINAL_ROOT}")
 
         def _start_viewer_server(self) -> int:
@@ -1378,12 +1496,28 @@ def launch_gui(root_path: Path):
             from PySide6.QtCore import QUrl
             port = self._start_viewer_server()
             url = f"http://127.0.0.1:{port}/Viewer/index.html"
-            self.viewer_status_lbl.setText(f"Embedded 3D Viewer • {url}")
+            index_file = FINAL_ROOT / "Viewer" / "index.html"
             if self._web_view is None:
                 from PySide6.QtWebEngineWidgets import QWebEngineView
                 self._web_view = QWebEngineView()
                 self.viewer_container.addWidget(self._web_view, 1)
+            if index_file.is_file():
+                self.viewer_status_lbl.setText(f"Embedded 3D Viewer • {url}")
                 self._web_view.setUrl(QUrl(url))
+            else:
+                self.viewer_status_lbl.setText(f"Embedded 3D Viewer • No Viewer/index.html in {FINAL_ROOT}")
+                self._web_view.setHtml(
+                    f"""<!doctype html><html><body style="margin:0;background:#0d1016;color:#e5e9f0;
+                    font-family:Inter,Segoe UI,sans-serif;display:flex;align-items:center;justify-content:center;
+                    height:100vh;"><div style="max-width:560px;padding:28px;border:1px solid #262d3d;
+                    border-radius:10px;background:#141822;text-align:center;">
+                    <h2 style="margin-top:0;color:#f59e0b;">3D Viewer Not Found</h2>
+                    <p style="color:#94a3b8;line-height:1.5;">No <code>Viewer/index.html</code> was found under:<br>
+                    <code style="color:#93c5fd;">{FINAL_ROOT}</code></p>
+                    <p style="color:#94a3b8;line-height:1.5;">Click <b>Output Folder...</b> above to point OpenZenless
+                    to an existing <code>FinalOutput</code> directory containing <code>Viewer/index.html</code>.</p>
+                    </div></body></html>"""
+                )
 
         def _rebuild_and_reload_viewer(self):
             for lib_name in ("build_character_catalog.py", "build_viewer_data.py"):
