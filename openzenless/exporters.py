@@ -15,6 +15,7 @@ from .indexer import (
     _emit,
     load_character_index,
     load_curated_map_index,
+    load_stage_texture_blocks,
     load_wwise_mapper,
 )
 
@@ -459,6 +460,23 @@ def export_scene_map(
                         name_filter="",
                         log_cb=log_cb,
                     )
+                    tex_blk_names, tex_pat = load_stage_texture_blocks(sname)
+                    if tex_blk_names and tex_pat:
+                        seen_names = {p.name for p in resolved}
+                        extra_tex = [
+                            blocks_dir / os.path.basename(b)
+                            for b in tex_blk_names
+                            if os.path.basename(b) not in seen_names and (blocks_dir / os.path.basename(b)).is_file()
+                        ]
+                        if extra_tex:
+                            _emit(log_cb, f"Exporting shared map Texture2Ds ({len(extra_tex)} .blk(s), filter={tex_pat}) -> {dest}")
+                            export_blks_batch(
+                                extra_tex, dest,
+                                types=["Texture2D"],
+                                export_mode="Convert",
+                                name_filter=tex_pat,
+                                log_cb=log_cb,
+                            )
                     if rc == 0 or (dest.exists() and (any(dest.rglob("*.fbx")) or any(dest.rglob("*.obj")))):
                         rc_glb = _convert_dir_to_glb(dest, sname, log_cb=log_cb)
                         if rc_glb != 0:

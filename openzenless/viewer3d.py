@@ -662,10 +662,7 @@ class GLBViewport(QOpenGLWidget):
             self._toon_prog.setUniformValue("u_tex", 0)
 
         def _draw_sm(i: int, sm: GLSubMesh):
-            if sm.double_sided or sm.is_sky:
-                gl.glDisable(gl.GL_CULL_FACE)
-            else:
-                gl.glEnable(gl.GL_CULL_FACE)
+            gl.glDisable(gl.GL_CULL_FACE)
             tid = self.tex_ids[i] if i < len(self.tex_ids) else 0
             has_tex = bool(self.show_textures and tid and sm.uvs is not None)
             if has_tex:

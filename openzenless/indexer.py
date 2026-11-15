@@ -189,6 +189,7 @@ def _parse_cli_asset_map(
     chars_auto: dict[str, set[str]] = {}
     short_blocks: dict[str, set[str]] = {}
     stages_auto: dict[str, set[str]] = {}
+    tex_prefix_blocks: dict[str, dict[str, int]] = {}
     font_blocks: set[str] = set()
 
     entry_count = 0
@@ -219,6 +220,11 @@ def _parse_cli_asset_map(
                     short_blocks.setdefault(short_tok, set()).add(blk_name)
             if cur_type in ("GameObject", "Mesh") and _STAGE_RE.match(cur_name):
                 stages_auto.setdefault(cur_name, set()).add(blk_name)
+            if cur_type == "Texture2D" and "_" in cur_name:
+                t_pref = cur_name.split("_", 1)[0].lower()
+                if len(t_pref) >= 3:
+                    bmap = tex_prefix_blocks.setdefault(t_pref, {})
+                    bmap[blk_name] = bmap.get(blk_name, 0) + 1
 
     def _extract_str_val(line: str, key: str) -> str | None:
         idx = line.find(key)
@@ -270,12 +276,47 @@ def _parse_cli_asset_map(
         (map_dir / "fonts_index_auto.json").write_text(
             json.dumps({"blocks": sorted(font_blocks)}, indent=2)
         )
+    if tex_prefix_blocks:
+        compact_tex = {
+            k: [b for b, _c in sorted(v.items(), key=lambda it: -it[1])[:24]]
+            for k, v in sorted(tex_prefix_blocks.items())
+        }
+        (map_dir / "stage_prefix_blocks_auto.json").write_text(json.dumps(compact_tex))
     _emit(
         log_cb,
         f"Parsed AnimeStudio AssetMap ({entry_count} entries): "
         f"{len(chars_auto)} characters, {len(stages_auto)} stages, {len(font_blocks)} font blocks",
     )
     return len(chars_auto), len(stages_auto), len(font_blocks)
+
+
+def load_stage_texture_blocks(stage_name: str) -> tuple[list[str], str]:
+    map_dir = cfg.CACHE_DIR / "asset_map"
+    p = map_dir / "stage_prefix_blocks_auto.json"
+    if not p.is_file():
+        am = map_dir / "zzz_assets_map.json"
+        if am.is_file():
+            try:
+                _parse_cli_asset_map(am, map_dir)
+            except Exception:
+                pass
+    if not p.is_file():
+        return [], ""
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return [], ""
+    clean = re.sub(r"^(?:Stage|Env|Scene|Map)_", "", stage_name)
+    toks = [t for t in clean.split("_") if len(t) >= 3 and not t.isdigit()]
+    if not toks:
+        return [], ""
+    seen: list[str] = []
+    for t in toks:
+        for b in data.get(t.lower(), []):
+            if b not in seen:
+                seen.append(b)
+    pat = f"^(?:{'|'.join(re.escape(t) for t in toks)})_"
+    return seen, pat
 
 
 def build_asset_map(
