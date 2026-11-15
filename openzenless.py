@@ -21,13 +21,68 @@ import subprocess
 import sys
 from pathlib import Path
 
-GAME_ROOT = Path(os.environ.get("ZZZ_GAME_ROOT", "/home/bcan77/ZenlessZoneZero_v3.4_Android_Build"))
-FINAL_ROOT = Path(os.environ.get("ZZZ_FINAL_OUTPUT", "/mnt/extra/zzz34_output/FinalOutput"))
+APP_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = Path.home() / ".config" / "openzenless" / "config.json"
+
+
+def load_user_config() -> dict:
+    try:
+        if CONFIG_FILE.is_file():
+            return json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def save_user_config(cfg: dict):
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cur = load_user_config()
+        cur.update(cfg)
+        CONFIG_FILE.write_text(json.dumps(cur, indent=2))
+    except Exception:
+        pass
+
+
+def detect_default_game_root() -> Path:
+    if os.environ.get("ZZZ_GAME_ROOT"):
+        return Path(os.environ["ZZZ_GAME_ROOT"])
+    cfg = load_user_config()
+    if cfg.get("game_root") and Path(cfg["game_root"]).exists():
+        return Path(cfg["game_root"])
+    for cand in (
+        Path("/home/bcan77/ZenlessZoneZero_v3.4_Android_Build"),
+        Path.home() / "ZenlessZoneZero_v3.4_Android_Build",
+        Path.home() / "ZenlessZoneZero Game",
+    ):
+        if cand.exists():
+            return cand
+    return Path.home()
+
+
+def detect_default_final_root() -> Path:
+    if os.environ.get("ZZZ_FINAL_OUTPUT"):
+        return Path(os.environ["ZZZ_FINAL_OUTPUT"])
+    cfg = load_user_config()
+    if cfg.get("final_root") and Path(cfg["final_root"]).exists():
+        return Path(cfg["final_root"])
+    for cand in (
+        APP_DIR / "FinalOutput",
+        Path.cwd() / "FinalOutput",
+        Path("/mnt/extra/zzz34_output/FinalOutput"),
+        Path.home() / "OpenZenless_Output",
+    ):
+        if cand.exists():
+            return cand
+    return Path.home() / "OpenZenless_Output"
+
+
+GAME_ROOT = detect_default_game_root()
+FINAL_ROOT = detect_default_final_root()
 EXTRACTOR_ROOT = FINAL_ROOT / "Extractor"
 CLI_DIR = EXTRACTOR_ROOT / "tools" / "AnimeStudioUltimate" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0"
 CLI_EXE = CLI_DIR / "AnimeStudio.CLI.exe"
 CACHE_DIR = Path(os.environ.get("ZZZ_BLK_EXPLORER_CACHE", "/tmp/zzz_blk_explorer"))
-APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = APP_DIR / "assets"
 LOGO_HEADER = ASSETS_DIR / "OpenZenless_Header.png"
 LOGO_ICON = ASSETS_DIR / "OpenZenless_WhiteText.png"
@@ -37,6 +92,19 @@ NAP_MAP_FILE = ANIMEWWISE_DIR / "maps" / "nap.map"
 VGMSTREAM_CLI = EXTRACTOR_ROOT / "tools" / "vgmstream" / "build" / "cli" / "vgmstream-cli"
 DOC_FILE = APP_DIR / "README.md"
 _WWISE_MAPPER_CACHE = None
+
+
+def set_final_root(new_root: Path):
+    global FINAL_ROOT, EXTRACTOR_ROOT, CLI_DIR, CLI_EXE, ANIMEWWISE_DIR, NAP_MAP_FILE, VGMSTREAM_CLI
+    FINAL_ROOT = new_root
+    if (new_root / "Extractor").exists():
+        EXTRACTOR_ROOT = new_root / "Extractor"
+        CLI_DIR = EXTRACTOR_ROOT / "tools" / "AnimeStudioUltimate" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0"
+        CLI_EXE = CLI_DIR / "AnimeStudio.CLI.exe"
+        ANIMEWWISE_DIR = EXTRACTOR_ROOT / "tools" / "AnimeWwise"
+        NAP_MAP_FILE = ANIMEWWISE_DIR / "maps" / "nap.map"
+        VGMSTREAM_CLI = EXTRACTOR_ROOT / "tools" / "vgmstream" / "build" / "cli" / "vgmstream-cli"
+    save_user_config({"final_root": str(new_root)})
 
 
 def resolve_files_root(game_root: Path) -> Path:
@@ -1252,12 +1320,16 @@ def launch_gui(root_path: Path):
             bar = QHBoxLayout()
             self.viewer_status_lbl = QLabel("Exported Asset 3D Viewer & Catalog (Characters, Maps, Animations)")
             self.viewer_status_lbl.setStyleSheet("color: #94a3b8; font-weight: 600;")
+            btn_out = QPushButton("Output Folder...")
+            btn_out.setToolTip("Point the 3D Viewer & Basic Mode at your exported output folder")
+            btn_out.clicked.connect(self._choose_output_root)
             btn_rebuild = QPushButton("Rebuild Catalog & Reload")
             btn_rebuild.clicked.connect(self._rebuild_and_reload_viewer)
             btn_ext = QPushButton("Open in Browser")
             btn_ext.clicked.connect(self._open_viewer_external)
             bar.addWidget(self.viewer_status_lbl)
             bar.addStretch()
+            bar.addWidget(btn_out)
             bar.addWidget(btn_rebuild)
             bar.addWidget(btn_ext)
             lay.addLayout(bar)
@@ -1265,15 +1337,25 @@ def launch_gui(root_path: Path):
             lay.addLayout(self.viewer_container, 1)
             return w
 
+        def _choose_output_root(self):
+            d = QFileDialog.getExistingDirectory(self, "Select Export Output Root (containing Characters / Maps_Combined / Viewer)", str(FINAL_ROOT))
+            if d:
+                self.apply_output_root(Path(d))
+
+        def apply_output_root(self, new_root: Path):
+            set_final_root(new_root)
+            self._populate_basic_categories()
+            self._ensure_viewer_loaded()
+            if self._web_view is not None:
+                self._web_view.reload()
+            self.status.showMessage(f"Output Root set to {FINAL_ROOT}")
+
         def _start_viewer_server(self) -> int:
             if self._viewer_port is not None:
                 return self._viewer_port
-            import functools
             import http.server
             import socketserver
             import threading
-
-            handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(FINAL_ROOT))
 
             class _QuietHandler(http.server.SimpleHTTPRequestHandler):
                 def __init__(self, *args, **kwargs):
@@ -1711,8 +1793,10 @@ def launch_gui(root_path: Path):
             d = QFileDialog.getExistingDirectory(self, "Select ZZZ Game Root", str(self.game_root))
             if d:
                 self.game_root = Path(d)
+                save_user_config({"game_root": str(self.game_root)})
                 self.files_root = resolve_files_root(self.game_root)
                 self._populate_tree()
+                self._populate_basic_categories()
                 self._refresh_version_badge()
                 self.open_directory(self.files_root)
 
