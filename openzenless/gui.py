@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from . import config as cfg
@@ -27,6 +28,8 @@ from .indexer import (
     load_stage_index,
     load_texture_sections,
 )
+from .tools import ensure_extractor_tools
+from .viewer3d import NativeViewerWidget
 
 
 def launch_gui(root_path: Path):
@@ -176,7 +179,7 @@ def launch_gui(root_path: Path):
                     "Z:" + str(out_dir).replace("/", "\\"),
                     "--game", "ZZZ",
                     "--types", self.asset_type,
-                    "--filter_with_name", self.asset_name,
+                    "--names", self.asset_name,
                     "--group_assets", "ByType",
                     "--export_type", "Convert",
                 ]
@@ -216,13 +219,20 @@ def launch_gui(root_path: Path):
         def __init__(self, game_root: Path):
             super().__init__()
             self.game_root = game_root
+            self.cancel_event = threading.Event()
 
         def run(self):
             try:
+                if not cfg.CLI_EXE.is_file() or not cfg.NAP_MAP_FILE.is_file():
+                    ensure_extractor_tools(
+                        log_cb=lambda line: self.log_line.emit(line),
+                        progress_cb=lambda pct, msg: self.progress.emit(min(pct, 25), msg),
+                    )
                 manifest = build_asset_map(
                     self.game_root,
                     log_cb=lambda line: self.log_line.emit(line),
                     progress_cb=lambda pct, msg: self.progress.emit(pct, msg),
+                    cancel_event=self.cancel_event,
                 )
                 self.finished_ok.emit(manifest)
             except Exception as exc:
@@ -233,7 +243,7 @@ def launch_gui(root_path: Path):
             super().__init__(parent)
             self.game_root = game_root
             self.setWindowTitle("OpenZenless — Building Asset Map")
-            self.resize(640, 380)
+            self.resize(680, 420)
             lay = QVBoxLayout(self)
             lay.setSpacing(10)
 
@@ -257,8 +267,9 @@ def launch_gui(root_path: Path):
             lay.addWidget(self.log_box, 1)
 
             btns = QHBoxLayout()
-            self.btn_skip = QPushButton("Skip")
-            self.btn_skip.clicked.connect(self.accept)
+            self.btn_skip = QPushButton("Use Quick Index")
+            self.btn_skip.setToolTip("Cancel full AnimeStudio scan and open immediately with quick section index")
+            self.btn_skip.clicked.connect(self._use_quick_index)
             btns.addStretch()
             btns.addWidget(self.btn_skip)
             lay.addLayout(btns)
@@ -270,22 +281,31 @@ def launch_gui(root_path: Path):
             self.worker.failed.connect(self._on_failed)
             self.worker.start()
 
+        def _use_quick_index(self):
+            self.btn_skip.setEnabled(False)
+            self.btn_skip.setText("Finishing Quick Index...")
+            self.worker.cancel_event.set()
+
         def _on_progress(self, pct: int, msg: str):
             self.pbar.setValue(pct)
             self.status_lbl.setText(msg)
 
         def _on_done(self, _manifest: dict):
             self.pbar.setValue(100)
+            self.status_lbl.setText("Asset Map complete! Opening OpenZenless...")
+            QApplication.processEvents()
             self.accept()
 
         def _on_failed(self, msg: str):
             self.status_lbl.setText(f"Mapping warning: {msg}")
             self.log_box.appendPlainText(f"[ERROR] {msg}")
+            self.btn_skip.setEnabled(True)
             self.btn_skip.setText("Continue Anyway")
 
         def closeEvent(self, event):
             if self.worker.isRunning():
-                self.worker.wait(500)
+                self.worker.cancel_event.set()
+                self.worker.wait(1500)
             super().closeEvent(event)
 
     class ExportDialog(QDialog):
@@ -311,9 +331,13 @@ def launch_gui(root_path: Path):
             tool_bar = QHBoxLayout()
             self.tool_status_lbl = QLabel()
             self.tool_status_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
-            self.btn_locate_ext = QPushButton("Locate Extractor/Output...")
+            self.btn_setup_tools = QPushButton("Setup / Build Tools")
+            self.btn_setup_tools.setToolTip("Automatically clone & build AnimeStudio.CLI and AnimeWwise into ~/.local/share/openzenless/tools")
+            self.btn_setup_tools.clicked.connect(self._setup_tools)
+            self.btn_locate_ext = QPushButton("Locate Output/Extractor...")
             self.btn_locate_ext.clicked.connect(self._locate_extractor)
             tool_bar.addWidget(self.tool_status_lbl, 1)
+            tool_bar.addWidget(self.btn_setup_tools)
             tool_bar.addWidget(self.btn_locate_ext)
             lay.addLayout(tool_bar)
 
@@ -366,6 +390,7 @@ def launch_gui(root_path: Path):
             opts_lay.setHorizontalSpacing(14)
             opts_lay.setVerticalSpacing(8)
             self.chk_glb = QCheckBox("Convert Character to GLB + Facial Morphs (Blender)")
+            self.chk_shaders = QCheckBox("Export Shaders & Materials")
             self.chk_resume = QCheckBox("Resume Map Checkpoints")
             self.chk_resume.setChecked(True)
             self.chk_dry = QCheckBox("Dry Run (Preview Full Plan)")
@@ -381,6 +406,7 @@ def launch_gui(root_path: Path):
             self.chk_wwise_map = QCheckBox("Auto-name && Organize Voices via AnimeWwise (nap.map)")
             self.chk_wwise_map.setChecked(True)
             self.chk_wav = QCheckBox("Decode .wem -> .wav (vgmstream-cli)")
+            self.chk_wav.setChecked(cfg.VGMSTREAM_CLI.is_file())
 
             self.chk_inc_chars = QCheckBox("Include Characters")
             self.chk_inc_chars.setChecked(True)
@@ -397,6 +423,7 @@ def launch_gui(root_path: Path):
             opts_lay.addWidget(self.chk_wwise_map, 1, 0)
             opts_lay.addWidget(self.chk_wav, 1, 1)
             opts_lay.addWidget(self.chk_dry, 1, 2)
+            opts_lay.addWidget(self.chk_shaders, 2, 0)
 
             full_row = QHBoxLayout()
             full_row.setContentsMargins(0, 4, 0, 0)
@@ -441,6 +468,32 @@ def launch_gui(root_path: Path):
                 f"vgmstream: {'OK' if vgm_ok else 'MISSING'} | "
                 f"Audio AKPK: Ready"
             )
+
+        def _setup_tools(self):
+            if self.worker is not None and self.worker.isRunning():
+                return
+            self.log_box.clear()
+            self.btn_run.setEnabled(False)
+            self.btn_setup_tools.setEnabled(False)
+
+            def task(cb):
+                res = ensure_extractor_tools(log_cb=cb)
+                cb(f"Tools ready: {res}")
+                return 0 if res.get("cli_exists") else 1
+
+            self.worker = BatchExportWorker(task)
+            self.worker.log_line.connect(self.log_box.appendPlainText)
+            self.worker.finished_rc.connect(lambda rc: (
+                self.btn_setup_tools.setEnabled(True),
+                self._refresh_tool_status(),
+                self.parent_win._refresh_version_badge(),
+                self._on_done(rc),
+            ))
+            self.worker.failed.connect(lambda err: (
+                self.btn_setup_tools.setEnabled(True),
+                self._on_err(err),
+            ))
+            self.worker.start()
 
         def _locate_extractor(self):
             d = QFileDialog.getExistingDirectory(
@@ -529,6 +582,7 @@ def launch_gui(root_path: Path):
             self.mode_combo.setEnabled(scope == "assets")
             self.filter_edit.setEnabled(scope == "assets")
             self.chk_glb.setEnabled(scope in ("character", "full"))
+            self.chk_shaders.setEnabled(scope in ("character", "map", "stage", "full"))
             self.chk_resume.setEnabled(scope in ("map", "stage", "full"))
             self.spin_workers.setEnabled(scope in ("map", "stage"))
             self.chk_dry.setEnabled(scope == "full")
@@ -565,6 +619,7 @@ def launch_gui(root_path: Path):
             out = Path(out_text)
             game_root = self.parent_win.game_root
             convert_glb = self.chk_glb.isChecked()
+            export_shaders = self.chk_shaders.isChecked()
             resume = self.chk_resume.isChecked()
             dry_run = self.chk_dry.isChecked()
             workers = self.spin_workers.value()
@@ -579,11 +634,11 @@ def launch_gui(root_path: Path):
 
             def task(cb):
                 if scope == "character":
-                    return export_character_full(target, out_dir=out, convert_glb=convert_glb, log_cb=cb, game_root=game_root)
+                    return export_character_full(target, out_dir=out, convert_glb=convert_glb, log_cb=cb, game_root=game_root, export_shaders=export_shaders)
                 if scope == "animations":
                     return export_character_animations_only(target, game_root, out, log_cb=cb)
                 if scope in ("map", "stage"):
-                    return export_scene_map(target, resume=resume, workers=workers, out_dir=out, log_cb=cb)
+                    return export_scene_map(target, resume=resume, workers=workers, out_dir=out, log_cb=cb, game_root=game_root, export_shaders=export_shaders)
                 if scope == "fonts":
                     return export_blk_asset_types(src, out / "Fonts", ["Font"], "Convert", log_cb=cb)
                 if scope == "assets":
@@ -598,7 +653,7 @@ def launch_gui(root_path: Path):
                     include_chars=inc_chars, include_scenes=inc_scenes,
                     include_fonts=inc_fonts, include_audio=inc_audio,
                     convert_glb=convert_glb, use_wwise_map=use_wwise, decode_wav=decode_wav,
-                    dry_run=dry_run, log_cb=cb,
+                    dry_run=dry_run, log_cb=cb, export_shaders=export_shaders,
                 )
 
             self.worker = BatchExportWorker(task)
@@ -631,6 +686,82 @@ def launch_gui(root_path: Path):
                 event.ignore()
                 return
             super().closeEvent(event)
+
+    class GameRootDialog(QDialog):
+        def __init__(self, initial_root: Path, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("OpenZenless — Select ZZZ Game Installation")
+            self.resize(640, 230)
+            self.selected_root = initial_root
+
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(18, 16, 18, 16)
+            lay.setSpacing(10)
+
+            title = QLabel("Locate Your Zenless Zone Zero Installation")
+            title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f59e0b;")
+            lay.addWidget(title)
+
+            desc = QLabel(
+                "Choose your ZZZ game folder (for example: ZenlessZoneZero Game, "
+                "com.HoYoverse.Nap, or its files/ folder) before indexing assets."
+            )
+            desc.setWordWrap(True)
+            desc.setStyleSheet("color: #94a3b8;")
+            lay.addWidget(desc)
+
+            row = QHBoxLayout()
+            self.path_edit = QLineEdit(str(initial_root) if cfg.is_valid_game_root(initial_root) else "")
+            self.path_edit.setPlaceholderText("Select ZZZ game root folder...")
+            self.path_edit.textChanged.connect(self._validate_path)
+            btn_browse = QPushButton("Browse...")
+            btn_browse.clicked.connect(self._browse)
+            row.addWidget(self.path_edit, 1)
+            row.addWidget(btn_browse)
+            lay.addLayout(row)
+
+            self.status_lbl = QLabel("")
+            self.status_lbl.setWordWrap(True)
+            lay.addWidget(self.status_lbl)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            self.btn_skip = QPushButton("Skip for now")
+            self.btn_skip.clicked.connect(self.reject)
+            self.btn_continue = QPushButton("Continue & Index")
+            self.btn_continue.setObjectName("primaryBtn")
+            self.btn_continue.clicked.connect(self._accept_root)
+            btn_row.addWidget(self.btn_skip)
+            btn_row.addWidget(self.btn_continue)
+            lay.addLayout(btn_row)
+
+            self._validate_path(self.path_edit.text())
+
+        def _browse(self):
+            start = self.path_edit.text().strip() or str(Path.home())
+            d = QFileDialog.getExistingDirectory(self, "Select ZZZ Game Installation", start)
+            if d:
+                self.path_edit.setText(d)
+
+        def _validate_path(self, text: str):
+            p = Path(text.strip()) if text.strip() else None
+            if p and cfg.is_valid_game_root(p):
+                fr = cfg.resolve_files_root(p)
+                plat = cfg.detect_build_platform(p, fr)
+                self.status_lbl.setText(f"Detected valid ZZZ files ({plat}) at: {fr}")
+                self.status_lbl.setStyleSheet("color: #4ade80;")
+                self.btn_continue.setEnabled(True)
+            else:
+                self.status_lbl.setText("No ZZZ Blocks/ or .blk/.pck files detected in this folder yet.")
+                self.status_lbl.setStyleSheet("color: #fbbf24;")
+                self.btn_continue.setEnabled(False)
+
+        def _accept_root(self):
+            p = Path(self.path_edit.text().strip())
+            self.selected_root = p
+            cfg.GAME_ROOT = p
+            cfg.save_user_config({"game_root": str(p)})
+            self.accept()
 
     class BlkExplorerWindow(QMainWindow):
         def __init__(self, initial_root: Path):
@@ -724,6 +855,11 @@ def launch_gui(root_path: Path):
             self.btn_open_folder.setToolTip("Choose ZZZ game root folder")
             self.btn_open_folder.clicked.connect(self.choose_root_folder)
             h_lay.addWidget(self.btn_open_folder)
+
+            self.btn_rebuild_map = QPushButton("Rebuild Asset Map...")
+            self.btn_rebuild_map.setToolTip("Scan game files with AnimeStudio.CLI to rebuild character & stage indexes")
+            self.btn_rebuild_map.clicked.connect(self.rebuild_asset_map)
+            h_lay.addWidget(self.btn_rebuild_map)
 
             self.btn_batch_export = QPushButton("Batch Export...")
             self.btn_batch_export.setObjectName("primaryBtn")
@@ -881,38 +1017,14 @@ def launch_gui(root_path: Path):
             self.btn_mode_adv.setChecked(idx == 1)
             self.btn_mode_viewer.setChecked(idx == 2)
             if idx == 2:
-                self._ensure_viewer_loaded()
+                self.viewer_widget.refresh_catalog()
 
         def _build_viewer_page(self) -> QWidget:
-            self._viewer_server = None
-            self._viewer_port = None
-            self._web_view = None
-            w = QWidget()
-            lay = QVBoxLayout(w)
-            lay.setContentsMargins(8, 8, 8, 8)
-            lay.setSpacing(6)
-            bar = QHBoxLayout()
-            self.viewer_status_lbl = QLabel("Exported Asset 3D Viewer & Catalog (Characters, Maps, Animations)")
-            self.viewer_status_lbl.setStyleSheet("color: #94a3b8; font-weight: 600;")
-            btn_out = QPushButton("Output Folder...")
-            btn_out.setToolTip("Point the 3D Viewer & Basic Mode at your exported output folder")
-            btn_out.clicked.connect(self._choose_output_root)
-            btn_rebuild = QPushButton("Rebuild Catalog && Reload")
-            btn_rebuild.clicked.connect(self._rebuild_and_reload_viewer)
-            btn_ext = QPushButton("Open in Browser")
-            btn_ext.clicked.connect(self._open_viewer_external)
-            bar.addWidget(self.viewer_status_lbl)
-            bar.addStretch()
-            bar.addWidget(btn_out)
-            bar.addWidget(btn_rebuild)
-            bar.addWidget(btn_ext)
-            lay.addLayout(bar)
-            self.viewer_container = QVBoxLayout()
-            lay.addLayout(self.viewer_container, 1)
-            return w
+            self.viewer_widget = NativeViewerWidget(choose_output_cb=self._choose_output_root)
+            return self.viewer_widget
 
         def _choose_output_root(self):
-            d = QFileDialog.getExistingDirectory(self, "Select Export Output Root (containing Characters / Maps_Combined / Viewer)", str(cfg.FINAL_ROOT))
+            d = QFileDialog.getExistingDirectory(self, "Select Export Output Root (containing Exports / Characters / Maps_Combined)", str(cfg.FINAL_ROOT))
             if d:
                 self.apply_output_root(Path(d))
 
@@ -925,73 +1037,8 @@ def launch_gui(root_path: Path):
             self._populate_tree()
             self._populate_basic_categories()
             self._refresh_version_badge()
-            self._ensure_viewer_loaded()
+            self.viewer_widget.refresh_catalog()
             self.status.showMessage(f"Output Root set to {cfg.FINAL_ROOT}")
-
-        def _start_viewer_server(self) -> int:
-            if self._viewer_port is not None:
-                return self._viewer_port
-            import http.server
-            import socketserver
-            import threading
-
-            class _QuietHandler(http.server.SimpleHTTPRequestHandler):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, directory=str(cfg.FINAL_ROOT), **kwargs)
-
-                def log_message(self, format, *args):
-                    pass
-
-            class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
-                daemon_threads = True
-
-            srv = _Server(("127.0.0.1", 0), _QuietHandler)
-            self._viewer_server = srv
-            self._viewer_port = srv.server_address[1]
-            t = threading.Thread(target=srv.serve_forever, daemon=True)
-            t.start()
-            return self._viewer_port
-
-        def _ensure_viewer_loaded(self):
-            from PySide6.QtCore import QUrl
-            port = self._start_viewer_server()
-            url = f"http://127.0.0.1:{port}/Viewer/index.html"
-            index_file = cfg.FINAL_ROOT / "Viewer" / "index.html"
-            if self._web_view is None:
-                from PySide6.QtWebEngineWidgets import QWebEngineView
-                self._web_view = QWebEngineView()
-                self.viewer_container.addWidget(self._web_view, 1)
-            if index_file.is_file():
-                self.viewer_status_lbl.setText(f"Embedded 3D Viewer • {url}")
-                self._web_view.setUrl(QUrl(url))
-            else:
-                self.viewer_status_lbl.setText(f"Embedded 3D Viewer • No Viewer/index.html in {cfg.FINAL_ROOT}")
-                self._web_view.setHtml(
-                    f"""<!doctype html><html><body style="margin:0;background:#0d1016;color:#e5e9f0;
-                    font-family:Inter,Segoe UI,sans-serif;display:flex;align-items:center;justify-content:center;
-                    height:100vh;"><div style="max-width:560px;padding:28px;border:1px solid #262d3d;
-                    border-radius:10px;background:#141822;text-align:center;">
-                    <h2 style="margin-top:0;color:#f59e0b;">3D Viewer Not Found</h2>
-                    <p style="color:#94a3b8;line-height:1.5;">No <code>Viewer/index.html</code> was found under:<br>
-                    <code style="color:#93c5fd;">{cfg.FINAL_ROOT}</code></p>
-                    <p style="color:#94a3b8;line-height:1.5;">Click <b>Output Folder...</b> above to point OpenZenless
-                    to an existing <code>FinalOutput</code> directory containing <code>Viewer/index.html</code>.</p>
-                    </div></body></html>"""
-                )
-
-        def _rebuild_and_reload_viewer(self):
-            for lib_name in ("build_character_catalog.py", "build_viewer_data.py"):
-                s = cfg.EXTRACTOR_ROOT / "lib" / lib_name
-                if s.exists():
-                    subprocess.run([sys.executable, str(s)], capture_output=True)
-            if self._web_view is not None:
-                self._web_view.reload()
-            self.status.showMessage("Rebuilt catalog & reloaded 3D Viewer")
-
-        def _open_viewer_external(self):
-            import webbrowser
-            port = self._start_viewer_server()
-            webbrowser.open(f"http://127.0.0.1:{port}/Viewer/index.html")
 
         def _build_basic_page(self) -> QWidget:
             page = QSplitter(Qt.Horizontal)
@@ -1049,9 +1096,11 @@ def launch_gui(root_path: Path):
             self.btn_basic_export2 = QPushButton("Animations Only")
             self.btn_basic_export2.clicked.connect(self._basic_export_secondary)
             self.btn_basic_export2.setVisible(False)
+            self.chk_basic_shaders = QCheckBox("Export Shaders & Materials")
             btn_row.addWidget(self.btn_basic_inspect)
             btn_row.addWidget(self.btn_basic_export1)
             btn_row.addWidget(self.btn_basic_export2)
+            btn_row.addWidget(self.chk_basic_shaders)
             d_lay.addLayout(btn_row)
 
             page.addWidget(detail)
@@ -1221,15 +1270,16 @@ def launch_gui(root_path: Path):
             if not out:
                 return
             out_dir = Path(out)
+            export_shaders = self.chk_basic_shaders.isChecked()
             if cat == "characters":
                 self._run_basic_export(
                     f"Exporting {r['name']}",
-                    lambda cb: export_character_full(r["id"], out_dir=out_dir, convert_glb=True, log_cb=cb, game_root=self.game_root),
+                    lambda cb: export_character_full(r["id"], out_dir=out_dir, convert_glb=True, log_cb=cb, game_root=self.game_root, export_shaders=export_shaders),
                 )
             elif cat == "maps":
                 self._run_basic_export(
                     f"Exporting Map {r['id']}",
-                    lambda cb: export_scene_map(r["id"], resume=True, workers=1, out_dir=out_dir, log_cb=cb),
+                    lambda cb: export_scene_map(r["id"], resume=True, workers=1, out_dir=out_dir, log_cb=cb, game_root=self.game_root, export_shaders=export_shaders),
                 )
             elif cat == "textures":
                 blks = [self.files_root / "Blocks" / os.path.basename(b) for b in r.get("blocks", [])]
@@ -1245,7 +1295,7 @@ def launch_gui(root_path: Path):
                     f"Unpacking {r['name']} (AnimeWwise Auto-Named)",
                     lambda cb: export_audio_pck(
                         Path(r["path"]), out_dir / "Audio",
-                        use_wwise_map=True, decode_wav=False, log_cb=cb,
+                        use_wwise_map=True, decode_wav=cfg.VGMSTREAM_CLI.is_file(), log_cb=cb,
                     ),
                 )
             elif cat == "fonts":
@@ -1383,6 +1433,34 @@ def launch_gui(root_path: Path):
             elif kind == "char":
                 self._open_block_group(f"Character: {val}", self.char_blocks.get(val, []))
 
+        def _reload_indexes(self):
+            self.stage_blocks = self._load_stage_blocks()
+            self.curated_maps = load_curated_map_index()
+            self.char_blocks = self._load_char_blocks()
+            self.char_names = load_character_names()
+            self._populate_tree()
+            self._populate_basic_categories()
+            self._refresh_version_badge()
+
+        def rebuild_asset_map(self):
+            map_dir = cfg.CACHE_DIR / "asset_map"
+            for fname in (
+                "manifest.json",
+                "zzz_assets_map.json",
+                "character_index_auto.json",
+                "stage_index_auto.json",
+                "fonts_index_auto.json",
+            ):
+                p = map_dir / fname
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            if self.files_root.exists():
+                AssetMapDialog(self.game_root, self).exec()
+            self._reload_indexes()
+
         def choose_root_folder(self):
             d = QFileDialog.getExistingDirectory(self, "Select ZZZ Game Root", str(self.game_root))
             if d:
@@ -1391,13 +1469,7 @@ def launch_gui(root_path: Path):
                 self.files_root = cfg.resolve_files_root(self.game_root)
                 if not has_asset_map(self.game_root) and self.files_root.exists():
                     AssetMapDialog(self.game_root, self).exec()
-                self.stage_blocks = self._load_stage_blocks()
-                self.curated_maps = load_curated_map_index()
-                self.char_blocks = self._load_char_blocks()
-                self.char_names = load_character_names()
-                self._populate_tree()
-                self._populate_basic_categories()
-                self._refresh_version_badge()
+                self._reload_indexes()
                 self.open_directory(self.files_root)
 
         def go_up(self):
@@ -1718,12 +1790,21 @@ def launch_gui(root_path: Path):
 
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_QSS)
+    should_index = True
+    if not cfg.has_saved_game_root() or not cfg.is_valid_game_root(root_path):
+        dlg = GameRootDialog(root_path)
+        if dlg.exec() == QDialog.Accepted:
+            root_path = dlg.selected_root
+        else:
+            should_index = False
     files_root = cfg.resolve_files_root(root_path)
-    if not has_asset_map(root_path) and files_root.exists():
+    if should_index and not has_asset_map(root_path) and files_root.exists():
         has_containers = any(files_root.rglob("*.blk")) or any(files_root.rglob("*.pck"))
         if has_containers or (cfg.EXTRACTOR_ROOT / "lib").is_dir():
             AssetMapDialog(root_path).exec()
     win = BlkExplorerWindow(root_path)
     win.show()
+    win.raise_()
+    win.activateWindow()
     sys.exit(app.exec())
 

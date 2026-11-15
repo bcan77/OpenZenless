@@ -4,9 +4,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent.parent
+TOOLS_DIR = Path.home() / ".local" / "share" / "openzenless" / "tools"
 CONFIG_FILE = Path.home() / ".config" / "openzenless" / "config.json"
 
 
@@ -35,14 +37,25 @@ def detect_default_game_root() -> Path:
     cfg = load_user_config()
     if cfg.get("game_root") and Path(cfg["game_root"]).exists():
         return Path(cfg["game_root"])
-    for cand in (
-        Path("/home/bcan77/ZenlessZoneZero_v3.4_Android_Build"),
-        Path.home() / "ZenlessZoneZero_v3.4_Android_Build",
-        Path.home() / "ZenlessZoneZero Game",
-    ):
-        if cand.exists():
-            return cand
     return Path.home()
+
+
+def has_saved_game_root() -> bool:
+    if os.environ.get("ZZZ_GAME_ROOT") and Path(os.environ["ZZZ_GAME_ROOT"]).exists():
+        return True
+    cfg = load_user_config()
+    return bool(cfg.get("game_root") and Path(cfg["game_root"]).exists())
+
+
+def is_valid_game_root(game_root: Path) -> bool:
+    if not game_root.exists():
+        return False
+    files_root = resolve_files_root(game_root)
+    if not files_root.is_dir():
+        return False
+    if (files_root / "Blocks").is_dir() or (files_root / "Audio").is_dir():
+        return True
+    return next(files_root.rglob("*.blk"), None) is not None or next(files_root.rglob("*.pck"), None) is not None
 
 
 def detect_default_final_root() -> Path:
@@ -54,7 +67,6 @@ def detect_default_final_root() -> Path:
     for cand in (
         APP_DIR / "FinalOutput",
         Path.cwd() / "FinalOutput",
-        Path("/mnt/extra/zzz34_output/FinalOutput"),
         Path.home() / "OpenZenless_Output",
     ):
         if cand.exists():
@@ -67,7 +79,7 @@ FINAL_ROOT = detect_default_final_root()
 EXTRACTOR_ROOT = FINAL_ROOT / "Extractor"
 CLI_DIR = EXTRACTOR_ROOT / "tools" / "AnimeStudioUltimate" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0"
 CLI_EXE = CLI_DIR / "AnimeStudio.CLI.exe"
-CACHE_DIR = Path(os.environ.get("ZZZ_BLK_EXPLORER_CACHE", "/tmp/zzz_blk_explorer"))
+CACHE_DIR = Path(os.environ.get("ZZZ_BLK_EXPLORER_CACHE") or (Path(tempfile.gettempdir()) / "zzz_blk_explorer"))
 ASSETS_DIR = APP_DIR / "assets"
 LOGO_HEADER = ASSETS_DIR / "OpenZenless_Header.png"
 LOGO_ICON = ASSETS_DIR / "OpenZenless_WhiteText.png"
@@ -84,7 +96,10 @@ def _resolve_tool_paths():
     if os.environ.get("ANIMESTUDIO_CLI"):
         cli_cands.append(Path(os.environ["ANIMESTUDIO_CLI"]))
     cli_cands.extend([
+        TOOLS_DIR / "AnimeStudio" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0-windows" / "AnimeStudio.CLI.exe",
+        TOOLS_DIR / "AnimeStudio" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0" / "AnimeStudio.CLI.exe",
         EXTRACTOR_ROOT / "tools" / "AnimeStudioUltimate" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0" / "AnimeStudio.CLI.exe",
+        EXTRACTOR_ROOT / "tools" / "AnimeStudio" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0-windows" / "AnimeStudio.CLI.exe",
         APP_DIR / "tools" / "AnimeStudioUltimate" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0" / "AnimeStudio.CLI.exe",
         APP_DIR / "tools" / "AnimeStudio.CLI.exe",
     ])
@@ -95,6 +110,7 @@ def _resolve_tool_paths():
     CLI_DIR = CLI_EXE.parent
 
     ww_cands = [
+        TOOLS_DIR / "AnimeWwise",
         EXTRACTOR_ROOT / "tools" / "AnimeWwise",
         APP_DIR / "tools" / "AnimeWwise",
     ]
@@ -102,6 +118,7 @@ def _resolve_tool_paths():
     NAP_MAP_FILE = ANIMEWWISE_DIR / "maps" / "nap.map"
 
     vgm_cands = [
+        TOOLS_DIR / "vgmstream" / "build" / "cli" / "vgmstream-cli",
         EXTRACTOR_ROOT / "tools" / "vgmstream" / "build" / "cli" / "vgmstream-cli",
         APP_DIR / "tools" / "vgmstream" / "build" / "cli" / "vgmstream-cli",
     ]

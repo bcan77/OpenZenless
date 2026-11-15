@@ -74,9 +74,9 @@ pip install -r requirements.txt
 ### Environment Variables (Optional)
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `ZZZ_GAME_ROOT` | `/home/bcan77/ZenlessZoneZero_v3.4_Android_Build` | Path to extracted ZZZ build root |
-| `ZZZ_FINAL_OUTPUT` | `/mnt/extra/zzz34_output/FinalOutput` | Path to `FinalOutput` (exports, `Extractor/`, `Viewer/`) |
-| `ZZZ_BLK_EXPLORER_CACHE` | `/tmp/zzz_blk_explorer` | Cache directory for decoded previews & `.blk` JSON dumps |
+| `ZZZ_GAME_ROOT` | `~/.config/openzenless/config.json` (`$HOME` fallback) | Path to ZZZ installation root |
+| `ZZZ_FINAL_OUTPUT` | `~/OpenZenless_Output` | Path to output directory (exports, `Extractor/`, `Viewer/`) |
+| `ZZZ_BLK_EXPLORER_CACHE` | `$TMPDIR/zzz_blk_explorer` | Cache directory for decoded previews, asset maps & `.blk` JSON dumps |
 
 ---
 

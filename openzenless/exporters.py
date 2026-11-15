@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from . import config as cfg
@@ -70,8 +72,237 @@ def export_blk_asset_types(
         "--export_type", export_mode,
     ]
     if name_filter.strip():
-        cmd.extend(["--filter_with_name", name_filter.strip()])
+        cmd.extend(["--names", name_filter.strip()])
     return run_streaming_cmd(cmd, cwd=cfg.CLI_DIR, env=env, log_cb=log_cb)
+
+
+_CHAR_PART_TOKENS = (
+    "Ani", "Body", "Face", "Hair", "Eye", "Eyes", "Model", "ModelAvatar",
+    "UI", "Weapon", "Cloth", "Skin", "Skill", "Common", "Effect", "NPC",
+    "Player", "Story", "Timeline", "Mat", "Tex", "Mesh", "LOD", "Pose",
+    "Show", "Walk", "Run", "Attack", "Idle", "Evade", "Switch", "QTE",
+    "Ult", "Hit", "Die", "Gal", "Lobby", "Quest", "Cutscene", "Cam",
+    "Camera", "Bone", "Rig", "Head", "Tail", "Wing", "Wings", "Hat",
+    "Cape", "Coat", "Dress", "Shoe", "Shoes", "Glove", "Gloves",
+    "Accessory", "Acc", "Prop", "Sticker", "Icon", "Portrait", "Card",
+    "Bust", "Half", "Full", "Avatar", "Default", "Bip001", "Root",
+)
+
+
+def _char_base_short(char_name: str) -> str:
+    parts = char_name.split("_")
+    if char_name.startswith("Avatar_") and len(parts) >= 4:
+        return "_".join(parts[3:])
+    return char_name
+
+
+def _char_short_name(char_name: str, all_chars=None) -> str:
+    short = _char_base_short(char_name)
+    neg_parts = []
+    if all_chars:
+        prefix = short + "_"
+        for other in all_chars:
+            other_short = _char_base_short(other)
+            if other_short.startswith(prefix):
+                sub = other_short[len(prefix):]
+                if sub:
+                    neg_parts.append(f"_{re.escape(sub)}(?:$|_)")
+    neg = f"(?!{'|'.join(sorted(set(neg_parts)))})" if neg_parts else ""
+    if "_" not in short:
+        parts_pat = "|".join(_CHAR_PART_TOKENS)
+        return f"(?:^|_){re.escape(short)}{neg}(?=$|_(?:{parts_pat})(?:$|_))"
+    return f"(?:^|_){re.escape(short)}{neg}(?:$|_)"
+
+
+def export_blks_batch(
+    blk_paths: list[Path],
+    out_dir: Path,
+    types: list[str],
+    export_mode: str = "Convert",
+    name_filter: str = "",
+    log_cb=None,
+) -> int:
+    if not blk_paths:
+        return 0
+    if len(blk_paths) == 1:
+        return export_blk_asset_types(
+            blk_paths[0], out_dir, types=types, export_mode=export_mode,
+            name_filter=name_filter, log_cb=log_cb,
+        )
+    stage_dir = Path(tempfile.mkdtemp(prefix="oz_stage_"))
+    try:
+        for blk in blk_paths:
+            link = stage_dir / blk.name
+            if not link.exists():
+                os.symlink(blk, link)
+        return export_blk_asset_types(
+            stage_dir, out_dir, types=types, export_mode=export_mode,
+            name_filter=name_filter, log_cb=log_cb,
+        )
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+
+def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
+    blender = shutil.which("blender")
+    if not blender:
+        _emit(log_cb, "WARNING: blender not found in PATH; skipping GLB conversion.")
+        return 0
+    fbxs = sorted(char_dir.rglob("*.fbx"))
+    objs = sorted(char_dir.rglob("*.obj"))
+    if len(fbxs) > 50:
+        filtered = [
+            p for p in fbxs
+            if not any(t in p.stem.lower() for t in ("_col_", "_proxy", "_lod1", "_lod2", "_lod3"))
+        ]
+        if filtered:
+            fbxs = filtered
+    if not fbxs and not objs:
+        _emit(log_cb, f"No FBX/OBJ models found in {char_dir}; skipping GLB conversion.")
+        return 0
+    glb_path = char_dir / f"{char_name}.glb"
+    fbx_list = [str(p) for p in fbxs]
+    obj_list = [str(p) for p in objs]
+    py_expr = (
+        "import bpy\n"
+        "bpy.ops.wm.read_factory_settings(use_empty=True)\n"
+        "sc = bpy.context.scene\n"
+        "hold = bpy.data.collections.new('Hold')\n"
+        "def _stash():\n"
+        "    for o in list(sc.collection.objects):\n"
+        "        sc.collection.objects.unlink(o)\n"
+        "        hold.objects.link(o)\n"
+        "    for c in list(sc.collection.children):\n"
+        "        sc.collection.children.unlink(c)\n"
+        "        hold.children.link(c)\n"
+        f"fbxs = {fbx_list!r}\n"
+        f"objs = {obj_list!r}\n"
+        "for idx, fp in enumerate(fbxs, 1):\n"
+        "    bpy.ops.import_scene.fbx(filepath=fp)\n"
+        "    _stash()\n"
+        "    if idx % 250 == 0:\n"
+        "        print(f'Imported FBX {idx}/{len(fbxs)}', flush=True)\n"
+        "if not any(o.type == 'MESH' for o in bpy.data.objects):\n"
+        "    for idx, fp in enumerate(objs, 1):\n"
+        "        bpy.ops.wm.obj_import(filepath=fp)\n"
+        "        _stash()\n"
+        "        if idx % 250 == 0:\n"
+        "            print(f'Imported OBJ {idx}/{len(objs)}', flush=True)\n"
+        "sc.collection.children.link(hold)\n"
+        "import os, re as _re\n"
+        f"pngs = [str(p) for p in sorted(__import__('pathlib').Path({str(char_dir)!r}).rglob('*.png'))]\n"
+        "diffuse_pngs = []\n"
+        "for _p in pngs:\n"
+        "    _st = os.path.splitext(os.path.basename(_p))[0].lower()\n"
+        "    if _st.endswith(('_n', '_m', '_a', '_mask', '_sdf', '_data', '_rm')):\n"
+        "        continue\n"
+        "    diffuse_pngs.append((_st, _p))\n"
+        "_img_cache = {}\n"
+        "_mat_cache = {}\n"
+        "def _pick_tex(name):\n"
+        "    nl = _re.sub(r'\\.[0-9]+$', '', name.lower())\n"
+        "    nl = _re.sub(r'^separatemesh_avatar_[^_]+_[^_]+_[^_]+_', '', nl)\n"
+        "    nl = _re.sub(r'_(?:lod[0-9]+|model)$', '', nl)\n"
+        "    nl_base = _re.sub(r'_[0-9]+$', '', nl)\n"
+        "    toks = [t for t in nl_base.split('_') if t]\n"
+        "    best_p, best_s = None, 0\n"
+        "    for st, fp in diffuse_pngs:\n"
+        "        sc_val = 0\n"
+        "        if st == nl + '_d' or st == nl_base + '_d' or st == nl:\n"
+        "            sc_val = 1000\n"
+        "        else:\n"
+        "            for k in range(len(toks), 1, -1):\n"
+        "                pref = '_'.join(toks[:k])\n"
+        "                if st.startswith(pref) and st.endswith('_d'):\n"
+        "                    sc_val = 100 + k * 10\n"
+        "                    break\n"
+        "                if st.startswith(pref):\n"
+        "                    sc_val = 50 + k * 10\n"
+        "                    break\n"
+        "            if not sc_val and toks:\n"
+        "                hits = sum(1 for t in toks if len(t) >= 3 and t in st)\n"
+        "                if hits >= 2:\n"
+        "                    sc_val = hits * 10 + (5 if st.endswith('_d') else 0)\n"
+        "        if sc_val > best_s:\n"
+        "            best_s, best_p = sc_val, fp\n"
+        "    return best_p\n"
+        "def _has_base_tex(mat):\n"
+        "    if not mat or not mat.use_nodes or not mat.node_tree:\n"
+        "        return False\n"
+        "    for nd in mat.node_tree.nodes:\n"
+        "        if nd.type == 'TEX_IMAGE' and nd.image is not None:\n"
+        "            for lk in nd.outputs[0].links:\n"
+        "                if lk.to_socket.name == 'Base Color':\n"
+        "                    return True\n"
+        "    return False\n"
+        "def _img_has_alpha(img):\n"
+        "    if img.depth not in (32, 64, 128) or not img.has_data:\n"
+        "        return False\n"
+        "    try:\n"
+        "        px = img.pixels\n"
+        "        n = len(px)\n"
+        "        step = max(4, (n // 4096) * 4)\n"
+        "        for i in range(3, n, step):\n"
+        "            if px[i] < 0.98:\n"
+        "                return True\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    return False\n"
+        "def _make_mat(fp, obj_name=''):\n"
+        "    nl = (os.path.basename(fp) + ' ' + obj_name).lower()\n"
+        "    is_sky = any(t in nl for t in ('sky', 'cloud', 'dome', 'backdrop'))\n"
+        "    is_cutout = any(t in nl for t in ('hair', 'lash', 'leaf', 'tree', 'plant', 'bush', 'grass', 'foliage', 'shadow'))\n"
+        "    key = (fp, is_sky, is_cutout)\n"
+        "    if key in _mat_cache:\n"
+        "        return _mat_cache[key]\n"
+        "    img = _img_cache.get(fp)\n"
+        "    if img is None:\n"
+        "        img = bpy.data.images.load(fp, check_existing=True)\n"
+        "        _img_cache[fp] = img\n"
+        "    mat = bpy.data.materials.new(name=os.path.splitext(os.path.basename(fp))[0])\n"
+        "    mat.use_nodes = True\n"
+        "    nt = mat.node_tree\n"
+        "    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)\n"
+        "    if bsdf is None:\n"
+        "        bsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')\n"
+        "    tex = nt.nodes.new('ShaderNodeTexImage')\n"
+        "    tex.image = img\n"
+        "    nt.links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])\n"
+        "    has_a = _img_has_alpha(img)\n"
+        "    if has_a or is_sky or is_cutout or any(t in nl for t in ('glass', 'window', 'eff', 'fx', 'trans')):\n"
+        "        nt.links.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])\n"
+        "        if hasattr(mat, 'blend_method'):\n"
+        "            mat.blend_method = 'CLIP' if is_cutout else 'BLEND'\n"
+        "        if hasattr(mat, 'alpha_threshold'):\n"
+        "            mat.alpha_threshold = 0.45\n"
+        "    if is_sky or is_cutout:\n"
+        "        mat.use_backface_culling = False\n"
+        "    _mat_cache[key] = mat\n"
+        "    return mat\n"
+        "if diffuse_pngs:\n"
+        "    for o in bpy.data.objects:\n"
+        "        if o.type != 'MESH' or not o.data:\n"
+        "            continue\n"
+        "        if o.data.materials and any(_has_base_tex(m) for m in o.data.materials):\n"
+        "            continue\n"
+        "        mname = o.data.materials[0].name if o.data.materials and o.data.materials[0] else ''\n"
+        "        fp = (_pick_tex(mname) if mname else None) or _pick_tex(o.name) or _pick_tex(o.data.name)\n"
+        "        if fp:\n"
+        "            mat = _make_mat(fp, o.name)\n"
+        "            if o.data.materials:\n"
+        "                o.data.materials[0] = mat\n"
+        "            else:\n"
+        "                o.data.materials.append(mat)\n"
+        f"bpy.ops.export_scene.gltf(filepath={str(glb_path)!r}, export_format='GLB')\n"
+    )
+    _emit(log_cb, f"Converting {len(fbxs)} FBX / {len(objs)} OBJ model(s) to GLB via Blender -> {glb_path.name}")
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
+        tf.write(py_expr)
+        script_path = Path(tf.name)
+    try:
+        return run_streaming_cmd([blender, "--background", "--python", str(script_path)], log_cb=log_cb)
+    finally:
+        script_path.unlink(missing_ok=True)
 
 
 def export_character_full(
@@ -80,6 +311,7 @@ def export_character_full(
     convert_glb: bool = False,
     log_cb=None,
     game_root: Path | None = None,
+    export_shaders: bool = False,
 ) -> int:
     script = cfg.EXTRACTOR_ROOT / "lib" / "extract_character_v2.py"
     if not script.exists():
@@ -93,17 +325,31 @@ def export_character_full(
                 resolved = [blocks_dir / f"{b}.blk" for b in blocks if (blocks_dir / f"{b}.blk").is_file()]
             if resolved:
                 dest = (out_dir or (cfg.FINAL_ROOT / "Exports")) / char_name
-                _emit(log_cb, f"extract_character_v2.py not found; exporting {len(resolved)} .blk(s) via AnimeStudio.CLI -> {dest}")
-                last_rc = 0
-                for blk in resolved:
-                    rc = export_blk_asset_types(
-                        blk, dest,
-                        types=["Mesh", "Texture2D", "AnimationClip", "Animator", "Avatar"],
-                        export_mode="Convert",
-                        log_cb=log_cb,
-                    )
-                    if rc != 0:
-                        last_rc = rc
+                char_short = _char_short_name(char_name, chars.keys())
+                _emit(log_cb, f"Exporting {char_name} from {len(resolved)} .blk(s) via AnimeStudio.CLI (filter={char_short}) -> {dest}")
+                types_list = ["Mesh", "Texture2D", "Animator", "Avatar"]
+                if export_shaders:
+                    types_list.extend(["Shader", "Material"])
+                last_rc = export_blks_batch(
+                    resolved, dest,
+                    types=types_list,
+                    export_mode="Convert",
+                    name_filter=char_short,
+                    log_cb=log_cb,
+                )
+                if convert_glb and last_rc == 0:
+                    rc_glb = _convert_dir_to_glb(dest, char_name, log_cb=log_cb)
+                    if rc_glb != 0:
+                        last_rc = rc_glb
+                rc_anim = export_blks_batch(
+                    resolved, dest,
+                    types=["AnimationClip"],
+                    export_mode="Convert",
+                    name_filter=char_short,
+                    log_cb=log_cb,
+                )
+                if rc_anim != 0:
+                    _emit(log_cb, f"WARNING: AnimationClip export returned rc={rc_anim} (some clips could not be decoded).")
                 return last_rc
         raise FileNotFoundError(
             f"Missing {script} (and AnimeStudio.CLI.exe fallback unavailable). "
@@ -157,19 +403,16 @@ def export_character_animations_only(
 
     dest_dir = out_dir / char_name / "Animations"
     dest_dir.mkdir(parents=True, exist_ok=True)
-    _emit(log_cb, f"Exporting animations only for {char_name} from {len(resolved)} .blk file(s) -> {dest_dir}")
-    last_rc = 0
-    for blk in resolved:
-        rc = export_blk_asset_types(
-            blk,
-            dest_dir,
-            types=["AnimationClip", "Animator", "Avatar"],
-            export_mode="Convert",
-            log_cb=log_cb,
-        )
-        if rc != 0:
-            last_rc = rc
-    return last_rc
+    char_short = _char_short_name(char_name, chars.keys())
+    _emit(log_cb, f"Exporting animations only for {char_name} (filter={char_short}) from {len(resolved)} .blk file(s) -> {dest_dir}")
+    return export_blks_batch(
+        resolved,
+        dest_dir,
+        types=["AnimationClip", "Animator", "Avatar"],
+        export_mode="Convert",
+        name_filter=char_short,
+        log_cb=log_cb,
+    )
 
 
 def export_scene_map(
@@ -178,10 +421,51 @@ def export_scene_map(
     workers: int = 1,
     out_dir: Path | None = None,
     log_cb=None,
+    game_root: Path | None = None,
+    export_shaders: bool = False,
 ) -> int:
     script = cfg.EXTRACTOR_ROOT / "lib" / "export_maps_pipeline.py"
     if not script.exists():
-        raise FileNotFoundError(f"Missing {script}")
+        stages = load_curated_map_index()
+        if cfg.CLI_EXE.is_file() and shutil.which("wine") is not None and stages:
+            files_root = cfg.resolve_files_root(game_root or cfg.GAME_ROOT)
+            blocks_dir = files_root / "Blocks"
+            targets = (
+                [(stage_name, stages[stage_name])]
+                if stage_name and stage_name.lower() != "all" and stage_name in stages
+                else list(stages.items()) if (not stage_name or stage_name.lower() == "all") else []
+            )
+            if targets:
+                base_out = out_dir or (cfg.FINAL_ROOT / "Exports")
+                last_rc = 0
+                for sname, blocks in targets:
+                    resolved = [blocks_dir / os.path.basename(b) for b in blocks if (blocks_dir / os.path.basename(b)).is_file()]
+                    if not resolved:
+                        resolved = [blocks_dir / f"{b}.blk" for b in blocks if (blocks_dir / f"{b}.blk").is_file()]
+                    if not resolved:
+                        continue
+                    dest = base_out / sname
+                    _emit(log_cb, f"Exporting map {sname} ({len(resolved)} .blk(s)) via AnimeStudio.CLI -> {dest}")
+                    map_types = ["Mesh", "Texture2D", "GameObject", "Animator"]
+                    if export_shaders:
+                        map_types.extend(["Shader", "Material"])
+                    rc = export_blks_batch(
+                        resolved, dest,
+                        types=map_types,
+                        export_mode="Convert",
+                        name_filter="",
+                        log_cb=log_cb,
+                    )
+                    if rc == 0:
+                        rc_glb = _convert_dir_to_glb(dest, sname, log_cb=log_cb)
+                        if rc_glb != 0:
+                            rc = rc_glb
+                    if rc != 0:
+                        last_rc = rc
+                return last_rc
+        raise FileNotFoundError(
+            f"Missing {script} (and AnimeStudio.CLI.exe stage fallback unavailable)."
+        )
     cmd = [sys.executable, str(script), "--workers", str(max(1, workers))]
     if resume:
         cmd.append("--resume")
@@ -282,6 +566,7 @@ def export_full_game(
     decode_wav: bool = False,
     dry_run: bool = False,
     log_cb=None,
+    export_shaders: bool = False,
 ) -> int:
     files_root = cfg.resolve_files_root(game_root)
     chars = sorted(load_character_index().keys())
@@ -297,7 +582,7 @@ def export_full_game(
     has_cli = cfg.CLI_EXE.is_file() and shutil.which("wine") is not None
 
     chars_ready = include_chars and bool(chars) and (char_script.is_file() or (has_cli and blocks_dir.exists()))
-    scenes_ready = include_scenes and map_script.is_file()
+    scenes_ready = include_scenes and (map_script.is_file() or (has_cli and blocks_dir.exists() and bool(maps)))
     fonts_ready = include_fonts and blocks_dir.exists() and has_cli
     audio_ready = include_audio and has_pcks
 
@@ -339,7 +624,8 @@ def export_full_game(
                 _emit(log_cb, f"[{idx}/{len(chars)}] Exporting character {ch}...")
                 try:
                     rc = export_character_full(
-                        ch, out_dir=out_dir / "Characters", convert_glb=convert_glb, log_cb=log_cb, game_root=game_root
+                        ch, out_dir=out_dir / "Characters", convert_glb=convert_glb, log_cb=log_cb,
+                        game_root=game_root, export_shaders=export_shaders,
                     )
                     if rc != 0:
                         had_errors = True
@@ -355,7 +641,10 @@ def export_full_game(
             ran_any = True
             _emit(log_cb, "Exporting curated maps...")
             try:
-                rc = export_scene_map("all", resume=True, workers=1, out_dir=out_dir / "Maps_Combined", log_cb=log_cb)
+                rc = export_scene_map(
+                    "all", resume=True, workers=1, out_dir=out_dir / "Maps_Combined",
+                    log_cb=log_cb, game_root=game_root, export_shaders=export_shaders,
+                )
                 if rc != 0:
                     had_errors = True
                     _emit(log_cb, f"[WARN] Curated Maps exited with code {rc}")
