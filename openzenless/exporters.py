@@ -16,6 +16,7 @@ from .indexer import (
     load_character_index,
     load_curated_map_index,
     load_stage_texture_blocks,
+    load_stage_texture_blocks_for_dir,
     load_wwise_mapper,
 )
 
@@ -153,13 +154,13 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         return 0
     fbxs = sorted(char_dir.rglob("*.fbx"))
     objs = sorted(char_dir.rglob("*.obj"))
-    if len(fbxs) > 50:
-        filtered = [
-            p for p in fbxs
-            if not any(t in p.stem.lower() for t in ("_col_", "_proxy", "_lod1", "_lod2", "_lod3"))
-        ]
-        if filtered:
-            fbxs = filtered
+    def _filter_models(paths: list[Path]) -> list[Path]:
+        non_col = [p for p in paths if not any(t in p.stem.lower() for t in ("_col_", "_proxy"))]
+        base = non_col if non_col else paths
+        non_lod = [p for p in base if not any(t in p.stem.lower() for t in ("_lod1", "_lod2", "_lod3"))]
+        return non_lod if non_lod else base
+    fbxs = _filter_models(fbxs)
+    objs = _filter_models(objs)
     if not fbxs and not objs:
         _emit(log_cb, f"No FBX/OBJ models found in {char_dir}; skipping GLB conversion.")
         return 0
@@ -185,14 +186,23 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "    _stash()\n"
         "    if idx % 250 == 0:\n"
         "        print(f'Imported FBX {idx}/{len(fbxs)}', flush=True)\n"
+        "import os, re as _re\n"
+        f"_is_char_dir = {char_name.startswith('Avatar_')!r}\n"
         "if not any(o.type == 'MESH' for o in bpy.data.objects):\n"
+        "    if _is_char_dir:\n"
+        "        _sep = [p for p in objs if os.path.basename(p).lower().startswith('separatemesh_')]\n"
+        "        if _sep:\n"
+        "            _sep_low = ' '.join(os.path.basename(p).lower() for p in _sep)\n"
+        "            objs = [p for p in objs if p in _sep or os.path.splitext(os.path.basename(p))[0].lower() not in _sep_low]\n"
         "    for idx, fp in enumerate(objs, 1):\n"
-        "        bpy.ops.wm.obj_import(filepath=fp)\n"
+        "        if _is_char_dir or os.path.basename(fp).lower().startswith('separatemesh_'):\n"
+        "            bpy.ops.wm.obj_import(filepath=fp, forward_axis='NEGATIVE_Y', up_axis='Z')\n"
+        "        else:\n"
+        "            bpy.ops.wm.obj_import(filepath=fp)\n"
         "        _stash()\n"
         "        if idx % 250 == 0:\n"
         "            print(f'Imported OBJ {idx}/{len(objs)}', flush=True)\n"
         "sc.collection.children.link(hold)\n"
-        "import os, re as _re\n"
         f"pngs = [str(p) for p in sorted(__import__('pathlib').Path({str(char_dir)!r}).rglob('*.png'))]\n"
         "diffuse_pngs = []\n"
         "for _p in pngs:\n"
@@ -204,6 +214,7 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "_mat_cache = {}\n"
         "def _pick_tex(name):\n"
         "    nl = _re.sub(r'\\.[0-9]+$', '', name.lower())\n"
+        "    nl = _re.sub(r'\\s*\\([0-9]+\\)$', '', nl).strip()\n"
         "    nl = _re.sub(r'^separatemesh_.*?_model_', '', nl)\n"
         "    nl = _re.sub(r'^separatemesh_avatar_[^_]+_[^_]+_[^_]+_', '', nl)\n"
         "    nl = _re.sub(r'_(?:lod[0-9]+|model)$', '', nl)\n"
@@ -211,7 +222,7 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "    num_suf = m_num.group(1) if m_num else None\n"
         "    nl_base = _re.sub(r'_[0-9]+$', '', nl)\n"
         "    toks = [t for t in nl_base.split('_') if t]\n"
-        "    is_avatar = len(toks) >= 2 and toks[1] in ('body', 'face', 'hair', 'weapon', 'eye', 'cloth')\n"
+        "    is_avatar = len(toks) >= 2 and toks[1] in ('body', 'face', 'hair', 'weapon', 'eye', 'cloth', 'eyeglass', 'glasses')\n"
         "    best_p, best_s = None, 0\n"
         "    for st, fp in diffuse_pngs:\n"
         "        if any(k in st for k in ('decal', 'floodlight', '_eff')) and not any(k in nl for k in ('decal', 'floodlight', 'eff', 'light')):\n"
@@ -232,8 +243,14 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "                if st.startswith(pref + '_'):\n"
         "                    sc_val = 100 + k * 10 + (10 if st.endswith('_d') else 0) + map_bonus\n"
         "                    break\n"
-        "        elif is_avatar and toks[1] == 'hair' and '_body' in st and st.endswith('_d'):\n"
+        "        elif is_avatar and toks[1] in ('hair', 'eyeglass', 'glasses') and ('_body' in st or '_face' in st) and st.endswith('_d'):\n"
         "            sc_val = 60\n"
+        "        if sc_val == 0 and len(toks) >= 3:\n"
+        "            noun = toks[-1].rstrip('s')\n"
+        "            if len(noun) >= 5 and noun in st:\n"
+        "                sc_val = 90 + (10 if st.endswith('_d') else 0)\n"
+        "            elif st.startswith(toks[0] + '_' + toks[1] + '_'):\n"
+        "                sc_val = 40 + (10 if st.endswith('_d') else 0)\n"
         "        if sc_val > best_s:\n"
         "            best_s, best_p = sc_val, fp\n"
         "    return best_p\n"
@@ -261,7 +278,7 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "    return False\n"
         "def _make_mat(fp, obj_name=''):\n"
         "    nl = (os.path.basename(fp) + ' ' + obj_name).lower()\n"
-        "    is_sky = any(t in nl for t in ('sky', 'cloud', 'dome', 'backdrop'))\n"
+        "    is_sky = bool(_re.search(r'(?:^|[_\\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\\s.0-9])', nl))\n"
         "    is_cutout = any(t in nl for t in ('hair', 'lash', 'leaf', 'tree', 'plant', 'bush', 'grass', 'foliage', 'shadow'))\n"
         "    key = (fp, is_sky, is_cutout)\n"
         "    if key in _mat_cache:\n"
@@ -292,6 +309,12 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "    _mat_cache[key] = mat\n"
         "    return mat\n"
         "if diffuse_pngs:\n"
+        "    _mesh_objs = [o for o in bpy.data.objects if o.type == 'MESH' and o.data]\n"
+        "    _non_proxy = [o for o in _mesh_objs if not _re.search(r'(?:_col_|_col$|_proxy(?:\\.[0-9]+)?$|_lod[1-3](?:\\.[0-9]+)?$)', o.name.lower())]\n"
+        "    if _non_proxy:\n"
+        "        for o in _mesh_objs:\n"
+        "            if o not in _non_proxy:\n"
+        "                bpy.data.objects.remove(o, do_unlink=True)\n"
         "    for o in bpy.data.objects:\n"
         "        if o.type != 'MESH' or not o.data:\n"
         "            continue\n"
@@ -468,7 +491,7 @@ def export_scene_map(
                         name_filter="",
                         log_cb=log_cb,
                     )
-                    tex_blk_names, tex_pat = load_stage_texture_blocks(sname)
+                    tex_blk_names, tex_pat = load_stage_texture_blocks_for_dir(sname, dest)
                     if tex_blk_names and tex_pat:
                         seen_names = {p.name for p in resolved}
                         extra_tex = [
