@@ -393,13 +393,13 @@ def load_stage_texture_blocks_for_dir(stage_name: str, stage_dir: Path) -> tuple
                     if len(tl) >= 5 and not tl.isdigit() and tl in noun_data:
                         mesh_nouns.add(tl)
 
-    # Round-robin across every key and noun so no prop category is starved, then fill by score
+    # Round-robin across exact nouns FIRST, then mesh_keys, then stage_toks
     seen: list[str] = []
     seen_set: set[str] = set()
     buckets: list[list[str]] = (
-        [key_data.get(k, [])[:6] for k in sorted(mesh_keys)]
-        + [noun_data.get(n, [])[:4] for n in sorted(mesh_nouns)]
-        + [pref_data.get(t.lower(), [])[:12] for t in stage_toks]
+        [noun_data.get(n, [])[:3] for n in sorted(mesh_nouns)]
+        + [key_data.get(k, [])[:4] for k in sorted(mesh_keys)]
+        + [pref_data.get(t.lower(), [])[:8] for t in stage_toks]
     )
     max_len = max((len(b) for b in buckets), default=0)
     for idx_b in range(max_len):
@@ -409,9 +409,9 @@ def load_stage_texture_blocks_for_dir(stage_name: str, stage_dir: Path) -> tuple
                 if blk not in seen_set:
                     seen_set.add(blk)
                     seen.append(blk)
-                    if len(seen) >= 48:
+                    if len(seen) >= 96:
                         break
-        if len(seen) >= 48:
+        if len(seen) >= 96:
             break
 
     if not mesh_prefixes and not mesh_nouns:
