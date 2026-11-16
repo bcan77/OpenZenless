@@ -79,7 +79,17 @@ FINAL_ROOT = detect_default_final_root()
 EXTRACTOR_ROOT = FINAL_ROOT / "Extractor"
 CLI_DIR = EXTRACTOR_ROOT / "tools" / "AnimeStudioUltimate" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0"
 CLI_EXE = CLI_DIR / "AnimeStudio.CLI.exe"
-CACHE_DIR = Path(os.environ.get("ZZZ_BLK_EXPLORER_CACHE") or (Path(tempfile.gettempdir()) / "zzz_blk_explorer"))
+CACHE_DIR = Path(
+    os.environ.get("ZZZ_BLK_EXPLORER_CACHE")
+    or (Path.home() / ".local" / "share" / "openzenless" / "cache")
+)
+_LEGACY_TMP_CACHE = Path(tempfile.gettempdir()) / "zzz_blk_explorer"
+if not (CACHE_DIR / "asset_map").exists() and (_LEGACY_TMP_CACHE / "asset_map").exists():
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(_LEGACY_TMP_CACHE / "asset_map", CACHE_DIR / "asset_map", dirs_exist_ok=True)
+    except Exception:
+        pass
 ASSETS_DIR = APP_DIR / "assets"
 LOGO_HEADER = ASSETS_DIR / "OpenZenless_Header.png"
 LOGO_ICON = ASSETS_DIR / "OpenZenless_WhiteText.png"

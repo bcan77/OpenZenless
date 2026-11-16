@@ -191,7 +191,13 @@ def _parse_cli_asset_map(
     stages_auto: dict[str, set[str]] = {}
     tex_prefix_blocks: dict[str, dict[str, int]] = {}
     tex_key_blocks: dict[str, dict[str, int]] = {}
+    tex_noun_blocks: dict[str, dict[str, int]] = {}
     font_blocks: set[str] = set()
+    _GENERIC_NOUNS = frozenset((
+        "prop", "wall", "floor", "decal", "object", "model", "ceiling", "ground",
+        "building", "light", "mask", "shadow", "general", "paper", "crack",
+        "small", "large", "door", "window", "metal", "stone", "wood", "glass",
+    ))
 
     entry_count = 0
     bytes_read = 0
@@ -231,6 +237,10 @@ def _parse_cli_asset_map(
                     t_key = f"{parts[0]}_{parts[1]}"
                     kmap = tex_key_blocks.setdefault(t_key, {})
                     kmap[blk_name] = kmap.get(blk_name, 0) + 1
+                for tok in parts[2:]:
+                    if len(tok) >= 5 and not tok.isdigit() and tok not in _GENERIC_NOUNS:
+                        nmap = tex_noun_blocks.setdefault(tok.rstrip("s"), {})
+                        nmap[blk_name] = nmap.get(blk_name, 0) + 1
 
     def _extract_str_val(line: str, key: str) -> str | None:
         idx = line.find(key)
@@ -294,6 +304,12 @@ def _parse_cli_asset_map(
             for k, v in sorted(tex_key_blocks.items())
         }
         (map_dir / "tex_key_blocks_auto.json").write_text(json.dumps(compact_keys))
+    if tex_noun_blocks:
+        compact_nouns = {
+            k: [b for b, _c in sorted(v.items(), key=lambda it: -it[1])[:12]]
+            for k, v in sorted(tex_noun_blocks.items())
+        }
+        (map_dir / "tex_noun_blocks_auto.json").write_text(json.dumps(compact_nouns))
     _emit(
         log_cb,
         f"Parsed AnimeStudio AssetMap ({entry_count} entries): "
@@ -335,8 +351,9 @@ def load_stage_texture_blocks_for_dir(stage_name: str, stage_dir: Path) -> tuple
     """Find shared texture .blks for every mesh prefix/category exported into stage_dir."""
     map_dir = cfg.CACHE_DIR / "asset_map"
     key_p = map_dir / "tex_key_blocks_auto.json"
+    noun_p = map_dir / "tex_noun_blocks_auto.json"
     pref_p = map_dir / "stage_prefix_blocks_auto.json"
-    if not key_p.is_file():
+    if not key_p.is_file() or not noun_p.is_file():
         am = map_dir / "zzz_assets_map.json"
         if am.is_file():
             try:
@@ -345,22 +362,20 @@ def load_stage_texture_blocks_for_dir(stage_name: str, stage_dir: Path) -> tuple
                 pass
 
     key_data: dict[str, list[str]] = {}
+    noun_data: dict[str, list[str]] = {}
     pref_data: dict[str, list[str]] = {}
-    if key_p.is_file():
-        try:
-            key_data = json.loads(key_p.read_text())
-        except Exception:
-            pass
-    if pref_p.is_file():
-        try:
-            pref_data = json.loads(pref_p.read_text())
-        except Exception:
-            pass
+    for fp, dst in ((key_p, key_data), (noun_p, noun_data), (pref_p, pref_data)):
+        if fp.is_file():
+            try:
+                dst.update(json.loads(fp.read_text()))
+            except Exception:
+                pass
 
     clean = re.sub(r"^(?:Stage|Env|Scene|Map)_", "", stage_name)
     stage_toks = [t for t in clean.split("_") if len(t) >= 3 and not t.isdigit()]
     mesh_prefixes: set[str] = set(stage_toks)
     mesh_keys: set[str] = set()
+    mesh_nouns: set[str] = set()
 
     if stage_dir.is_dir():
         for ext in ("*.fbx", "*.obj"):
@@ -373,23 +388,40 @@ def load_stage_texture_blocks_for_dir(stage_name: str, stage_dir: Path) -> tuple
                     mesh_prefixes.add(parts[0])
                 if len(parts) >= 2:
                     mesh_keys.add(f"{parts[0].lower()}_{parts[1].lower()}")
+                for tok in parts[2:]:
+                    tl = tok.lower().rstrip("s")
+                    if len(tl) >= 5 and not tl.isdigit() and tl in noun_data:
+                        mesh_nouns.add(tl)
 
-    blk_scores: dict[str, int] = {}
-    for k in sorted(mesh_keys):
-        for b in key_data.get(k, ())[:12]:
-            blk_scores[b] = blk_scores.get(b, 0) + 3
-    for t in stage_toks:
-        for b in pref_data.get(t.lower(), ())[:24]:
-            blk_scores[b] = blk_scores.get(b, 0) + 2
-    if not blk_scores:
-        for t in sorted(mesh_prefixes):
-            for b in pref_data.get(t.lower(), ())[:8]:
-                blk_scores[b] = blk_scores.get(b, 0) + 1
-    seen = [b for b, _sc in sorted(blk_scores.items(), key=lambda it: -it[1])[:36]]
+    # Round-robin across every key and noun so no prop category is starved, then fill by score
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    buckets: list[list[str]] = (
+        [key_data.get(k, [])[:6] for k in sorted(mesh_keys)]
+        + [noun_data.get(n, [])[:4] for n in sorted(mesh_nouns)]
+        + [pref_data.get(t.lower(), [])[:12] for t in stage_toks]
+    )
+    max_len = max((len(b) for b in buckets), default=0)
+    for idx_b in range(max_len):
+        for bucket in buckets:
+            if idx_b < len(bucket):
+                blk = bucket[idx_b]
+                if blk not in seen_set:
+                    seen_set.add(blk)
+                    seen.append(blk)
+                    if len(seen) >= 48:
+                        break
+        if len(seen) >= 48:
+            break
 
-    if not mesh_prefixes:
+    if not mesh_prefixes and not mesh_nouns:
         return [], ""
-    pat = f"^(?:{'|'.join(re.escape(t) for t in sorted(mesh_prefixes))})_"
+    pref_pat = f"(?:{'|'.join(re.escape(t) for t in sorted(mesh_prefixes))})_" if mesh_prefixes else ""
+    if mesh_nouns:
+        noun_pat = f"(?:{'|'.join(re.escape(n) for n in sorted(mesh_nouns))})"
+        pat = f"^(?:{pref_pat})|(?:{noun_pat})" if pref_pat else noun_pat
+    else:
+        pat = f"^{pref_pat}"
     return seen, pat
 
 

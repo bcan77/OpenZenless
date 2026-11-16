@@ -440,6 +440,8 @@ def load_glb_scene(path: Path) -> GLScene:
                 uvs = None
                 if prim.attributes.TEXCOORD_0 is not None:
                     uvs = _read_accessor(gltf, blob, prim.attributes.TEXCOORD_0).astype(np.float32)
+                elif getattr(prim.attributes, "TEXCOORD_1", None) is not None:
+                    uvs = _read_accessor(gltf, blob, prim.attributes.TEXCOORD_1).astype(np.float32)
 
                 if prim.indices is not None:
                     idx = _read_accessor(gltf, blob, prim.indices).astype(np.uint32).reshape(-1)
@@ -471,7 +473,7 @@ def load_glb_scene(path: Path) -> GLScene:
 
                 hint = f"{node.name or ''} {mesh.name or ''} {mat_name}".lower()
                 is_sky = bool(re.search(r"(?:^|[_\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\s.0-9])", hint))
-                is_cutout = any(t in hint for t in ("hair", "lash", "leaf", "tree", "plant", "bush", "grass", "foliage"))
+                is_cutout = any(t in hint for t in ("hair", "lash", "leaf", "tree", "plant", "shrub", "bush", "grass", "foliage"))
                 if is_sky:
                     double_sided = True
                     if alpha_mode == "OPAQUE" and tex_data is not None:
@@ -480,10 +482,6 @@ def load_glb_scene(path: Path) -> GLScene:
                     a_min = int(np.frombuffer(tex_data[0], dtype=np.uint8)[3::4].min())
                     if a_min < 250:
                         alpha_mode = "MASK"
-                elif alpha_mode == "BLEND" and tex_data is not None and not any(t in hint for t in ("glass", "window", "water", "eff", "fx", "decal", "trans")):
-                    a_mean = float(np.frombuffer(tex_data[0], dtype=np.uint8)[3::4].mean())
-                    if a_mean < 5.0:
-                        alpha_mode = "OPAQUE"
 
                 gm = _match_game_material(game_mats, mat_name, mesh.name or "", node.name or "")
                 toon_smooth = 0.08
@@ -504,6 +502,11 @@ def load_glb_scene(path: Path) -> GLScene:
                     toon_spec = gm["specular"]
                     rim_glow = gm["rim_glow"]
                     rim_col = gm["rim_color"]
+
+                if alpha_mode == "BLEND" and tex_data is not None and not is_sky and not any(t in hint for t in ("glass", "window", "water", "eff", "fx", "decal", "trans")):
+                    a_mean = float(np.frombuffer(tex_data[0], dtype=np.uint8)[3::4].mean())
+                    if a_mean < 5.0:
+                        alpha_mode = "OPAQUE"
 
                 if len(pos_w) > 0:
                     pmin = pos_w.min(axis=0)
