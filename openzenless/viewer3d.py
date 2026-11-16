@@ -745,6 +745,8 @@ class GLBViewport(QOpenGLWidget):
         self.anim_time: float = 0.0
         self._bone_keys: list[tuple[str, ...]] = []
         self._bone_scale: float = 1.0
+        self._rest_local_rel: list[np.ndarray] = []
+        self._rest_pts: np.ndarray = np.zeros((0, 3), dtype=np.float32)
         self._inv_rest_worlds: list[np.ndarray] = []
         self._mesh_bind: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         self._toon_prog: QOpenGLShaderProgram | None = None
@@ -764,6 +766,8 @@ class GLBViewport(QOpenGLWidget):
         self.anim_time = 0.0
         self._bone_keys = []
         self._bone_scale = 1.0
+        self._rest_local_rel = []
+        self._rest_pts = np.zeros((0, 3), dtype=np.float32)
         self._inv_rest_worlds = []
         self._mesh_bind = []
         self._upload_textures()
@@ -1036,33 +1040,63 @@ class GLBViewport(QOpenGLWidget):
                 keys.append(f"path_{zlib.crc32('/'.join(parts[k:]).encode('utf-8'))}")
             self._bone_keys.append(tuple(keys))
 
-        rest_pts = np.array([b.rest_world[:3, 3] for b in bones], dtype=np.float32)
-        b_span = float(np.linalg.norm(rest_pts.max(axis=0) - rest_pts.min(axis=0))) if len(rest_pts) else 1.0
-        s_span = max(0.1, float(self.scene.radius * 2.0))
-        self._bone_scale = round(s_span / max(b_span, 1e-5), 2) if (b_span > 1e-5 and b_span < s_span * 0.25) else 1.0
-        if abs(self._bone_scale - 100.0) < 25.0:
-            self._bone_scale = 100.0
+        root_s = float(np.mean(np.abs(bones[0].scale))) if bones else 1.0
+        if 1e-4 < root_s < 0.25:
+            self._bone_scale = round(1.0 / root_s, 4)
+        else:
+            rest_pts = np.array([b.rest_world[:3, 3] for b in bones], dtype=np.float32)
+            b_span = float(np.linalg.norm(rest_pts.max(axis=0) - rest_pts.min(axis=0))) if len(rest_pts) else 1.0
+            body_pts = [sm.positions for sm in self.scene.submeshes if not sm.is_weapon and len(sm.positions)]
+            if body_pts:
+                bp = np.concatenate(body_pts, axis=0)
+                s_span = max(0.1, float(np.linalg.norm(bp.max(axis=0) - bp.min(axis=0))))
+            else:
+                s_span = max(0.1, float(self.scene.radius * 2.0))
+            self._bone_scale = round(s_span / max(b_span, 1e-5), 2) if (b_span > 1e-5 and b_span < s_span * 0.25) else 1.0
+            if abs(self._bone_scale - 100.0) < 25.0:
+                self._bone_scale = 100.0
 
         self._inv_rest_worlds = []
+        self._rest_local_rel = []
+        rest_worlds_scaled: list[np.ndarray] = []
         scaled_rest_pts = []
         for b in bones:
             rw = b.rest_world.copy()
             rw[:3, 3] *= self._bone_scale
-            # Orthonormalize rotation part for clean inverse
             rot = rw[:3, :3]
             norms = np.linalg.norm(rot, axis=0, keepdims=True)
             rw[:3, :3] = np.divide(rot, np.maximum(norms, 1e-6))
+            rest_worlds_scaled.append(rw)
             try:
                 self._inv_rest_worlds.append(np.linalg.inv(rw).astype(np.float32))
             except np.linalg.LinAlgError:
                 self._inv_rest_worlds.append(np.eye(4, dtype=np.float32))
             scaled_rest_pts.append(rw[:3, 3])
+            if b.parent >= 0:
+                self._rest_local_rel.append((self._inv_rest_worlds[b.parent] @ rw).astype(np.float32))
+            else:
+                self._rest_local_rel.append(rw.astype(np.float32))
         rest_arr = np.asarray(scaled_rest_pts, dtype=np.float32)
+        self._rest_pts = rest_arr
 
-        bip_idx = np.array([i for i, b in enumerate(bones) if "bip001" in b.name.lower()], dtype=np.int32)
-        if len(bip_idx) == 0:
-            bip_idx = np.arange(len(bones), dtype=np.int32)
-        cand_pts = rest_arr[bip_idx]
+        # Bind to primary Bip001 bone segments (exclude duplicate .001/.002 armatures)
+        seg_bones = [
+            i for i, b in enumerate(bones)
+            if "bip001" in b.name.lower()
+            and not re.search(r"\.\d+$", b.name)
+            and b.parent >= 0
+            and "bip001" in bones[b.parent].name.lower()
+            and not re.search(r"\.\d+$", bones[b.parent].name)
+        ]
+        if not seg_bones:
+            seg_bones = [i for i, b in enumerate(bones) if "bip001" in b.name.lower() and not re.search(r"\.\d+$", b.name)]
+        if not seg_bones:
+            seg_bones = list(range(len(bones)))
+        seg_idx = np.array(seg_bones, dtype=np.int32)
+        seg_a = np.asarray([rest_arr[bones[i].parent] if bones[i].parent >= 0 else rest_arr[i] for i in seg_bones], dtype=np.float32)
+        seg_b = rest_arr[seg_idx]
+        seg_ab = seg_b - seg_a
+        seg_len2 = np.maximum(np.sum(seg_ab * seg_ab, axis=1), 1e-8)
 
         self._mesh_bind = []
         for sm in self.scene.submeshes:
@@ -1070,19 +1104,47 @@ class GLBViewport(QOpenGLWidget):
             rn = sm.normals.copy()
             n_v = len(rp)
             bi = np.zeros(n_v, dtype=np.int32)
-            for start in range(0, n_v, 2048):
-                chunk = rp[start : start + 2048]
-                d2 = np.sum((chunk[:, None, :] - cand_pts[None, :, :]) ** 2, axis=2)
-                bi[start : start + 2048] = bip_idx[np.argmin(d2, axis=1)]
+            for start in range(0, n_v, 1024):
+                chunk = rp[start : start + 1024]
+                ap = chunk[:, None, :] - seg_a[None, :, :]
+                t_proj = np.clip(np.sum(ap * seg_ab[None, :, :], axis=2) / seg_len2[None, :], 0.0, 1.0)
+                closest = seg_a[None, :, :] + t_proj[:, :, None] * seg_ab[None, :, :]
+                d2 = np.sum((chunk[:, None, :] - closest) ** 2, axis=2)
+                bi[start : start + 1024] = seg_idx[np.argmin(d2, axis=1)]
             self._mesh_bind.append((rp, rn, bi))
 
     def _apply_skinning_frame(self):
-        if not self.scene or not self._mesh_bind:
+        if not self.scene or not self._mesh_bind or len(self._rest_pts) == 0:
             return
         worlds = self._eval_animated_bones()
-        if not worlds or len(worlds) != len(self._inv_rest_worlds):
+        bones = self.scene.bones or []
+        if not worlds or len(worlds) != len(bones):
             return
-        skin_mats = np.stack([worlds[i] @ self._inv_rest_worlds[i] for i in range(len(worlds))], axis=0)
+        anim_pts = np.asarray([w[:3, 3] for w in worlds], dtype=np.float32)
+        n_b = len(bones)
+        skin_mats = np.repeat(np.eye(4, dtype=np.float32)[None, :, :], n_b, axis=0)
+        for i, b in enumerate(bones):
+            p = b.parent if b.parent >= 0 else i
+            d0 = self._rest_pts[i] - self._rest_pts[p]
+            d1 = anim_pts[i] - anim_pts[p]
+            n0 = float(np.linalg.norm(d0))
+            n1 = float(np.linalg.norm(d1))
+            R = np.eye(3, dtype=np.float32)
+            if n0 > 1e-4 and n1 > 1e-4:
+                u0 = d0 / n0
+                u1 = d1 / n1
+                c = float(np.clip(np.dot(u0, u1), -1.0, 1.0))
+                if c < 0.9999:
+                    v = np.cross(u0, u1)
+                    s2 = float(np.dot(v, v))
+                    vx = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]], dtype=np.float32)
+                    if s2 > 1e-8:
+                        R = np.eye(3, dtype=np.float32) + vx + (vx @ vx) * ((1.0 - c) / s2)
+                    elif c < -0.999:
+                        R = -np.eye(3, dtype=np.float32)
+            skin_mats[i, :3, :3] = R
+            skin_mats[i, :3, 3] = anim_pts[p] - (R @ self._rest_pts[p])
+
         for sm, (rp, rn, bi) in zip(self.scene.submeshes, self._mesh_bind):
             if len(rp) == 0:
                 continue
@@ -1105,34 +1167,44 @@ class GLBViewport(QOpenGLWidget):
         if not self._bone_keys:
             self._prepare_bone_binding()
         t = self.anim_time % max(clip.duration, 0.001)
+        has_root_motion = any(
+            "bip001" in bones[i].name.lower() and (
+                self._lookup_curve(clip.pos_curves, self._bone_keys[i]) is not None
+                or self._lookup_curve(clip.rot_curves, self._bone_keys[i]) is not None
+            )
+            for i in range(len(bones))
+        )
         worlds: list[np.ndarray] = []
         ident = np.eye(4, dtype=np.float32)
         for i, b in enumerate(bones):
             keys = self._bone_keys[i] if i < len(self._bone_keys) else (b.name,)
-            pos = b.translation
-            rot = b.rotation
-            scl = b.scale
             pc = self._lookup_curve(clip.pos_curves, keys)
+            rc = self._lookup_curve(clip.rot_curves, keys)
+            sc_c = self._lookup_curve(clip.scale_curves, keys)
+            if b.parent < 0:
+                if has_root_motion:
+                    worlds.append(ident)
+                else:
+                    worlds.append(self._rest_local_rel[i] if i < len(self._rest_local_rel) else ident)
+                continue
+            pw = worlds[b.parent]
+            if pc is None and rc is None and sc_c is None:
+                loc = self._rest_local_rel[i] if i < len(self._rest_local_rel) else ident
+                worlds.append(pw @ loc)
+                continue
             if pc is not None:
                 p = _eval_vec3_curve(*pc, t)
-                pos = np.array([-p[0], p[1], p[2]], dtype=np.float32) / self._bone_scale
-            rc = self._lookup_curve(clip.rot_curves, keys)
+                pos = np.array([-p[0], p[1], p[2]], dtype=np.float32)
+            else:
+                pos = self._rest_local_rel[i][:3, 3].copy() if i < len(self._rest_local_rel) else np.zeros(3, dtype=np.float32)
             if rc is not None:
                 q = _eval_quat_curve(*rc, t)
-                rot = np.array([-q[0], q[1], q[2], -q[3]], dtype=np.float32)
-            sc = self._lookup_curve(clip.scale_curves, keys)
-            if sc is not None:
-                scl = _eval_vec3_curve(*sc, t)
+                rot = np.array([q[0], -q[1], -q[2], q[3]], dtype=np.float32)
+            else:
+                rot = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            scl = _eval_vec3_curve(*sc_c, t) if sc_c is not None else np.ones(3, dtype=np.float32)
             loc = _trs_to_mat4(pos, rot, scl)
-            pw = worlds[b.parent] if b.parent >= 0 else ident
-            w = pw @ loc
-            worlds.append(w)
-        if self._bone_scale != 1.0:
-            for w in worlds:
-                w[:3, 3] *= self._bone_scale
-                rot = w[:3, :3]
-                norms = np.linalg.norm(rot, axis=0, keepdims=True)
-                w[:3, :3] = np.divide(rot, np.maximum(norms, 1e-6))
+            worlds.append(pw @ loc)
         return worlds
 
     def _draw_skeleton(self):
@@ -1149,7 +1221,7 @@ class GLBViewport(QOpenGLWidget):
         gl.glBegin(gl.GL_LINES)
         gl.glColor4f(0.20, 0.92, 1.0, 0.95)
         for idx, b in enumerate(bones):
-            if b.parent >= 0:
+            if b.parent >= 0 and not re.search(r"\.\d+$", b.name):
                 p0 = worlds[b.parent][:3, 3]
                 p1 = worlds[idx][:3, 3]
                 gl.glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))

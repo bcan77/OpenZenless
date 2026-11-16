@@ -253,6 +253,8 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "                sc_val = 90 + (10 if st.endswith('_d') else 0)\n"
         "            elif st.startswith(toks[0] + '_' + toks[1] + '_'):\n"
         "                sc_val = 40 + (10 if st.endswith('_d') else 0)\n"
+        "        if sc_val == 0 and 'billboard' in nl and 'billboard' in st:\n"
+        "            sc_val = 80 + (10 if st.endswith('_d') else 0)\n"
         "        if sc_val > best_s:\n"
         "            best_s, best_p = sc_val, fp\n"
         "    return best_p\n"
