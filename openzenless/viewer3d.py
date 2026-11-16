@@ -511,6 +511,10 @@ def load_glb_scene(path: Path) -> GLScene:
                     a_mean = float(np.frombuffer(tex_data[0], dtype=np.uint8)[3::4].mean())
                     if a_mean < 5.0:
                         alpha_mode = "OPAQUE"
+                elif alpha_mode == "MASK" and tex_data is not None:
+                    a_arr = np.frombuffer(tex_data[0], dtype=np.uint8)[3::4]
+                    if float((a_arr >= int(alpha_cutoff * 255)).mean()) < 0.03:
+                        alpha_mode = "OPAQUE"
 
                 if len(pos_w) > 0:
                     pmin = pos_w.min(axis=0)
@@ -810,7 +814,9 @@ class GLBViewport(QOpenGLWidget):
     def _free_textures(self):
         if self.tex_ids:
             try:
-                gl.glDeleteTextures(self.tex_ids)
+                uniq_ids = [tid for tid in set(self.tex_ids) if tid]
+                if uniq_ids:
+                    gl.glDeleteTextures(uniq_ids)
             except Exception:
                 pass
             self.tex_ids.clear()
@@ -818,18 +824,23 @@ class GLBViewport(QOpenGLWidget):
     def _upload_textures(self):
         if not self.scene:
             return
+        uploaded: dict[int, int] = {}
         for sm in self.scene.submeshes:
             if sm.tex_rgba and sm.tex_w > 0 and sm.tex_h > 0:
-                tid = int(gl.glGenTextures(1))
-                gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
-                gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
-                gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
-                gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT)
-                gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT)
-                gl.glTexImage2D(
-                    gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, sm.tex_w, sm.tex_h, 0,
-                    gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, sm.tex_rgba,
-                )
+                key = id(sm.tex_rgba)
+                tid = uploaded.get(key)
+                if tid is None:
+                    tid = int(gl.glGenTextures(1))
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
+                    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+                    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+                    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT)
+                    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT)
+                    gl.glTexImage2D(
+                        gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, sm.tex_w, sm.tex_h, 0,
+                        gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, sm.tex_rgba,
+                    )
+                    uploaded[key] = tid
                 self.tex_ids.append(tid)
             else:
                 self.tex_ids.append(0)
