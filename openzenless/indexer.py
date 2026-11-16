@@ -192,6 +192,7 @@ def _parse_cli_asset_map(
     tex_prefix_blocks: dict[str, dict[str, int]] = {}
     tex_key_blocks: dict[str, dict[str, int]] = {}
     tex_noun_blocks: dict[str, dict[str, int]] = {}
+    tex_pathid: dict[str, list[str]] = {}
     font_blocks: set[str] = set()
     _GENERIC_NOUNS = frozenset((
         "prop", "wall", "floor", "decal", "object", "model", "ceiling", "ground",
@@ -206,6 +207,7 @@ def _parse_cli_asset_map(
     cur_container = ""
     cur_source = ""
     cur_type = ""
+    cur_pathid = ""
 
     def _flush_entry():
         nonlocal entry_count
@@ -227,6 +229,8 @@ def _parse_cli_asset_map(
                     short_blocks.setdefault(short_tok, set()).add(blk_name)
             if cur_type in ("GameObject", "Mesh") and _STAGE_RE.match(cur_name):
                 stages_auto.setdefault(cur_name, set()).add(blk_name)
+            if cur_type == "Texture2D" and cur_pathid and cur_name:
+                tex_pathid[cur_pathid] = [cur_name, blk_name]
             if cur_type == "Texture2D" and "_" in cur_name:
                 parts = [p.lower() for p in cur_name.split("_") if p]
                 t_pref = parts[0]
@@ -271,9 +275,11 @@ def _parse_cli_asset_map(
                 cur_source = _extract_str_val(s, '"Source":') or ""
             elif s.startswith('"Type":'):
                 cur_type = _extract_str_val(s, '"Type":') or ""
+            elif s.startswith('"PathID":'):
+                cur_pathid = s.split(":", 1)[1].strip().rstrip(",")
             elif s in ("}", "},"):
                 _flush_entry()
-                cur_name = cur_container = cur_source = cur_type = ""
+                cur_name = cur_container = cur_source = cur_type = cur_pathid = ""
 
     for ckey, blks in chars_auto.items():
         parts = ckey.split("_")
@@ -310,12 +316,75 @@ def _parse_cli_asset_map(
             for k, v in sorted(tex_noun_blocks.items())
         }
         (map_dir / "tex_noun_blocks_auto.json").write_text(json.dumps(compact_nouns))
+    if tex_pathid:
+        (map_dir / "tex_pathid_auto.json").write_text(json.dumps(tex_pathid))
     _emit(
         log_cb,
         f"Parsed AnimeStudio AssetMap ({entry_count} entries): "
         f"{len(chars_auto)} characters, {len(stages_auto)} stages, {len(font_blocks)} font blocks",
     )
     return len(chars_auto), len(stages_auto), len(font_blocks)
+
+
+def resolve_material_textures(dest_dir: Path) -> tuple[dict[str, str], list[str], list[str]]:
+    """Resolve Material/*.json _MainTex/_BaseMap m_PathIDs via tex_pathid_auto.json."""
+    mat_dir = dest_dir / "Material"
+    if not mat_dir.is_dir():
+        return {}, [], []
+    map_dir = cfg.CACHE_DIR / "asset_map"
+    pid_p = map_dir / "tex_pathid_auto.json"
+    if not pid_p.is_file():
+        am = map_dir / "zzz_assets_map.json"
+        if am.is_file():
+            try:
+                _parse_cli_asset_map(am, map_dir)
+            except Exception:
+                pass
+    if not pid_p.is_file():
+        return {}, [], []
+    try:
+        pid_map = json.loads(pid_p.read_text())
+    except Exception:
+        return {}, [], []
+
+    mat_to_tex: dict[str, str] = {}
+    needed_blks: list[str] = []
+    seen_blks: set[str] = set()
+    needed_tex: list[str] = []
+    seen_tex: set[str] = set()
+    _TEX_SLOTS = ("_MainTex", "_BaseMap", "_BaseColorMap", "_Diffuse", "_Albedo", "_MainTex0", "_BaseColor", "_ColorMap")
+
+    for mp in mat_dir.glob("*.json"):
+        try:
+            d = json.loads(mp.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        tex_envs = (d.get("m_SavedProperties") or {}).get("m_TexEnvs") or {}
+        if not isinstance(tex_envs, dict):
+            continue
+        chosen_pid = None
+        for slot in _TEX_SLOTS:
+            tv = tex_envs.get(slot)
+            if isinstance(tv, dict):
+                mt = tv.get("m_Texture")
+                if isinstance(mt, dict) and not mt.get("IsNull", False):
+                    pid = mt.get("m_PathID")
+                    if pid:
+                        chosen_pid = str(pid)
+                        break
+        if not chosen_pid:
+            continue
+        hit = pid_map.get(chosen_pid)
+        if hit and len(hit) == 2:
+            tname, blk = hit[0], hit[1]
+            mat_to_tex[mp.stem.lower()] = tname.lower()
+            if blk and blk not in seen_blks:
+                seen_blks.add(blk)
+                needed_blks.append(blk)
+            if tname and tname not in seen_tex:
+                seen_tex.add(tname)
+                needed_tex.append(tname)
+    return mat_to_tex, needed_blks, needed_tex
 
 
 def load_stage_texture_blocks(stage_name: str) -> tuple[list[str], str]:

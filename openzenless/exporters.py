@@ -18,6 +18,7 @@ from .indexer import (
     load_stage_texture_blocks,
     load_stage_texture_blocks_for_dir,
     load_wwise_mapper,
+    resolve_material_textures,
 )
 
 
@@ -165,6 +166,7 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         _emit(log_cb, f"No FBX/OBJ models found in {char_dir}; skipping GLB conversion.")
         return 0
     glb_path = char_dir / f"{char_name}.glb"
+    mat_to_tex, _, _ = resolve_material_textures(char_dir)
     fbx_list = [str(p) for p in fbxs]
     obj_list = [str(p) for p in objs]
     py_expr = (
@@ -204,6 +206,8 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "            print(f'Imported OBJ {idx}/{len(objs)}', flush=True)\n"
         "sc.collection.children.link(hold)\n"
         f"pngs = [str(p) for p in sorted(__import__('pathlib').Path({str(char_dir)!r}).rglob('*.png'))]\n"
+        f"_mat_to_tex = {mat_to_tex!r}\n"
+        "_png_by_stem = {os.path.splitext(os.path.basename(_p))[0].lower(): _p for _p in pngs}\n"
         "diffuse_pngs = []\n"
         "for _p in pngs:\n"
         "    _st = os.path.splitext(os.path.basename(_p))[0].lower()\n"
@@ -214,6 +218,9 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "_mat_cache = {}\n"
         "def _pick_tex(name):\n"
         "    nl = _re.sub(r'\\.[0-9]+$', '', name.lower())\n"
+        "    _exact = _mat_to_tex.get(nl)\n"
+        "    if _exact and _exact in _png_by_stem:\n"
+        "        return _png_by_stem[_exact]\n"
         "    nl = _re.sub(r'\\s*\\[[^\\]]+\\]$', '', nl)\n"
         "    nl = _re.sub(r'\\s*\\([0-9]+\\)$', '', nl).strip()\n"
         "    nl = _re.sub(r'^separatemesh_.*?_model_', '', nl)\n"
@@ -379,9 +386,9 @@ def export_character_full(
                 dest = (out_dir or (cfg.FINAL_ROOT / "Exports")) / char_name
                 char_short = _char_short_name(char_name, chars.keys())
                 _emit(log_cb, f"Exporting {char_name} from {len(resolved)} .blk(s) via AnimeStudio.CLI (filter={char_short}) -> {dest}")
-                types_list = ["Mesh", "Texture2D", "Animator", "Avatar"]
+                types_list = ["Mesh", "Texture2D", "Animator", "Avatar", "Material"]
                 if export_shaders:
-                    types_list.extend(["Shader", "Material"])
+                    types_list.append("Shader")
                 last_rc = export_blks_batch(
                     resolved, dest,
                     types=types_list,
@@ -498,9 +505,9 @@ def export_scene_map(
                         continue
                     dest = base_out / sname
                     _emit(log_cb, f"Exporting map {sname} ({len(resolved)} .blk(s)) via AnimeStudio.CLI -> {dest}")
-                    map_types = ["Mesh", "Texture2D", "GameObject", "Animator"]
+                    map_types = ["Mesh", "Texture2D", "GameObject", "Animator", "Material"]
                     if export_shaders:
-                        map_types.extend(["Shader", "Material"])
+                        map_types.append("Shader")
                     rc = export_blks_batch(
                         resolved, dest,
                         types=map_types,
@@ -508,21 +515,27 @@ def export_scene_map(
                         name_filter="",
                         log_cb=log_cb,
                     )
+                    _mat_map, mat_blks, mat_texs = resolve_material_textures(dest)
                     tex_blk_names, tex_pat = load_stage_texture_blocks_for_dir(sname, dest)
-                    if tex_blk_names and tex_pat:
+                    all_tex_blks = list(dict.fromkeys(mat_blks + tex_blk_names))[:96]
+                    if all_tex_blks:
                         seen_names = {p.name for p in resolved}
                         extra_tex = [
                             blocks_dir / os.path.basename(b)
-                            for b in tex_blk_names
+                            for b in all_tex_blks
                             if os.path.basename(b) not in seen_names and (blocks_dir / os.path.basename(b)).is_file()
                         ]
                         if extra_tex:
-                            _emit(log_cb, f"Exporting shared map Texture2Ds ({len(extra_tex)} .blk(s), filter={tex_pat}) -> {dest}")
+                            extra_pat = tex_pat
+                            if mat_texs:
+                                mat_re = "|".join(re.escape(t) for t in mat_texs[:300])
+                                extra_pat = f"(?:{tex_pat})|(?:^(?:{mat_re})$)" if tex_pat else f"^(?:{mat_re})$"
+                            _emit(log_cb, f"Exporting shared map Texture2Ds ({len(extra_tex)} .blk(s), {len(_mat_map)} Material PathIDs resolved) -> {dest}")
                             export_blks_batch(
                                 extra_tex, dest,
                                 types=["Texture2D"],
                                 export_mode="Convert",
-                                name_filter=tex_pat,
+                                name_filter=extra_pat,
                                 log_cb=log_cb,
                             )
                     if rc == 0 or (dest.exists() and (any(dest.rglob("*.fbx")) or any(dest.rglob("*.obj")))):
