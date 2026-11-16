@@ -67,6 +67,7 @@ class GLSubMesh:
     alpha_cutoff: float = 0.5
     double_sided: bool = False
     is_sky: bool = False
+    is_weapon: bool = False
     center: tuple[float, float, float] = (0.0, 0.0, 0.0)
     toon_smoothness: float = 0.08
     toon_specular: float = 0.15
@@ -472,6 +473,7 @@ def load_glb_scene(path: Path) -> GLScene:
                             )
 
                 hint = f"{node.name or ''} {mesh.name or ''} {mat_name}".lower()
+                is_weapon = "weapon" in hint
                 is_sky = bool(re.search(r"(?:^|[_\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\s.0-9])", hint))
                 is_cutout = any(t in hint for t in ("hair", "lash", "leaf", "tree", "plant", "shrub", "bush", "grass", "foliage"))
                 if is_sky:
@@ -532,6 +534,7 @@ def load_glb_scene(path: Path) -> GLScene:
                         alpha_cutoff=alpha_cutoff,
                         double_sided=double_sided,
                         is_sky=is_sky,
+                        is_weapon=is_weapon,
                         center=sm_center,
                         toon_smoothness=toon_smooth,
                         toon_specular=toon_spec,
@@ -737,9 +740,10 @@ class GLBViewport(QOpenGLWidget):
         self.show_grid = True
         self.toon_enabled = True
         self.show_skeleton = True
+        self.show_weapons = True
         self.anim_clip: UnityAnimClip | None = None
         self.anim_time: float = 0.0
-        self._bone_keys: list[tuple[str, str, str]] = []
+        self._bone_keys: list[tuple[str, ...]] = []
         self._bone_scale: float = 1.0
         self._inv_rest_worlds: list[np.ndarray] = []
         self._mesh_bind: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
@@ -890,6 +894,8 @@ class GLBViewport(QOpenGLWidget):
         for i, sm in enumerate(self.scene.submeshes):
             if len(sm.indices) == 0:
                 continue
+            if sm.is_weapon and not self.show_weapons:
+                continue
             if sm.alpha_mode == "BLEND":
                 dx = sm.center[0] - cx
                 dy = sm.center[1] - cy
@@ -1024,10 +1030,11 @@ class GLBViewport(QOpenGLWidget):
         for i, b in enumerate(bones):
             p = b.name if b.parent < 0 else f"{paths[b.parent]}/{b.name}"
             paths.append(p)
-            k_full = f"path_{zlib.crc32(p.encode('utf-8'))}"
-            k_sub = f"path_{zlib.crc32(p[p.index('Bip001'):].encode('utf-8'))}" if "Bip001" in p else k_full
-            k_leaf = f"path_{zlib.crc32(b.name.encode('utf-8'))}"
-            self._bone_keys.append((b.name, k_sub, k_full, k_leaf))
+            parts = p.split("/")
+            keys = [b.name]
+            for k in range(len(parts)):
+                keys.append(f"path_{zlib.crc32('/'.join(parts[k:]).encode('utf-8'))}")
+            self._bone_keys.append(tuple(keys))
 
         rest_pts = np.array([b.rest_world[:3, 3] for b in bones], dtype=np.float32)
         b_span = float(np.linalg.norm(rest_pts.max(axis=0) - rest_pts.min(axis=0))) if len(rest_pts) else 1.0
@@ -1269,6 +1276,12 @@ class NativeViewerWidget(QWidget):
         self.btn_skel.setChecked(True)
         self.btn_skel.toggled.connect(self._toggle_skeleton)
         anim_bar.addWidget(self.btn_skel)
+
+        self.btn_weapons = QPushButton("Weapons")
+        self.btn_weapons.setCheckable(True)
+        self.btn_weapons.setChecked(True)
+        self.btn_weapons.toggled.connect(self._toggle_weapons)
+        anim_bar.addWidget(self.btn_weapons)
         root.addLayout(anim_bar)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -1371,6 +1384,10 @@ class NativeViewerWidget(QWidget):
 
     def _toggle_skeleton(self, checked: bool):
         self.viewport.show_skeleton = checked
+        self.viewport.update()
+
+    def _toggle_weapons(self, checked: bool):
+        self.viewport.show_weapons = checked
         self.viewport.update()
 
     def _populate_anim_combo(self, model_path: Path):
@@ -1482,6 +1499,10 @@ class NativeViewerWidget(QWidget):
         self.anim_slider.setValue(0)
         self.anim_time_lbl.setText("0.00 / 0.00s")
         self.viewport.set_scene(scene)
+        has_wpn = any(sm.is_weapon for sm in scene.submeshes)
+        has_body = any(not sm.is_weapon for sm in scene.submeshes)
+        self.btn_weapons.setEnabled(has_wpn)
+        self.btn_weapons.setChecked(not (has_wpn and has_body))
         self._populate_anim_combo(scene.source_path)
         self.status_lbl.setText(
             f"{scene.source_path.name} • {len(scene.submeshes)} meshes • "
