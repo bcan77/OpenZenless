@@ -475,15 +475,17 @@ def load_glb_scene(path: Path) -> GLScene:
                 hint = f"{node.name or ''} {mesh.name or ''} {mat_name}".lower()
                 is_weapon = "weapon" in hint
                 is_sky = bool(re.search(r"(?:^|[_\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\s.0-9])", hint))
-                is_cutout = any(t in hint for t in ("hair", "lash", "leaf", "tree", "plant", "shrub", "bush", "grass", "foliage"))
+                is_cutout = any(t in hint for t in ("hair", "lash", "leaf", "tree", "plant", "shrub", "bush", "grass", "foliage", "decal"))
                 if is_sky:
                     double_sided = True
                     if alpha_mode == "OPAQUE" and tex_data is not None:
                         alpha_mode = "BLEND"
-                elif alpha_mode == "OPAQUE" and tex_data is not None and is_cutout:
+                elif alpha_mode in ("OPAQUE", "BLEND") and tex_data is not None and is_cutout:
                     a_min = int(np.frombuffer(tex_data[0], dtype=np.uint8)[3::4].min())
                     if a_min < 250:
                         alpha_mode = "MASK"
+                    elif alpha_mode == "BLEND":
+                        alpha_mode = "OPAQUE"
 
                 gm = _match_game_material(game_mats, mat_name, mesh.name or "", node.name or "")
                 toon_smooth = 0.08
