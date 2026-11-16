@@ -748,7 +748,7 @@ class GLBViewport(QOpenGLWidget):
         self._rest_local_rel: list[np.ndarray] = []
         self._rest_pts: np.ndarray = np.zeros((0, 3), dtype=np.float32)
         self._inv_rest_worlds: list[np.ndarray] = []
-        self._mesh_bind: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        self._mesh_bind: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         self._toon_prog: QOpenGLShaderProgram | None = None
         self.yaw = 35.0
         self.pitch = 20.0
@@ -780,7 +780,7 @@ class GLBViewport(QOpenGLWidget):
         self.anim_time = 0.0
         if clip is None:
             if self.scene and self._mesh_bind:
-                for sm, (rp, rn, _bi) in zip(self.scene.submeshes, self._mesh_bind):
+                for sm, (rp, rn, *_rest) in zip(self.scene.submeshes, self._mesh_bind):
                     sm.positions = rp.copy()
                     sm.normals = rn.copy()
         else:
@@ -1079,10 +1079,11 @@ class GLBViewport(QOpenGLWidget):
         rest_arr = np.asarray(scaled_rest_pts, dtype=np.float32)
         self._rest_pts = rest_arr
 
-        # Bind to primary Bip001 bone segments (exclude duplicate .001/.002 armatures)
+        # Bind to primary Bip001 bone segments (exclude duplicate .001/.002 armatures & tiny finger/toe twigs)
         seg_bones = [
             i for i, b in enumerate(bones)
             if "bip001" in b.name.lower()
+            and not any(t in b.name.lower() for t in ("finger", "toe"))
             and not re.search(r"\.\d+$", b.name)
             and b.parent >= 0
             and "bip001" in bones[b.parent].name.lower()
@@ -1099,19 +1100,43 @@ class GLBViewport(QOpenGLWidget):
         seg_len2 = np.maximum(np.sum(seg_ab * seg_ab, axis=1), 1e-8)
 
         self._mesh_bind = []
+        inv_sigma2 = 1.0 / (0.075 ** 2)
         for sm in self.scene.submeshes:
             rp = sm.positions.copy()
             rn = sm.normals.copy()
             n_v = len(rp)
-            bi = np.zeros(n_v, dtype=np.int32)
-            for start in range(0, n_v, 1024):
-                chunk = rp[start : start + 1024]
-                ap = chunk[:, None, :] - seg_a[None, :, :]
-                t_proj = np.clip(np.sum(ap * seg_ab[None, :, :], axis=2) / seg_len2[None, :], 0.0, 1.0)
-                closest = seg_a[None, :, :] + t_proj[:, :, None] * seg_ab[None, :, :]
-                d2 = np.sum((chunk[:, None, :] - closest) ** 2, axis=2)
-                bi[start : start + 1024] = seg_idx[np.argmin(d2, axis=1)]
-            self._mesh_bind.append((rp, rn, bi))
+            bi0 = np.zeros(n_v, dtype=np.int32)
+            bi1 = np.zeros(n_v, dtype=np.int32)
+            w0 = np.ones(n_v, dtype=np.float32)
+            w1 = np.zeros(n_v, dtype=np.float32)
+            if len(seg_idx) >= 2:
+                for start in range(0, n_v, 1024):
+                    chunk = rp[start : start + 1024]
+                    ap = chunk[:, None, :] - seg_a[None, :, :]
+                    t_proj = np.clip(np.sum(ap * seg_ab[None, :, :], axis=2) / seg_len2[None, :], 0.0, 1.0)
+                    closest = seg_a[None, :, :] + t_proj[:, :, None] * seg_ab[None, :, :]
+                    d2 = np.sum((chunk[:, None, :] - closest) ** 2, axis=2)
+                    top2 = np.argpartition(d2, 1, axis=1)[:, :2]
+                    d2_0 = np.take_along_axis(d2, top2[:, :1], axis=1)[:, 0]
+                    d2_1 = np.take_along_axis(d2, top2[:, 1:2], axis=1)[:, 0]
+                    swap = d2_1 < d2_0
+                    i0 = np.where(swap, top2[:, 1], top2[:, 0])
+                    i1 = np.where(swap, top2[:, 0], top2[:, 1])
+                    d_near = np.minimum(d2_0, d2_1)
+                    d_far = np.maximum(d2_0, d2_1)
+                    e0 = np.ones_like(d_near)
+                    e1 = np.exp(-np.maximum(0.0, d_far - d_near) * inv_sigma2)
+                    e1 = np.where(d_far > d_near * 3.5 + 0.005, 0.0, e1)
+                    s_w = e0 + e1
+                    sl = slice(start, start + 1024)
+                    bi0[sl] = seg_idx[i0]
+                    bi1[sl] = seg_idx[i1]
+                    w0[sl] = e0 / s_w
+                    w1[sl] = e1 / s_w
+            elif len(seg_idx) == 1:
+                bi0.fill(seg_idx[0])
+                bi1.fill(seg_idx[0])
+            self._mesh_bind.append((rp, rn, bi0, bi1, w0, w1))
 
     def _apply_skinning_frame(self):
         if not self.scene or not self._mesh_bind or len(self._rest_pts) == 0:
@@ -1145,12 +1170,19 @@ class GLBViewport(QOpenGLWidget):
             skin_mats[i, :3, :3] = R
             skin_mats[i, :3, 3] = anim_pts[p] - (R @ self._rest_pts[p])
 
-        for sm, (rp, rn, bi) in zip(self.scene.submeshes, self._mesh_bind):
+        for sm, (rp, rn, bi0, bi1, w0, w1) in zip(self.scene.submeshes, self._mesh_bind):
             if len(rp) == 0:
                 continue
-            M = skin_mats[bi]
-            sm.positions = np.ascontiguousarray(np.einsum("vij,vj->vi", M[:, :3, :3], rp) + M[:, :3, 3], dtype=np.float32)
-            sm.normals = np.ascontiguousarray(np.einsum("vij,vj->vi", M[:, :3, :3], rn), dtype=np.float32)
+            M0 = skin_mats[bi0]
+            M1 = skin_mats[bi1]
+            p0 = np.einsum("vij,vj->vi", M0[:, :3, :3], rp) + M0[:, :3, 3]
+            p1 = np.einsum("vij,vj->vi", M1[:, :3, :3], rp) + M1[:, :3, 3]
+            n0 = np.einsum("vij,vj->vi", M0[:, :3, :3], rn)
+            n1 = np.einsum("vij,vj->vi", M1[:, :3, :3], rn)
+            sm.positions = np.ascontiguousarray(w0[:, None] * p0 + w1[:, None] * p1, dtype=np.float32)
+            n_mix = w0[:, None] * n0 + w1[:, None] * n1
+            n_len = np.linalg.norm(n_mix, axis=1, keepdims=True)
+            sm.normals = np.ascontiguousarray(np.divide(n_mix, np.maximum(n_len, 1e-6)), dtype=np.float32)
 
     @staticmethod
     def _lookup_curve(curves: dict, keys: tuple[str, ...]):
@@ -1194,7 +1226,10 @@ class GLBViewport(QOpenGLWidget):
                 continue
             if pc is not None:
                 p = _eval_vec3_curve(*pc, t)
-                pos = np.array([-p[0], p[1], p[2]], dtype=np.float32)
+                if b.name.lower() in ("bip001", "bone_root", "root"):
+                    pos = np.array([0.0, p[1], 0.0], dtype=np.float32)
+                else:
+                    pos = np.array([-p[0], p[1], p[2]], dtype=np.float32)
             else:
                 pos = self._rest_local_rel[i][:3, 3].copy() if i < len(self._rest_local_rel) else np.zeros(3, dtype=np.float32)
             if rc is not None:
