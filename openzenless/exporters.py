@@ -311,7 +311,7 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
         "    return mat\n"
         "if diffuse_pngs:\n"
         "    _mesh_objs = [o for o in bpy.data.objects if o.type == 'MESH' and o.data]\n"
-        "    _non_proxy = [o for o in _mesh_objs if not _re.search(r'(?:_col_|_col$|_proxy(?:\\.[0-9]+)?$|_lod[1-3](?:\\.[0-9]+)?$)', o.name.lower())]\n"
+        "    _non_proxy = [o for o in _mesh_objs if not _re.search(r'(?:_col_|_col$|_proxy(?:\\.[0-9]+)?$|_hairshadow(?:\\.[0-9]+)?$|_lod[1-3](?:\\.[0-9]+)?$)', o.name.lower())]\n"
         "    if _non_proxy:\n"
         "        for o in _mesh_objs:\n"
         "            if o not in _non_proxy:\n"

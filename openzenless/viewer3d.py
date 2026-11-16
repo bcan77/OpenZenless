@@ -473,6 +473,8 @@ def load_glb_scene(path: Path) -> GLScene:
                             )
 
                 hint = f"{node.name or ''} {mesh.name or ''} {mat_name}".lower()
+                if "hairshadow" in hint:
+                    continue
                 is_weapon = "weapon" in hint
                 is_sky = bool(re.search(r"(?:^|[_\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\s.0-9])", hint))
                 is_cutout = any(t in hint for t in ("hair", "lash", "leaf", "tree", "plant", "shrub", "bush", "grass", "foliage", "decal"))
@@ -756,6 +758,7 @@ class GLBViewport(QOpenGLWidget):
         self._inv_rest_worlds: list[np.ndarray] = []
         self._mesh_bind: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         self._toon_prog: QOpenGLShaderProgram | None = None
+        self._u_locs: dict[str, int] = {}
         self.yaw = 35.0
         self.pitch = 20.0
         self.distance = 3.0
@@ -802,8 +805,16 @@ class GLBViewport(QOpenGLWidget):
 
     def reset_camera(self):
         if self.scene is not None:
-            self.target = self.scene.center.copy()
-            self.distance = max(0.02, self.scene.radius * 2.4)
+            non_sky = [sm.center for sm in self.scene.submeshes if not sm.is_sky and len(sm.indices)]
+            if len(non_sky) > 20:
+                pts = np.asarray(non_sky, dtype=np.float32)
+                p10 = np.percentile(pts, 10, axis=0)
+                p90 = np.percentile(pts, 90, axis=0)
+                self.target = ((p10 + p90) * 0.5).astype(np.float32)
+                self.distance = max(0.05, float(np.linalg.norm(p90 - p10)) * 0.85)
+            else:
+                self.target = self.scene.center.copy()
+                self.distance = max(0.02, self.scene.radius * 2.4)
         else:
             self.target = np.zeros(3, dtype=np.float32)
             self.distance = 3.0
@@ -858,11 +869,19 @@ class GLBViewport(QOpenGLWidget):
         gl.glLightfv(gl.GL_LIGHT0, gl.GL_POSITION, [4.0, 8.0, 6.0, 0.0])
         gl.glLightfv(gl.GL_LIGHT0, gl.GL_DIFFUSE, [0.95, 0.95, 0.95, 1.0])
         gl.glLightfv(gl.GL_LIGHT0, gl.GL_AMBIENT, [0.32, 0.34, 0.38, 1.0])
-        gl.glLightfv(gl.GL_LIGHT1, GL_POSITION if hasattr(gl, "GL_POSITION") else gl.GL_POSITION, [-5.0, -2.0, -4.0, 0.0])
+        gl.glLightfv(gl.GL_LIGHT1, gl.GL_POSITION, [-5.0, -2.0, -4.0, 0.0])
         gl.glLightfv(gl.GL_LIGHT1, gl.GL_DIFFUSE, [0.35, 0.42, 0.55, 1.0])
         prog = QOpenGLShaderProgram(self)
         if prog.addShaderFromSourceCode(QOpenGLShader.Vertex, _TOON_VERT) and prog.addShaderFromSourceCode(QOpenGLShader.Fragment, _TOON_FRAG) and prog.link():
             self._toon_prog = prog
+            self._u_locs = {
+                name: prog.uniformLocation(name)
+                for name in (
+                    "u_tex", "u_use_tex", "u_color", "u_alpha_mode", "u_alpha_cutoff",
+                    "u_is_sky", "u_toon_enabled", "u_cam_pos", "u_light_dir",
+                    "u_toon_smooth", "u_toon_spec", "u_rim_glow", "u_rim_color", "u_shadow_tint",
+                )
+            }
 
     def _set_projection(self, w: int, h: int):
         h = max(1, h)
@@ -923,12 +942,17 @@ class GLBViewport(QOpenGLWidget):
         blend_items.sort(key=lambda it: it[0], reverse=True)
 
         use_shader = self._toon_prog is not None and not self.wireframe
+        ul = self._u_locs
         if use_shader:
             self._toon_prog.bind()
-            self._toon_prog.setUniformValue("u_toon_enabled", 1 if self.toon_enabled else 0)
-            self._toon_prog.setUniformValue("u_cam_pos", float(cx), float(cy), float(cz))
-            self._toon_prog.setUniformValue("u_light_dir", 0.45, 0.78, 0.42)
-            self._toon_prog.setUniformValue("u_tex", 0)
+            if ul.get("u_toon_enabled", -1) >= 0:
+                gl.glUniform1i(ul["u_toon_enabled"], 1 if self.toon_enabled else 0)
+            if ul.get("u_cam_pos", -1) >= 0:
+                gl.glUniform3f(ul["u_cam_pos"], float(cx), float(cy), float(cz))
+            if ul.get("u_light_dir", -1) >= 0:
+                gl.glUniform3f(ul["u_light_dir"], 0.45, 0.78, 0.42)
+            if ul.get("u_tex", -1) >= 0:
+                gl.glUniform1i(ul["u_tex"], 0)
 
         def _draw_sm(i: int, sm: GLSubMesh):
             gl.glDisable(gl.GL_CULL_FACE)
@@ -948,16 +972,26 @@ class GLBViewport(QOpenGLWidget):
 
             if use_shader:
                 am_int = 2 if sm.alpha_mode == "BLEND" else (1 if sm.alpha_mode == "MASK" else 0)
-                self._toon_prog.setUniformValue("u_use_tex", 1 if has_tex else 0)
-                self._toon_prog.setUniformValue("u_color", float(col[0]), float(col[1]), float(col[2]), float(col[3]))
-                self._toon_prog.setUniformValue("u_alpha_mode", am_int)
-                self._toon_prog.setUniformValue("u_alpha_cutoff", float(sm.alpha_cutoff))
-                self._toon_prog.setUniformValue("u_is_sky", 1 if sm.is_sky else 0)
-                self._toon_prog.setUniformValue("u_toon_smooth", float(sm.toon_smoothness))
-                self._toon_prog.setUniformValue("u_toon_spec", float(sm.toon_specular))
-                self._toon_prog.setUniformValue("u_rim_glow", float(sm.rim_glow))
-                self._toon_prog.setUniformValue("u_rim_color", float(sm.rim_color[0]), float(sm.rim_color[1]), float(sm.rim_color[2]))
-                self._toon_prog.setUniformValue("u_shadow_tint", float(sm.shadow_tint[0]), float(sm.shadow_tint[1]), float(sm.shadow_tint[2]))
+                if ul.get("u_use_tex", -1) >= 0:
+                    gl.glUniform1i(ul["u_use_tex"], 1 if has_tex else 0)
+                if ul.get("u_color", -1) >= 0:
+                    gl.glUniform4f(ul["u_color"], float(col[0]), float(col[1]), float(col[2]), float(col[3]))
+                if ul.get("u_alpha_mode", -1) >= 0:
+                    gl.glUniform1i(ul["u_alpha_mode"], am_int)
+                if ul.get("u_alpha_cutoff", -1) >= 0:
+                    gl.glUniform1f(ul["u_alpha_cutoff"], float(sm.alpha_cutoff))
+                if ul.get("u_is_sky", -1) >= 0:
+                    gl.glUniform1i(ul["u_is_sky"], 1 if sm.is_sky else 0)
+                if ul.get("u_toon_smooth", -1) >= 0:
+                    gl.glUniform1f(ul["u_toon_smooth"], float(sm.toon_smoothness))
+                if ul.get("u_toon_spec", -1) >= 0:
+                    gl.glUniform1f(ul["u_toon_spec"], float(sm.toon_specular))
+                if ul.get("u_rim_glow", -1) >= 0:
+                    gl.glUniform1f(ul["u_rim_glow"], float(sm.rim_glow))
+                if ul.get("u_rim_color", -1) >= 0:
+                    gl.glUniform3f(ul["u_rim_color"], float(sm.rim_color[0]), float(sm.rim_color[1]), float(sm.rim_color[2]))
+                if ul.get("u_shadow_tint", -1) >= 0:
+                    gl.glUniform3f(ul["u_shadow_tint"], float(sm.shadow_tint[0]), float(sm.shadow_tint[1]), float(sm.shadow_tint[2]))
             else:
                 gl.glColor4f(*col)
                 if sm.alpha_mode == "MASK":
