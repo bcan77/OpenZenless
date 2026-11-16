@@ -43,15 +43,17 @@ def load_stage_index() -> dict[str, list[str]]:
     stages: dict[str, list[str]] = {}
     for inv in (
         cfg.EXTRACTOR_ROOT / "data" / "all_maps_inventory.json",
-        cfg.CACHE_DIR / "asset_map" / "stage_index_auto.json",
         cfg.CACHE_DIR / "asset_map" / "stage_index_fallback.json",
+        cfg.CACHE_DIR / "asset_map" / "stage_index_auto.json",
     ):
         if inv.exists():
             try:
                 data = json.loads(inv.read_text())
-                stages = {k: list(v.get("blocks", [])) for k, v in (data.get("stages") or {}).items()}
-                if stages:
-                    break
+                for k, v in (data.get("stages") or {}).items():
+                    dst = stages.setdefault(k, [])
+                    for b in v.get("blocks", []):
+                        if b not in dst:
+                            dst.append(b)
             except Exception:
                 pass
     if stages:
@@ -71,6 +73,25 @@ def load_stage_index() -> dict[str, list[str]]:
                     for b in stages[parent]:
                         if b not in blks:
                             blks.append(b)
+    mm_p = cfg.CACHE_DIR / "asset_map" / "stage_mat_mesh_blocks_auto.json"
+    if mm_p.is_file():
+        try:
+            mm_data = json.loads(mm_p.read_text())
+            for sname, blks in stages.items():
+                clean = re.sub(r"^(?:Stage|Env|Scene|Map)_", "", sname)
+                toks = [t.lower() for t in clean.split("_") if len(t) >= 3 and not t.isdigit()]
+                added = 0
+                for t in toks:
+                    for b in mm_data.get(t, ()):
+                        if b not in blks:
+                            blks.append(b)
+                            added += 1
+                            if added >= 12:
+                                break
+                    if added >= 12:
+                        break
+        except Exception:
+            pass
     return stages
 
 
@@ -171,10 +192,10 @@ def has_asset_map(game_root: Path) -> bool:
 _AVATAR_RE = re.compile(
     r"(Avatar_(?:Male|Female)_Size\d+_[A-Za-z0-9]+(?:_(?!Ani|Body|Face|Hair|Eye|Model|UI|Weapon|Cloth|Skin|Skill|Common|Effect|NPC|Player|Story|Timeline|Mat|Tex|Mesh|LOD)[A-Za-z0-9]+)?)"
 )
-_STAGE_RE = re.compile(r"^(?:Stage|Scene|Map)_[A-Za-z0-9]+$")
+_STAGE_RE = re.compile(r"^(?:Stage|Scene|Map|Env)_[A-Za-z0-9_]+$")
 _PROG_RE = re.compile(r"\[(\d+)/(\d+)\]\s+Processed")
 _ASSET_TYPES_INTEREST = frozenset(
-    ("Mesh", "Texture2D", "GameObject", "Animator", "Avatar", "AnimationClip", "SkinnedMeshRenderer")
+    ("Mesh", "Texture2D", "GameObject", "Animator", "Avatar", "AnimationClip", "SkinnedMeshRenderer", "Material")
 )
 
 
@@ -193,6 +214,7 @@ def _parse_cli_asset_map(
     tex_key_blocks: dict[str, dict[str, int]] = {}
     tex_noun_blocks: dict[str, dict[str, int]] = {}
     tex_pathid: dict[str, list[str]] = {}
+    mat_mesh_blocks: dict[str, dict[str, int]] = {}
     font_blocks: set[str] = set()
     _GENERIC_NOUNS = frozenset((
         "prop", "wall", "floor", "decal", "object", "model", "ceiling", "ground",
@@ -229,6 +251,11 @@ def _parse_cli_asset_map(
                     short_blocks.setdefault(short_tok, set()).add(blk_name)
             if cur_type in ("GameObject", "Mesh") and _STAGE_RE.match(cur_name):
                 stages_auto.setdefault(cur_name, set()).add(blk_name)
+            if cur_type in ("Material", "Mesh") and "_" in cur_name:
+                m_pref = cur_name.split("_", 1)[0].lower()
+                if len(m_pref) >= 3:
+                    mm = mat_mesh_blocks.setdefault(m_pref, {})
+                    mm[blk_name] = mm.get(blk_name, 0) + (3 if cur_type == "Material" else 1)
             if cur_type == "Texture2D" and cur_pathid and cur_name:
                 tex_pathid[cur_pathid] = [cur_name, blk_name]
             if cur_type == "Texture2D" and "_" in cur_name:
@@ -318,6 +345,12 @@ def _parse_cli_asset_map(
         (map_dir / "tex_noun_blocks_auto.json").write_text(json.dumps(compact_nouns))
     if tex_pathid:
         (map_dir / "tex_pathid_auto.json").write_text(json.dumps(tex_pathid))
+    if mat_mesh_blocks:
+        compact_mm = {
+            k: [b for b, _c in sorted(v.items(), key=lambda it: -it[1])[:24]]
+            for k, v in sorted(mat_mesh_blocks.items())
+        }
+        (map_dir / "stage_mat_mesh_blocks_auto.json").write_text(json.dumps(compact_mm))
     _emit(
         log_cb,
         f"Parsed AnimeStudio AssetMap ({entry_count} entries): "
