@@ -13,7 +13,7 @@
 
 ---
 
-*NOTE : This program is HIGHLY EXPERIMENTAL, and may not work on your device. Please report any issues in the issues page!*
+*NOTE : This program is HIGHLY EXPERIMENTAL, and may not work on your device. Windows support is unavailable until I can manage to verify that this build can export and view all textures/assets reliably.*
 
 ## How the program works;
 
