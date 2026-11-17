@@ -621,6 +621,38 @@ def build_asset_map(
             auto_chars, auto_stages, auto_fonts = _parse_cli_asset_map(
                 cli_map_file, map_dir, log_cb=log_cb, progress_cb=progress_cb
             )
+        cab_bin = cfg.CLI_DIR / "Maps" / "ZZZ.bin"
+        if not cab_bin.is_file() and (cancel_event is None or not cancel_event.is_set()):
+            _prog(87, f"Building AnimeStudio CABMap dependency index (ZZZ.bin) across {len(blk_files)} .blk files...")
+            env = os.environ.copy()
+            env["WINEDEBUG"] = "-all"
+            cab_cmd = [
+                "wine", str(cfg.CLI_EXE),
+                "Z:" + str(blocks_dir).replace("/", "\\"),
+                "Z:" + str(map_dir).replace("/", "\\"),
+                "--game", "ZZZ",
+                "--map_op", "CABMap,Load",
+                "--map_name", "ZZZ",
+            ]
+            cab_proc = subprocess.Popen(
+                cab_cmd, cwd=str(cfg.CLI_DIR), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            assert cab_proc.stdout is not None
+            for line in cab_proc.stdout:
+                if cancel_event is not None and cancel_event.is_set():
+                    cab_proc.terminate()
+                    _emit(log_cb, "CABMap build skipped by user.")
+                    break
+                sline = line.rstrip("\n")
+                m = _PROG_RE.search(sline)
+                if m:
+                    cur, tot = int(m.group(1)), max(1, int(m.group(2)))
+                    pct = 87 + int(5 * cur / tot)
+                    _prog(pct, f"AnimeStudio CABMap [{cur}/{tot}]")
+                elif sline.strip():
+                    _emit(log_cb, sline)
+            cab_proc.wait()
 
     _prog(92, "Indexing sections & cross-referencing containers...")
     sections = load_texture_sections()

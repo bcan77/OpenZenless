@@ -473,7 +473,7 @@ def load_glb_scene(path: Path) -> GLScene:
                             )
 
                 hint = f"{node.name or ''} {mesh.name or ''} {mat_name}".lower()
-                if "hairshadow" in hint:
+                if "hairshadow" in hint or "shadowproxy" in hint:
                     continue
                 is_weapon = "weapon" in hint
                 is_sky = bool(re.search(r"(?:^|[_\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\s.0-9])", hint))
@@ -887,8 +887,8 @@ class GLBViewport(QOpenGLWidget):
         h = max(1, h)
         aspect = w / float(h)
         scene_r = self.scene.radius if self.scene else 1.0
-        near = max(0.005, min(self.distance * 0.002, scene_r * 0.002))
-        far = max(500.0, self.distance * 50.0, scene_r * 25.0)
+        near = max(0.0005, min(self.distance * 0.002, scene_r * 0.001))
+        far = max(200.0, self.distance * 50.0, scene_r * 25.0)
         top = near * math.tan(math.radians(45.0) * 0.5)
         right = top * aspect
         gl.glMatrixMode(gl.GL_PROJECTION)
@@ -964,7 +964,7 @@ class GLBViewport(QOpenGLWidget):
                 gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
                 gl.glEnableClientState(gl.GL_TEXTURE_COORD_ARRAY)
                 gl.glTexCoordPointer(2, gl.GL_FLOAT, 0, sm.uvs)
-                col = (1.0, 1.0, 1.0, sm.color[3])
+                col = sm.color
             else:
                 gl.glDisable(gl.GL_TEXTURE_2D)
                 gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
