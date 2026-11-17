@@ -1,6 +1,6 @@
 <div align="center">
   <img src="assets/OpenZenless_Header.png" alt="OpenZenless Logo" width="460" />
-  <p><strong>Zenless Zone Zero asset viewer & extractor, for the people who don't want to study MiHoYo encryption.</strong></p>
+  <p><strong>Zenless Zone Zero asset viewer & extractor, for the people who just want to create!.</strong></p>
   
 
   <p>
