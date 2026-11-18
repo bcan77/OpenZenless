@@ -74,22 +74,65 @@ def load_stage_index() -> dict[str, list[str]]:
                         if b not in blks:
                             blks.append(b)
     mm_p = cfg.CACHE_DIR / "asset_map" / "stage_mat_mesh_blocks_auto.json"
+    owners_p = cfg.CACHE_DIR / "asset_map" / "stage_blk_owners_auto.json"
+    owners_data: dict[str, list] = {}
+    if owners_p.is_file():
+        try:
+            owners_data = json.loads(owners_p.read_text())
+        except Exception:
+            owners_data = {}
+    nap_blocks_by_stage: dict[str, set[str]] = {}
+    for sec, info in load_texture_sections().items():
+        if sec.startswith("NapStreaming/"):
+            sname = sec.split("/", 1)[1].split("/")[0]
+            if sname and "." not in sname:
+                nap_blocks_by_stage.setdefault(sname, set()).update(info.get("blocks", ()))
+    known_stage_roots = {
+        t.lower()
+        for s in stages
+        for t in re.sub(r"^(?:Stage|Env|Scene|Map)_", "", s).split("_")
+        if len(t) >= 3 and not t.isdigit()
+    }
     if mm_p.is_file():
         try:
             mm_data = json.loads(mm_p.read_text())
             for sname, blks in stages.items():
                 clean = re.sub(r"^(?:Stage|Env|Scene|Map)_", "", sname)
                 toks = [t.lower() for t in clean.split("_") if len(t) >= 3 and not t.isdigit()]
-                added = 0
-                for t in toks:
+                mm_toks = [toks[0]] if (toks and mm_data.get(toks[0])) else toks
+                mm_cand: list[str] = []
+                for t in mm_toks:
                     for b in mm_data.get(t, ()):
-                        if b not in blks:
-                            blks.append(b)
-                            added += 1
-                            if added >= 12:
-                                break
-                    if added >= 12:
-                        break
+                        if b not in mm_cand:
+                            mm_cand.append(b)
+                nap_set = nap_blocks_by_stage.get(sname, set())
+                rich_mm = [
+                    b for b in mm_cand
+                    if (owners_data.get(b) is None) or (owners_data[b][0] in mm_toks and owners_data[b][1] >= 20)
+                ]
+                min_ocnt = 20 if len(rich_mm) >= 5 else 10
+                if owners_data and len(mm_cand) >= 3:
+                    mm_set = set(mm_cand)
+                    filtered: list[str] = []
+                    for b in blks:
+                        if b in nap_set:
+                            filtered.append(b)
+                            continue
+                        own = owners_data.get(b)
+                        if own and isinstance(own, list) and len(own) >= 2:
+                            opref, ocnt = own[0], own[1]
+                            if opref in known_stage_roots and opref not in toks:
+                                continue
+                            if ocnt < min_ocnt:
+                                continue
+                        elif not own and b not in mm_set:
+                            continue
+                        filtered.append(b)
+                    blks[:] = filtered
+                add_list = rich_mm if len(rich_mm) >= 5 else mm_cand
+                for b in add_list:
+                    if b not in blks:
+                        blks.append(b)
         except Exception:
             pass
     return stages
@@ -215,6 +258,14 @@ def _parse_cli_asset_map(
     tex_noun_blocks: dict[str, dict[str, int]] = {}
     tex_pathid: dict[str, list[str]] = {}
     mat_mesh_blocks: dict[str, dict[str, int]] = {}
+    mesh_pref_counts: dict[str, dict[str, int]] = {}
+    hlod_mesh_blks: set[str] = set()
+    _HLOD_MESH_RE = re.compile(r"^(?:[A-Z]{1,3}|BRG)_[0-9]+_HLOD")
+    _TECH_MESH_PREFS = frozenset((
+        "curveplacetool", "interiorsegment", "combinegroundquadmesh", "volumetricfog",
+        "loop", "roof", "dynamicobjects", "weathergroup", "eff", "device",
+        "triangle", "mesh", "lod", "billboardmergedmesh", "scenepropcollider", "blockout",
+    ))
     font_blocks: set[str] = set()
     _GENERIC_NOUNS = frozenset((
         "prop", "wall", "floor", "decal", "object", "model", "ceiling", "ground",
@@ -256,6 +307,11 @@ def _parse_cli_asset_map(
                 if len(m_pref) >= 3:
                     mm = mat_mesh_blocks.setdefault(m_pref, {})
                     mm[blk_name] = mm.get(blk_name, 0) + (3 if cur_type == "Material" else 1)
+                    if cur_type == "Mesh" and m_pref not in _TECH_MESH_PREFS:
+                        mp = mesh_pref_counts.setdefault(blk_name, {})
+                        mp[m_pref] = mp.get(m_pref, 0) + 1
+                elif cur_type == "Mesh" and _HLOD_MESH_RE.match(cur_name):
+                    hlod_mesh_blks.add(blk_name)
             if cur_type == "Texture2D" and cur_pathid and cur_name:
                 tex_pathid[cur_pathid] = [cur_name, blk_name]
             if cur_type == "Texture2D" and "_" in cur_name:
@@ -345,11 +401,33 @@ def _parse_cli_asset_map(
         (map_dir / "tex_noun_blocks_auto.json").write_text(json.dumps(compact_nouns))
     if tex_pathid:
         (map_dir / "tex_pathid_auto.json").write_text(json.dumps(tex_pathid))
+    blk_owners: dict[str, list] = {}
+    for blk_name, pcounts in mesh_pref_counts.items():
+        if not pcounts:
+            continue
+        top_pref, top_cnt = max(pcounts.items(), key=lambda it: it[1])
+        tot_cnt = sum(pcounts.values())
+        blk_owners[blk_name] = [top_pref, top_cnt, tot_cnt]
+    if blk_owners:
+        (map_dir / "stage_blk_owners_auto.json").write_text(json.dumps(blk_owners))
     if mat_mesh_blocks:
-        compact_mm = {
-            k: [b for b, _c in sorted(v.items(), key=lambda it: -it[1])[:24]]
-            for k, v in sorted(mat_mesh_blocks.items())
-        }
+        compact_mm = {}
+        for k, v in sorted(mat_mesh_blocks.items()):
+            keep = []
+            for b, _c in sorted(v.items(), key=lambda it: -it[1]):
+                if b not in mesh_pref_counts and b not in hlod_mesh_blks:
+                    continue
+                own = blk_owners.get(b)
+                if own is not None:
+                    opref, _ocnt, tot = own
+                    mcnt = mesh_pref_counts.get(b, {}).get(k, 0)
+                    if k != opref and mcnt < max(2, int(0.45 * tot)):
+                        continue
+                keep.append(b)
+                if len(keep) >= 128:
+                    break
+            if keep:
+                compact_mm[k] = keep
         (map_dir / "stage_mat_mesh_blocks_auto.json").write_text(json.dumps(compact_mm))
     _emit(
         log_cb,

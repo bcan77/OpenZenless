@@ -155,6 +155,10 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "                    var low = x.Text.ToLowerInvariant();\n"
             "                    if (low.EndsWith(\"_proxy\") || low.Contains(\"_proxy (\") || low.Contains(\"_proxy_\")\n"
             "                        || low.EndsWith(\"_col\") || low.Contains(\"_col_\")\n"
+            "                        || low.EndsWith(\"_collider\") || low.Contains(\"_collider (\") || low.Contains(\"_collider_\")\n"
+            "                        || low.StartsWith(\"scenepropcollider_\")\n"
+            "                        || low.StartsWith(\"blockout_\")\n"
+            "                        || (low.StartsWith(\"stage_\") && (low.EndsWith(\"_ld\") || low.Contains(\"_ld (\")))\n"
             "                        || low.EndsWith(\"_lod1\") || low.EndsWith(\"_lod2\") || low.EndsWith(\"_lod3\")\n"
             "                        || low.Contains(\"_lod1 (\") || low.Contains(\"_lod2 (\") || low.Contains(\"_lod3 (\")\n"
             "                        || low.StartsWith(\"sm_merged_bp_\") || low.StartsWith(\"napmesh,\"))\n"
@@ -261,7 +265,7 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "                        dest = target;\n"
             "                    else if (texEnv.Key == \"_MainTex\")\n"
             "                        dest = 0;\n"
-            "                    else if (!hasStdDiffuse && (texEnv.Key == \"_RoomTex\" || texEnv.Key == \"_BlindsTex\" || (texEnv.Key == \"_MaskMap\" && m_Texture2D.m_Name.EndsWith(\"_D\", global::System.StringComparison.OrdinalIgnoreCase))))\n"
+            "                    else if (!hasStdDiffuse && (texEnv.Key == \"_RoomTex\" || texEnv.Key == \"_BlindsTex\" || texEnv.Key == \"_ColorIDMap\" || (m_Texture2D.m_Name.EndsWith(\"_D\", global::System.StringComparison.OrdinalIgnoreCase) && !texEnv.Key.Contains(\"Detail\") && !texEnv.Key.Contains(\"Emission\") && !texEnv.Key.Contains(\"Normal\") && !texEnv.Key.Contains(\"Bump\"))))\n"
             "                        dest = 0;\n"
             "                    else if (texEnv.Key == \"_BumpMap\")\n"
             "                        dest = 3;\n"
@@ -273,13 +277,88 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "                    if (diffuseOnly && dest != 0)\n"
             "                        continue;\n"
             "\n"
-            "                    var texture = new ImportedMaterialTexture();\n"
+                    "                    var texture = new ImportedMaterialTexture();\n"
             "                    iMat.Textures.Add(texture);\n"
             "                    texture.Dest = dest;",
+        ),
+        (
+            "        private void ConvertMeshRenderer(Renderer meshR)\n"
+            "        {\n"
+            "            var mesh = GetMesh(meshR);\n"
+            "            if (mesh == null)\n"
+            "                return;\n"
+            "            var iMesh = new ImportedMesh();",
+            "        private static bool IsProxyOrGreyboxMaterial(Material mat)\n"
+            "        {\n"
+            "            if (mat == null)\n"
+            "                return true;\n"
+            "            if (!string.IsNullOrEmpty(mat.m_Name))\n"
+            "            {\n"
+            "                if (mat.m_Name.IndexOf(\"ShadowProxy\", global::System.StringComparison.OrdinalIgnoreCase) >= 0)\n"
+            "                    return true;\n"
+            "                if (mat.m_Name.StartsWith(\"Eff_\", global::System.StringComparison.OrdinalIgnoreCase))\n"
+            "                    return true;\n"
+            "            }\n"
+            "            if (string.Equals(mat.m_Name, \"Lit\", global::System.StringComparison.OrdinalIgnoreCase)\n"
+            "                && mat.m_SavedProperties?.m_TexEnvs != null\n"
+            "                && !mat.m_SavedProperties.m_TexEnvs.Any(kv => !kv.Value.m_Texture.IsNull))\n"
+            "                return true;\n"
+            "            return false;\n"
+            "        }\n\n"
+            "        private void ConvertMeshRenderer(Renderer meshR)\n"
+            "        {\n"
+            "            var mesh = GetMesh(meshR);\n"
+            "            if (mesh == null)\n"
+            "                return;\n"
+            "            bool skipProxies = global::System.Environment.GetEnvironmentVariable(\"AS_SKIP_PROXIES\") == \"1\";\n"
+            "            if (skipProxies && meshR.m_Materials.Count > 0 && meshR.m_Materials.All(m => !m.TryGet(out var mat) || IsProxyOrGreyboxMaterial(mat)))\n"
+            "                return;\n"
+            "            var iMesh = new ImportedMesh();",
+        ),
+        (
+            "                    if (meshR.m_Materials[i - firstSubMesh].TryGet(out var m_Material))\n"
+            "                    {\n"
+            "                        mat = m_Material;\n"
+            "                    }\n"
+            "                }\n"
+            "                ImportedMaterial iMat = ConvertMaterial(mat);",
+            "                    if (meshR.m_Materials[i - firstSubMesh].TryGet(out var m_Material))\n"
+            "                    {\n"
+            "                        mat = m_Material;\n"
+            "                    }\n"
+            "                }\n"
+            "                if (skipProxies && IsProxyOrGreyboxMaterial(mat))\n"
+            "                {\n"
+            "                    firstFace += numFaces;\n"
+            "                    continue;\n"
+            "                }\n"
+            "                ImportedMaterial iMat = ConvertMaterial(mat);",
+        ),
+        (
+            "            MeshList.Add(iMesh);\n"
+            "        }\n\n"
+            "        private static Mesh GetMesh(Renderer meshR)",
+            "            if (iMesh.SubmeshList.Count > 0)\n"
+            "                MeshList.Add(iMesh);\n"
+            "        }\n\n"
+            "        private static Mesh GetMesh(Renderer meshR)",
         ),
     ])
 
     _replace_in_file("AnimeStudio/AssetsHelper.cs", [
+        (
+            "        public static void ClearOffsets()\n"
+            "        {\n"
+            "            Offsets.Clear();\n"
+            "            Logger.Verbose(\"Cleared cached offsets\");\n"
+            "        }",
+            "        public static void ClearOffsets()\n"
+            "        {\n"
+            "            Offsets.Clear();\n"
+            "            Logger.Verbose(\"Cleared cached offsets\");\n"
+            "        }\n\n"
+            "        public static string[] GetOffsetPaths() => Offsets.Keys.ToArray();",
+        ),
         (
             "        public static string[] ProcessFiles(string[] files_list)\n"
             "        {\n"
@@ -288,6 +367,71 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "        {\n"
             "            Offsets.Clear();\n"
             "            HashSet<string> files = new HashSet<string>(files_list, StringComparer.OrdinalIgnoreCase);",
+        ),
+    ])
+
+    _replace_in_file("AnimeStudio/AssetsManager.cs", [
+        (
+            "            Progress.Reset();\n"
+            "            //use a for loop because list size can change\n"
+            "            for (var i = 0; i < importFiles.Count; i++)\n"
+            "            {\n"
+            "                LoadFile(importFiles[i]);\n"
+            "                Progress.Report(i + 1, importFiles.Count);\n"
+            "                if (tokenSource.IsCancellationRequested)\n"
+            "                {\n"
+            "                    Logger.Info(\"Loading files has been aborted !!\");\n"
+            "                    break;\n"
+            "                }\n"
+            "            }",
+            "            var alreadyFull = ResolveDependencies\n"
+            "                ? new HashSet<string>(files.Where(f => !AssetsHelper.TryGet(f, out _)), StringComparer.OrdinalIgnoreCase)\n"
+            "                : null;\n\n"
+            "            Progress.Reset();\n"
+            "            //use a for loop because list size can change\n"
+            "            for (var i = 0; i < importFiles.Count; i++)\n"
+            "            {\n"
+            "                LoadFile(importFiles[i]);\n"
+            "                Progress.Report(i + 1, importFiles.Count);\n"
+            "                if (tokenSource.IsCancellationRequested)\n"
+            "                {\n"
+            "                    Logger.Info(\"Loading files has been aborted !!\");\n"
+            "                    break;\n"
+            "                }\n"
+            "            }\n\n"
+            "            if (ResolveDependencies && !tokenSource.IsCancellationRequested)\n"
+            "            {\n"
+            "                var checkedCabs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);\n"
+            "                int scannedFiles = 0;\n"
+            "                while (scannedFiles < assetsFileList.Count && !tokenSource.IsCancellationRequested)\n"
+            "                {\n"
+            "                    var missingCabs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);\n"
+            "                    for (; scannedFiles < assetsFileList.Count; scannedFiles++)\n"
+            "                    {\n"
+            "                        foreach (var ext in assetsFileList[scannedFiles].m_Externals)\n"
+            "                        {\n"
+            "                            var cab = ext.fileName;\n"
+            "                            if (!string.IsNullOrEmpty(cab) && !assetsFileListHash.Contains(cab) && checkedCabs.Add(cab))\n"
+            "                            {\n"
+            "                                missingCabs.Add(cab);\n"
+            "                            }\n"
+            "                        }\n"
+            "                    }\n"
+            "                    if (missingCabs.Count == 0)\n"
+            "                        break;\n"
+            "                    AssetsHelper.ClearOffsets();\n"
+            "                    AssetsHelper.AddCABOffsetsFast(alreadyFull, missingCabs);\n"
+            "                    var extraFiles = AssetsHelper.GetOffsetPaths();\n"
+            "                    if (extraFiles.Length == 0)\n"
+            "                        break;\n"
+            "                    foreach (var extra in extraFiles)\n"
+            "                    {\n"
+            "                        if (tokenSource.IsCancellationRequested)\n"
+            "                            break;\n"
+            "                        LoadFile(extra);\n"
+            "                    }\n"
+            "                }\n"
+            "            }",
         ),
     ])
 
