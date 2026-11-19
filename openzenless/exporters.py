@@ -18,6 +18,8 @@ from .indexer import (
     _emit,
     load_character_index,
     load_curated_map_index,
+    load_oz_character_index,
+    load_oz_map_index,
     load_stage_texture_blocks,
     load_stage_texture_blocks_for_dir,
     load_wwise_mapper,
@@ -56,6 +58,11 @@ def export_blk_asset_types(
     diffuse_only: bool = False,
     skip_proxies: bool = False,
     stage_tokens: str = "",
+    container_hash_file: Path | None = None,
+    cab_filter: str = "",
+    extra_cabs: str = "",
+    group_assets: str = "ByType",
+    skip_animations: bool = False,
 ) -> int:
     if not source_path.exists():
         raise FileNotFoundError(f"Source path not found: {source_path}")
@@ -81,13 +88,21 @@ def export_blk_asset_types(
         env["AS_SKIP_PROXIES"] = "1"
     if stage_tokens:
         env["AS_STAGE_TOKENS"] = stage_tokens
+    if container_hash_file is not None:
+        env["AS_CONTAINER_HASH_FILE"] = ("Z:" + str(container_hash_file.resolve())).replace("/", "\\")
+    if cab_filter:
+        env["AS_CAB_FILTER"] = cab_filter
+    if extra_cabs:
+        env["AS_EXTRA_CABS"] = extra_cabs
+    if skip_animations:
+        env["AS_SKIP_ANIMATIONS"] = "1"
     cmd = [
         "wine", str(cfg.CLI_EXE),
         "Z:" + str(source_path).replace("/", "\\"),
         "Z:" + str(out_dir).replace("/", "\\"),
         "--game", "ZZZ",
         "--types", *types,
-        "--group_assets", "ByType",
+        "--group_assets", group_assets or "ByType",
         "--export_type", export_mode,
     ]
     if map_op and map_name:
@@ -150,6 +165,11 @@ def export_blks_batch(
     diffuse_only: bool = False,
     skip_proxies: bool = False,
     stage_tokens: str = "",
+    container_hash_file: Path | None = None,
+    cab_filter: str = "",
+    extra_cabs: str = "",
+    group_assets: str = "ByType",
+    skip_animations: bool = False,
 ) -> int:
     if not blk_paths:
         return 0
@@ -161,7 +181,9 @@ def export_blks_batch(
             blk_paths[0], out_dir, types=types, export_mode=export_mode,
             name_filter=name_filter, log_cb=log_cb,
             map_op=map_op, map_name=map_name, diffuse_only=diffuse_only, skip_proxies=skip_proxies,
-            stage_tokens=stage_tokens,
+            stage_tokens=stage_tokens, container_hash_file=container_hash_file,
+            cab_filter=cab_filter, extra_cabs=extra_cabs, group_assets=group_assets,
+            skip_animations=skip_animations,
         )
     if cab_active:
         with tempfile.NamedTemporaryFile("w", suffix=".blklist", delete=False, encoding="utf-8") as tf:
@@ -173,7 +195,9 @@ def export_blks_batch(
                 list_path, out_dir, types=types, export_mode=export_mode,
                 name_filter=name_filter, log_cb=log_cb,
                 map_op=map_op, map_name=map_name, diffuse_only=diffuse_only, skip_proxies=skip_proxies,
-                stage_tokens=stage_tokens,
+                stage_tokens=stage_tokens, container_hash_file=container_hash_file,
+                cab_filter=cab_filter, extra_cabs=extra_cabs, group_assets=group_assets,
+                skip_animations=skip_animations,
             )
         finally:
             list_path.unlink(missing_ok=True)
@@ -186,7 +210,9 @@ def export_blks_batch(
         return export_blk_asset_types(
             stage_dir, out_dir, types=types, export_mode=export_mode,
             name_filter=name_filter, log_cb=log_cb, diffuse_only=diffuse_only, skip_proxies=skip_proxies,
-            stage_tokens=stage_tokens,
+            stage_tokens=stage_tokens, container_hash_file=container_hash_file,
+            cab_filter=cab_filter, extra_cabs=extra_cabs, group_assets=group_assets,
+            skip_animations=skip_animations,
         )
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
@@ -573,7 +599,7 @@ def _blender_convert_chunk(
         "    cur = obj\n"
         "    while cur is not None:\n"
         "        nl = cur.name.lower()\n"
-        "        if _re.search(r'(?:_col(?:$|_|lider)|_proxy(?:$|_|\\s|\\.|[0-9])|_hairshadow(?:$|_|\\s|\\.|[0-9])|_lod[1-3](?:$|_|\\s|\\.|[0-9])|^volumetricfog|^scenepropcollider_|^blockout_|^stage_.*_ld$|^sm_merged_bp_|^napmesh,)', nl):\n"
+        "        if _re.search(r'(?:_col(?:$|_|lider)|_proxy(?:$|_|\\s|\\.|[0-9])|_hairshadow(?:$|_|\\s|\\.|[0-9])|^volumetricfog|^scenepropcollider_|^blockout_|^stage_.*_ld$|^sm_merged_bp_|^napmesh,)', nl):\n"
         "            return True\n"
         "        cur = cur.parent\n"
         "    if obj.type == 'MESH' and obj.data and obj.data.materials:\n"
@@ -714,6 +740,10 @@ def _blender_convert_chunk(
         "        if nd.type == 'TEX_IMAGE' and not any(lk.to_socket.name == 'Base Color' for lk in nd.outputs[0].links):\n"
         "            nt.nodes.remove(nd)\n"
         "    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)\n"
+        "    if bsdf and 'Emission Color' in bsdf.inputs and not bsdf.inputs['Emission Color'].is_linked:\n"
+        "        if 'Emission Strength' in bsdf.inputs:\n"
+        "            bsdf.inputs['Emission Strength'].default_value = 0.0\n"
+        "        bsdf.inputs['Emission Color'].default_value = (0.0, 0.0, 0.0, 1.0)\n"
         "    if bsdf and bsdf.inputs['Base Color'].is_linked:\n"
         "        dc = mat.diffuse_color\n"
         "        if any(abs(float(dc[k]) - 1.0) > 0.02 for k in range(3)):\n"
@@ -752,11 +782,21 @@ def _convert_dir_to_glb(char_dir: Path, char_name: str, log_cb=None) -> int:
     objs = sorted(char_dir.rglob("*.obj"))
     def _filter_models(paths: list[Path]) -> list[Path]:
         non_col = [p for p in paths if not any(t in p.stem.lower() for t in ("_col_", "_proxy"))]
-        base = non_col if non_col else paths
-        non_lod = [p for p in base if not any(t in p.stem.lower() for t in ("_lod1", "_lod2", "_lod3"))]
-        return non_lod if non_lod else base
-    fbxs = _filter_models(fbxs)
-    objs = _filter_models(objs)
+        return non_col if non_col else paths
+    def _dedup_cab_models(paths: list[Path]) -> list[Path]:
+        seen: set[tuple[str, str, str]] = set()
+        out: list[Path] = []
+        for p in paths:
+            cab_dir = next((part for part in p.parts if part.startswith("CAB-") or part.startswith("BuildPlayer-")), None)
+            if cab_dir is not None:
+                key = (cab_dir.lower(), p.parent.name.lower(), p.name.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+            out.append(p)
+        return out
+    fbxs = _dedup_cab_models(_filter_models(fbxs))
+    objs = _dedup_cab_models(_filter_models(objs))
     if not fbxs and not objs:
         _emit(log_cb, f"No FBX/OBJ models found in {char_dir}; skipping GLB conversion.")
         return 0
@@ -801,6 +841,83 @@ def export_character_full(
 ) -> int:
     script = cfg.EXTRACTOR_ROOT / "lib" / "extract_character_v2.py"
     if not script.exists():
+        oz_chars = load_oz_character_index()
+        matched_name = None
+        if oz_chars:
+            matched_name = char_name if char_name in oz_chars else next(
+                (k for k in oz_chars if k.lower() == char_name.lower()), None
+            )
+        if matched_name and _zzz_cab_map_exists() and cfg.CLI_EXE.is_file() and shutil.which("wine") is not None:
+            entry = oz_chars[matched_name]
+            root = game_root or cfg.GAME_ROOT
+            prefab_path = cfg.resolve_blk_path(root, entry.get("prefab_blk", ""))
+            if prefab_path is not None:
+                dest = (out_dir or (cfg.FINAL_ROOT / "Exports")) / matched_name
+                extra_cabs_str = ",".join(entry.get("extra_cabs") or [])
+                prefab_cab = entry.get("prefab_cab", "")
+                prefab_key = entry.get("prefab_key", "")
+                _emit(
+                    log_cb,
+                    f"Exporting {matched_name} ({prefab_path.name}, cab={prefab_cab}, "
+                    f"+{len(entry.get('extra_cabs') or [])} SeparateMesh CABs) -> {dest}",
+                )
+                hash_file: Path | None = None
+                try:
+                    if prefab_key:
+                        with tempfile.NamedTemporaryFile("w", suffix=".hashes", delete=False, encoding="utf-8") as hf:
+                            hf.write(str(prefab_key) + "\n")
+                            hash_file = Path(hf.name)
+                    types_list = ["GameObject"] + (["Shader"] if export_shaders else [])
+                    last_rc = export_blk_asset_types(
+                        prefab_path, dest,
+                        types=types_list,
+                        export_mode="Convert",
+                        log_cb=log_cb,
+                        map_op="CABMap",
+                        map_name="ZZZ",
+                        diffuse_only=(not export_shaders),
+                        skip_proxies=False,
+                        container_hash_file=hash_file,
+                        cab_filter=prefab_cab,
+                        extra_cabs=extra_cabs_str,
+                        group_assets="BySource",
+                        skip_animations=True,
+                    )
+                finally:
+                    if hash_file is not None:
+                        hash_file.unlink(missing_ok=True)
+                if convert_glb and last_rc == 0:
+                    rc_glb = _convert_dir_to_glb(dest, matched_name, log_cb=log_cb)
+                    if rc_glb != 0:
+                        last_rc = rc_glb
+                anim_blks = [
+                    p for b in (entry.get("anim_blks") or [])
+                    if (p := cfg.resolve_blk_path(root, b)) is not None
+                ]
+                if anim_blks:
+                    anim_keys = entry.get("anim_keys") or []
+                    anim_hash_file: Path | None = None
+                    try:
+                        if anim_keys:
+                            with tempfile.NamedTemporaryFile("w", suffix=".hashes", delete=False, encoding="utf-8") as ahf:
+                                ahf.write("\n".join(str(k) for k in anim_keys) + "\n")
+                                anim_hash_file = Path(ahf.name)
+                        rc_anim = export_blks_batch(
+                            anim_blks, dest / "Animations",
+                            types=["AnimationClip"],
+                            export_mode="Convert",
+                            log_cb=log_cb,
+                            use_cab_map=True,
+                            container_hash_file=anim_hash_file,
+                            group_assets="BySource",
+                        )
+                        if rc_anim != 0:
+                            _emit(log_cb, f"WARNING: AnimationClip export returned rc={rc_anim} (some clips could not be decoded).")
+                    finally:
+                        if anim_hash_file is not None:
+                            anim_hash_file.unlink(missing_ok=True)
+                return last_rc
+
         chars = load_character_index()
         blocks = chars.get(char_name)
         if blocks and cfg.CLI_EXE.is_file() and shutil.which("wine") is not None:
@@ -874,6 +991,43 @@ def export_character_animations_only(
     out_dir: Path,
     log_cb=None,
 ) -> int:
+    oz_chars = load_oz_character_index()
+    matched_name = None
+    if oz_chars:
+        matched_name = char_name if char_name in oz_chars else next(
+            (k for k in oz_chars if k.lower() == char_name.lower()), None
+        )
+    if matched_name and _zzz_cab_map_exists():
+        entry = oz_chars[matched_name]
+        anim_blks = [
+            p for b in (entry.get("anim_blks") or [])
+            if (p := cfg.resolve_blk_path(game_root, b)) is not None
+        ]
+        if anim_blks:
+            dest_dir = out_dir / matched_name / "Animations"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            anim_keys = entry.get("anim_keys") or []
+            anim_hash_file: Path | None = None
+            try:
+                if anim_keys:
+                    with tempfile.NamedTemporaryFile("w", suffix=".hashes", delete=False, encoding="utf-8") as ahf:
+                        ahf.write("\n".join(str(k) for k in anim_keys) + "\n")
+                        anim_hash_file = Path(ahf.name)
+                _emit(log_cb, f"Exporting animations for {matched_name} from {len(anim_blks)} .blk(s) ({len(anim_keys)} keys) -> {dest_dir}")
+                return export_blks_batch(
+                    anim_blks,
+                    dest_dir,
+                    types=["AnimationClip"],
+                    export_mode="Convert",
+                    log_cb=log_cb,
+                    use_cab_map=True,
+                    container_hash_file=anim_hash_file,
+                    group_assets="BySource",
+                )
+            finally:
+                if anim_hash_file is not None:
+                    anim_hash_file.unlink(missing_ok=True)
+
     chars = load_character_index()
     blocks = chars.get(char_name)
     if not blocks:
@@ -913,6 +1067,94 @@ def export_scene_map(
 ) -> int:
     script = cfg.EXTRACTOR_ROOT / "lib" / "export_maps_pipeline.py"
     if not script.exists():
+        oz_maps = load_oz_map_index()
+        if oz_maps and _zzz_cab_map_exists() and cfg.CLI_EXE.is_file() and shutil.which("wine") is not None:
+            oz_targets: list[tuple[str, dict]] = []
+            if not stage_name or stage_name.lower() == "all":
+                oz_targets = list(oz_maps.items())
+            elif stage_name in oz_maps:
+                oz_targets = [(stage_name, oz_maps[stage_name])]
+            else:
+                ci_match = next((k for k in oz_maps if k.lower() == stage_name.lower()), None)
+                if ci_match is not None:
+                    oz_targets = [(ci_match, oz_maps[ci_match])]
+            if oz_targets:
+                root = game_root or cfg.GAME_ROOT
+                base_out = out_dir or (cfg.FINAL_ROOT / "Exports")
+                map_types = ["GameObject"] + (["Shader"] if export_shaders else [])
+                last_rc = 0
+                for sname, entry in oz_targets:
+                    dest = base_out / sname
+                    dest.mkdir(parents=True, exist_ok=True)
+                    rc = 0
+                    st = entry.get("streaming")
+                    if isinstance(st, dict) and st.get("blks") and st.get("hashes"):
+                        stream_blks = [
+                            p for b in st["blks"]
+                            if (p := cfg.resolve_blk_path(root, b)) is not None
+                        ]
+                        if stream_blks:
+                            _emit(
+                                log_cb,
+                                f"Exporting {sname} Streaming ({len(st['hashes'])} sectors across {len(stream_blks)} .blk(s)) -> {dest / 'Streaming'}",
+                            )
+                            hash_file: Path | None = None
+                            try:
+                                with tempfile.NamedTemporaryFile("w", suffix=".hashes", delete=False, encoding="utf-8") as hf:
+                                    hf.write("\n".join(str(h) for h in st["hashes"]) + "\n")
+                                    hash_file = Path(hf.name)
+                                rc_st = export_blks_batch(
+                                    stream_blks,
+                                    dest / "Streaming",
+                                    types=map_types,
+                                    export_mode="Convert",
+                                    log_cb=log_cb,
+                                    use_cab_map=True,
+                                    diffuse_only=(not export_shaders),
+                                    skip_proxies=True,
+                                    container_hash_file=hash_file,
+                                    group_assets="BySource",
+                                    skip_animations=True,
+                                )
+                                if rc_st != 0:
+                                    rc = rc_st
+                            finally:
+                                if hash_file is not None:
+                                    hash_file.unlink(missing_ok=True)
+
+                    bs = entry.get("base_scene")
+                    if isinstance(bs, dict) and bs.get("blk"):
+                        bs_path = cfg.resolve_blk_path(root, bs["blk"])
+                        if bs_path is not None:
+                            _emit(
+                                log_cb,
+                                f"Exporting {sname} BaseScene ({bs_path.name}, cab={bs.get('cab', '')}) -> {dest / 'BaseScene'}",
+                            )
+                            rc_bs = export_blk_asset_types(
+                                bs_path,
+                                dest / "BaseScene",
+                                types=map_types,
+                                export_mode="Convert",
+                                log_cb=log_cb,
+                                map_op="CABMap",
+                                map_name="ZZZ",
+                                diffuse_only=(not export_shaders),
+                                skip_proxies=True,
+                                cab_filter=bs.get("cab", ""),
+                                group_assets="BySource",
+                                skip_animations=True,
+                            )
+                            if rc_bs != 0:
+                                rc = rc_bs
+
+                    if rc == 0 or list(dest.rglob("*.fbx")):
+                        rc_glb = _convert_dir_to_glb(dest, sname, log_cb=log_cb)
+                        if rc_glb != 0:
+                            rc = rc_glb
+                    if rc != 0:
+                        last_rc = rc
+                return last_rc
+
         stages = load_curated_map_index()
         if cfg.CLI_EXE.is_file() and shutil.which("wine") is not None and stages:
             files_root = cfg.resolve_files_root(game_root or cfg.GAME_ROOT)

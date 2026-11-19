@@ -173,6 +173,130 @@ def resolve_files_root(game_root: Path) -> Path:
     return game_root
 
 
+def find_blk_dirs(game_root: Path) -> list[Path]:
+    """Return ordered list of Blocks directories (main files/Blocks plus APK split Blocks if present)."""
+    files_root = resolve_files_root(game_root)
+    dirs: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(p: Path):
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        if p.is_dir() and rp not in seen:
+            seen.add(rp)
+            dirs.append(p)
+
+    _add(files_root / "Blocks")
+    for base in (game_root, files_root.parent, files_root.parent.parent):
+        _add(base / "APKs" / "extracted" / "split_UnityDataAssetPack" / "assets" / "Blocks")
+        _add(base / "split_UnityDataAssetPack" / "assets" / "Blocks")
+    return dirs
+
+
+def load_res_version_order(files_root: Path) -> dict[str, int]:
+    """Parse res_version_persist / data_version_persist into {blk_rel_or_name: priority_index} (0 = newest)."""
+    order: dict[str, int] = {}
+    idx = 0
+    for name in ("res_version_persist", "data_version_persist"):
+        for cand in (files_root / name, files_root.parent / name):
+            if not cand.is_file():
+                continue
+            try:
+                data = json.loads(cand.read_text(encoding="utf-8", errors="ignore"))
+                entries = data.get("files") if isinstance(data, dict) else None
+                if not isinstance(entries, list):
+                    continue
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    remote = str(item.get("remoteName") or "").replace("\\", "/")
+                    if not remote.lower().endswith(".blk"):
+                        continue
+                    rel = remote.split("Blocks/", 1)[-1] if "Blocks/" in remote else remote.lstrip("/")
+                    base = Path(rel).name
+                    if rel not in order:
+                        order[rel] = idx
+                    if base not in order:
+                        order[base] = idx
+                    idx += 1
+            except Exception:
+                pass
+    return order
+
+
+def collect_ordered_blks(game_root: Path) -> tuple[Path, list[Path]]:
+    """Collect all unique .blk files across main & APK Blocks dirs, ordered by res_version_persist priority."""
+    files_root = resolve_files_root(game_root)
+    blk_dirs = find_blk_dirs(game_root)
+    order_map = load_res_version_order(files_root)
+
+    if len(blk_dirs) > 1:
+        try:
+            common_base = Path(os.path.commonpath([str(d.resolve()) for d in blk_dirs]))
+        except Exception:
+            common_base = game_root.resolve()
+    elif blk_dirs:
+        common_base = blk_dirs[0].parent.resolve()
+    else:
+        common_base = files_root.resolve()
+
+    by_rel: dict[str, tuple[int, float, Path]] = {}
+    for bdir in blk_dirs:
+        for p in bdir.rglob("*.blk"):
+            if not p.is_file():
+                continue
+            try:
+                rel_in_blocks = p.relative_to(bdir).as_posix()
+            except Exception:
+                rel_in_blocks = p.name
+            try:
+                rel_common = p.resolve().relative_to(common_base).as_posix()
+            except Exception:
+                rel_common = rel_in_blocks
+            prio = order_map.get(rel_in_blocks, order_map.get(p.name, 999999))
+            try:
+                mt = p.stat().st_mtime
+            except OSError:
+                mt = 0.0
+            prev = by_rel.get(rel_common)
+            if prev is None or (prio, -mt) < (prev[0], prev[1]):
+                by_rel[rel_common] = (prio, -mt, p)
+
+    ordered = [
+        item[2]
+        for _, item in sorted(by_rel.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0]))
+    ]
+    return common_base, ordered
+
+
+def resolve_blk_path(game_root: Path | None, blk_ref: str) -> Path | None:
+    """Resolve a stored relative/basename .blk reference against game_root and its Blocks dirs."""
+    if not blk_ref:
+        return None
+    p = Path(blk_ref)
+    if p.is_file():
+        return p
+    root = game_root if game_root is not None else detect_default_game_root()
+    norm = blk_ref.replace("\\", "/").lstrip("/")
+    files_root = resolve_files_root(root)
+    cands = [
+        root / norm,
+        files_root / norm,
+        files_root.parent / norm,
+    ]
+    for bdir in find_blk_dirs(root):
+        cands.append(bdir / norm)
+        cands.append(bdir / Path(norm).name)
+        if "Blocks/" in norm:
+            cands.append(bdir / norm.split("Blocks/", 1)[1])
+    for cand in cands:
+        if cand.is_file():
+            return cand
+    return None
+
+
 def detect_build_platform(game_root: Path, files_root: Path) -> str:
     s = f"{game_root} {files_root}"
     if (files_root / "Audio" / "Windows").exists() or "ZenlessZoneZero_Data" in s or (game_root / "ZenlessZoneZero_Data").exists():

@@ -5,14 +5,117 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from . import config as cfg
 
 _WWISE_MAPPER_CACHE = None
+
+_OZ_CHAR_BASE_RE = re.compile(
+    r"^(Avatar_(?:Male|Female)_Size\d+_[A-Za-z0-9]+|Avatar_Bangboo_[A-Za-z0-9]+)$"
+)
+_OZ_ANI_CHAR_RE = re.compile(
+    r"^(Avatar_(?:Male|Female)_Size\d+_[A-Za-z0-9]+|Avatar_Bangboo_[A-Za-z0-9]+)_Ani_"
+)
+
+
+def xxh64(data: bytes, seed: int = 0) -> int:
+    """Pure-Python standard XXH64 (used by Unity/ZZZ for AssetBundle container hashes)."""
+    P1 = 0x9E3779B185EBCA87
+    P2 = 0xC2B2AE3D27D4EB4F
+    P3 = 0x165667B19E3779F9
+    P4 = 0x85EBCA77C2B2AE63
+    P5 = 0x27D4EB2F165667C5
+    M64 = 0xFFFFFFFFFFFFFFFF
+
+    def rotl64(x: int, r: int) -> int:
+        return ((x << r) | (x >> (64 - r))) & M64
+
+    def _round(acc: int, lane: int) -> int:
+        acc = (acc + lane * P2) & M64
+        acc = rotl64(acc, 31)
+        return (acc * P1) & M64
+
+    def _merge(acc: int, val: int) -> int:
+        acc ^= _round(0, val)
+        return ((acc * P1) + P4) & M64
+
+    n = len(data)
+    off = 0
+    if n >= 32:
+        v1 = (seed + P1 + P2) & M64
+        v2 = (seed + P2) & M64
+        v3 = seed & M64
+        v4 = (seed - P1) & M64
+        limit = n - 32
+        while off <= limit:
+            k1, k2, k3, k4 = struct.unpack_from("<4Q", data, off)
+            v1 = _round(v1, k1)
+            v2 = _round(v2, k2)
+            v3 = _round(v3, k3)
+            v4 = _round(v4, k4)
+            off += 32
+        h = (rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18)) & M64
+        h = _merge(h, v1)
+        h = _merge(h, v2)
+        h = _merge(h, v3)
+        h = _merge(h, v4)
+    else:
+        h = (seed + P5) & M64
+
+    h = (h + n) & M64
+    while off + 8 <= n:
+        lane = struct.unpack_from("<Q", data, off)[0]
+        h ^= _round(0, lane)
+        h = (rotl64(h, 27) * P1 + P4) & M64
+        off += 8
+    while off + 4 <= n:
+        lane = struct.unpack_from("<I", data, off)[0]
+        h ^= (lane * P1) & M64
+        h = (rotl64(h, 23) * P2 + P3) & M64
+        off += 4
+    while off < n:
+        h ^= (data[off] * P5) & M64
+        h = (rotl64(h, 11) * P1) & M64
+        off += 1
+
+    h ^= h >> 33
+    h = (h * P2) & M64
+    h ^= h >> 29
+    h = (h * P3) & M64
+    h ^= h >> 32
+    return h
+
+
+def load_oz_map_index() -> dict[str, dict]:
+    p = cfg.CACHE_DIR / "asset_map" / "oz_maps_index.json"
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+            maps = data.get("maps")
+            if isinstance(maps, dict):
+                return maps
+        except Exception:
+            pass
+    return {}
+
+
+def load_oz_character_index() -> dict[str, dict]:
+    p = cfg.CACHE_DIR / "asset_map" / "oz_characters_index.json"
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+            chars = data.get("characters")
+            if isinstance(chars, dict):
+                return chars
+        except Exception:
+            pass
+    return {}
 
 
 def _emit(log_cb, msg: str):
@@ -23,6 +126,18 @@ def _emit(log_cb, msg: str):
 
 
 def load_character_index() -> dict[str, list[str]]:
+    oz_chars = load_oz_character_index()
+    if oz_chars:
+        out: dict[str, list[str]] = {}
+        for k, v in oz_chars.items():
+            if not isinstance(v, dict):
+                continue
+            blks: list[str] = []
+            for b in [v.get("prefab_blk", ""), *v.get("mesh_blks", ())]:
+                if b and b not in blks:
+                    blks.append(b)
+            out[k] = blks
+        return out
     for cand in (
         cfg.EXTRACTOR_ROOT / "data" / "asset_map" / "character_index_lean.json",
         cfg.EXTRACTOR_ROOT / "data" / "asset_map" / "character_index_rich.json",
@@ -40,6 +155,22 @@ def load_character_index() -> dict[str, list[str]]:
 
 
 def load_stage_index() -> dict[str, list[str]]:
+    oz_maps = load_oz_map_index()
+    if oz_maps:
+        out: dict[str, list[str]] = {}
+        for k, v in oz_maps.items():
+            if not isinstance(v, dict):
+                continue
+            blks: list[str] = []
+            st = v.get("streaming") or {}
+            for b in st.get("blks", ()):
+                if b and b not in blks:
+                    blks.append(b)
+            bs = v.get("base_scene") or {}
+            if bs.get("blk") and bs["blk"] not in blks:
+                blks.append(bs["blk"])
+            out[k] = blks
+        return out
     stages: dict[str, list[str]] = {}
     for inv in (
         cfg.EXTRACTOR_ROOT / "data" / "all_maps_inventory.json",
@@ -224,14 +355,15 @@ def has_asset_map(game_root: Path) -> bool:
         try:
             data = json.loads(manifest.read_text())
             if data.get("files_root") == str(files_root):
-                if cfg.CLI_EXE.is_file() and (files_root / "Blocks").is_dir():
-                    if data.get("auto_characters", 0) > 0 or data.get("user_skipped"):
+                if (cfg.CACHE_DIR / "asset_map" / "oz_maps_index.json").is_file() and (cfg.CACHE_DIR / "asset_map" / "oz_characters_index.json").is_file() and data.get("oz_index_version", 0) >= 2:
+                    return True
+                if data.get("user_skipped"):
+                    return True
+                if not cfg.CLI_EXE.is_file():
+                    if data.get("blk_count", 0) > 0 or data.get("pck_count", 0) > 0:
                         return True
-                    return False
-                if data.get("blk_count", 0) > 0 or data.get("pck_count", 0) > 0:
-                    return True
-                if not (files_root / "Blocks").exists() and not (files_root / "Audio").exists():
-                    return True
+                    if not (files_root / "Blocks").exists() and not (files_root / "Audio").exists():
+                        return True
         except Exception:
             pass
     return False
@@ -610,6 +742,385 @@ def load_stage_texture_blocks_for_dir(stage_name: str, stage_dir: Path) -> tuple
     return seen, pat
 
 
+def _write_csharp_str(f, s: str):
+    """Write a .NET BinaryWriter 7-bit length-prefixed UTF-8 string."""
+    b = s.encode("utf-8")
+    n = len(b)
+    while n >= 0x80:
+        f.write(bytes(((n & 0x7F) | 0x80,)))
+        n >>= 7
+    f.write(bytes((n,)))
+    if b:
+        f.write(b)
+
+
+def _write_cab_map_bin(
+    cab_entries: dict[str, tuple[tuple[int, float], str, str, int, list[str]]],
+    base_folder_win: str,
+    out_bin: Path,
+):
+    """Write AnimeStudio AssetsHelper CABMap binary (Maps/ZZZ.bin) directly from indexed CAB rows."""
+    out_bin.parent.mkdir(parents=True, exist_ok=True)
+    tmp_bin = out_bin.with_suffix(".bin.tmp")
+    ordered = sorted(cab_entries.values(), key=lambda x: x[1].lower())
+    with tmp_bin.open("wb") as f:
+        _write_csharp_str(f, base_folder_win)
+        f.write(struct.pack("<i", len(ordered)))
+        for _, cab_name, blk_rel, offset, deps in ordered:
+            _write_csharp_str(f, cab_name)
+            _write_csharp_str(f, blk_rel.replace("/", "\\"))
+            f.write(struct.pack("<q", int(offset)))
+            _write_csharp_str_deps = deps or ()
+            f.write(struct.pack("<i", len(_write_csharp_str_deps)))
+            for dep in _write_csharp_str_deps:
+                _write_csharp_str(f, dep)
+    os.replace(tmp_bin, out_bin)
+
+
+def _build_oz_indexes_from_jsonl(
+    jsonl_paths: Path | list[Path],
+    map_dir: Path,
+    game_root: Path,
+    common_base: Path | None = None,
+    write_cab_map: bool = True,
+    total_blk_count: int | None = None,
+    log_cb=None,
+) -> tuple[int, int, int]:
+    """Parse lightweight AnimeStudio AS_DUMP_OZ_INDEX JSONL shard(s) -> oz_maps_index, oz_characters_index, Maps/ZZZ.bin."""
+    paths = [jsonl_paths] if isinstance(jsonl_paths, Path) else list(jsonl_paths)
+    files_root = cfg.resolve_files_root(game_root)
+    order_map = cfg.load_res_version_order(files_root)
+    prio_cache: dict[str, tuple[int, float]] = {}
+
+    def _blk_prio(blk_rel: str) -> tuple[int, float]:
+        cached = prio_cache.get(blk_rel)
+        if cached is not None:
+            return cached
+        norm = blk_rel.replace("\\", "/")
+        rel_in_blocks = norm.split("Blocks/", 1)[-1] if "Blocks/" in norm else norm
+        base = Path(rel_in_blocks).name
+        p = order_map.get(rel_in_blocks, order_map.get(base, 999999))
+        mt = 0.0
+        resolved = cfg.resolve_blk_path(game_root, blk_rel)
+        if resolved is not None:
+            try:
+                mt = resolved.stat().st_mtime
+            except OSError:
+                pass
+        val = (p, -mt)
+        prio_cache[blk_rel] = val
+        return val
+
+    cab_entries: dict[str, tuple[tuple[int, float], str, str, int, list[str]]] = {}
+    ab_by_key: dict[str, tuple[tuple[int, float], str, str, str, str]] = {}
+    prefabs_by_name: dict[str, tuple[tuple[int, float], str, str, str]] = {}
+    sep_mesh_by_name: dict[str, tuple[tuple[int, float], str, str, str]] = {}
+    char_anis: dict[str, dict[str, tuple[tuple[int, float], str, str]]] = {}
+    scenes: dict[str, tuple[tuple[int, float], str, str]] = {}
+    streams: dict[str, tuple[tuple[int, int, int, float], str, str, str, str, list[str]]] = {}
+    lods_by_cab: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    font_blks_set: set[str] = set()
+
+    for jp in paths:
+        if not jp.is_file():
+            continue
+        with jp.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                k = row.get("k")
+                blk = row.get("blk", "")
+                if not blk:
+                    continue
+                bp = _blk_prio(blk)
+
+                if k == "cab":
+                    cab = str(row.get("cab") or "")
+                    if cab:
+                        cl = cab.lower()
+                        prev_c = cab_entries.get(cl)
+                        if prev_c is None or bp < prev_c[0]:
+                            deps = [str(d) for d in (row.get("deps") or []) if d]
+                            cab_entries[cl] = (bp, cab, blk, int(row.get("off") or 0), deps)
+
+                elif k == "ab":
+                    key = str(row.get("key") or "")
+                    cab = str(row.get("cab") or "")
+                    atype = str(row.get("type") or "")
+                    aname = str(row.get("name") or "")
+                    if key:
+                        prev = ab_by_key.get(key)
+                        if prev is None or bp < prev[0]:
+                            ab_by_key[key] = (bp, blk, cab, atype, aname)
+                    if atype == "GameObject" and aname:
+                        if _OZ_CHAR_BASE_RE.match(aname) or (aname.endswith("_Model") and _OZ_CHAR_BASE_RE.match(aname[:-6])):
+                            prev_p = prefabs_by_name.get(aname)
+                            if prev_p is None or bp < prev_p[0]:
+                                prefabs_by_name[aname] = (bp, blk, cab, key)
+                    if atype == "Mesh" and aname.startswith("SeparateMesh_"):
+                        prev_m = sep_mesh_by_name.get(aname)
+                        if prev_m is None or bp < prev_m[0]:
+                            sep_mesh_by_name[aname] = (bp, blk, cab, key)
+                    if aname and ("_Ani_" in aname):
+                        am = _OZ_ANI_CHAR_RE.match(aname)
+                        if am and key:
+                            cbase = am.group(1)
+                            cmap = char_anis.setdefault(cbase, {})
+                            prev_a = cmap.get(aname)
+                            if prev_a is None or bp < prev_a[0]:
+                                cmap[aname] = (bp, blk, key)
+
+                elif k == "scene":
+                    cab = str(row.get("cab") or "")
+                    if cab.lower().startswith("buildplayer-") and not cab.lower().endswith(".sharedassets"):
+                        sname = cab[len("BuildPlayer-"):]
+                        prev_s = scenes.get(sname)
+                        if prev_s is None or bp < prev_s[0]:
+                            scenes[sname] = (bp, blk, cab)
+
+                elif k == "stream":
+                    mname = str(row.get("map") or "").strip()
+                    if not mname:
+                        continue
+                    sectors = [str(s) for s in (row.get("sectors") or []) if s]
+                    prefab_dir = str(row.get("prefab_dir") or f"Assets/NapResources/NapStreaming/{mname}/Prefab").rstrip("/")
+                    size = int(row.get("size") or 0)
+                    cab = str(row.get("cab") or "")
+                    key = str(row.get("key") or "")
+                    sp = (bp[0], -len(sectors), -size, bp[1])
+                    prev_st = streams.get(mname)
+                    if prev_st is None or sp < prev_st[0]:
+                        streams[mname] = (sp, blk, cab, key, prefab_dir, sectors)
+
+                elif k == "lod":
+                    cab = str(row.get("cab") or "")
+                    go_name = str(row.get("go") or "")
+                    mesh_path = str(row.get("mesh_path") or "")
+                    if cab and mesh_path:
+                        lods_by_cab.setdefault((blk, cab), []).append((go_name, mesh_path))
+
+                elif k == "font":
+                    font_blks_set.add(blk)
+
+    scenes_ci = {s.lower(): s for s in scenes}
+    paired_scenes: set[str] = set()
+    maps_dict: dict[str, dict] = {}
+
+    for mname in sorted(streams):
+        _, m_blk, m_cab, _, prefab_dir, sectors = streams[mname]
+        stream_blks: list[str] = []
+        stream_blk_set: set[str] = set()
+        hashes: list[str] = []
+        non_hlod_total = 0
+        for sec in sectors:
+            if sec.endswith("_HLOD"):
+                continue
+            non_hlod_total += 1
+            path_lower = f"{prefab_dir}/{sec}.prefab".lower().encode("utf-8")
+            h = str(xxh64(path_lower, 0))
+            hit = ab_by_key.get(h)
+            if hit is not None:
+                hashes.append(h)
+                p_blk = hit[1]
+                if p_blk not in stream_blk_set:
+                    stream_blk_set.add(p_blk)
+                    stream_blks.append(p_blk)
+        entry: dict = {
+            "streaming": {
+                "manifest_blk": m_blk,
+                "manifest_cab": m_cab,
+                "blks": stream_blks,
+                "hashes": hashes,
+                "sector_count": non_hlod_total,
+                "resolved_count": len(hashes),
+            }
+        }
+        sc_key = mname if mname in scenes else scenes_ci.get(mname.lower())
+        if sc_key is not None:
+            _, s_blk, s_cab = scenes[sc_key]
+            entry["base_scene"] = {"blk": s_blk, "cab": s_cab}
+            paired_scenes.add(sc_key)
+        maps_dict[mname] = entry
+
+    maps_ci = {m.lower(): m for m in maps_dict}
+    for sname in sorted(scenes):
+        if sname in paired_scenes:
+            continue
+        _, s_blk, s_cab = scenes[sname]
+        mk = maps_ci.get(sname.lower())
+        if mk is not None and "base_scene" not in maps_dict[mk]:
+            maps_dict[mk]["base_scene"] = {"blk": s_blk, "cab": s_cab}
+        elif mk is None:
+            maps_dict[sname] = {"base_scene": {"blk": s_blk, "cab": s_cab}}
+
+    char_cands: dict[str, dict[str, tuple[tuple[int, float], str, str, str, str]]] = {}
+    for pname, pinfo in prefabs_by_name.items():
+        if pname.endswith("_Model"):
+            cname = pname[:-6]
+            char_cands.setdefault(cname, {})["model"] = (*pinfo, pname)
+        else:
+            cname = pname
+            char_cands.setdefault(cname, {})["base"] = (*pinfo, pname)
+
+    chars_dict: dict[str, dict] = {}
+    for cname in sorted(char_cands):
+        cands = char_cands[cname]
+        base = cands.get("base")
+        model = cands.get("model")
+        base_lods = lods_by_cab.get((base[1], base[2]), []) if base else []
+        model_lods = lods_by_cab.get((model[1], model[2]), []) if model else []
+
+        if base and (base_lods or not model):
+            chosen = base
+            chosen_lods = base_lods
+        else:
+            chosen = model
+            chosen_lods = model_lods
+        if not chosen:
+            continue
+
+        _, p_blk, p_cab, p_key, pname = chosen
+        extra_cabs: list[str] = []
+        extra_cab_set: set[str] = set()
+        mesh_blks: list[str] = []
+        mesh_blk_set: set[str] = set()
+
+        for go_name, mesh_path in chosen_lods:
+            gl = go_name.lower()
+            ml = mesh_path.lower()
+            if "hairshadow" in gl or "hairshadow" in ml or gl.endswith("_lod3") or "_lod3.mesh" in ml:
+                continue
+            mh = str(xxh64(ml.encode("utf-8"), 0))
+            hit = ab_by_key.get(mh)
+            if hit is None:
+                stem = Path(mesh_path).stem
+                hit_m = sep_mesh_by_name.get(stem)
+                if hit_m is not None:
+                    hit = (hit_m[0], hit_m[1], hit_m[2], "Mesh", stem)
+            if hit is not None:
+                _, m_blk, m_cab, _, _ = hit
+                if m_cab and m_cab not in extra_cab_set and m_cab != p_cab:
+                    extra_cab_set.add(m_cab)
+                    extra_cabs.append(m_cab)
+                if m_blk and m_blk not in mesh_blk_set:
+                    mesh_blk_set.add(m_blk)
+                    mesh_blks.append(m_blk)
+
+        if not extra_cabs:
+            # Fallback for *_Model prefabs without NapLodController rows
+            prefixes = (f"SeparateMesh_{cname}_Model_", f"SeparateMesh_{cname}_")
+            for mname, (_, m_blk, m_cab, _) in sorted(sep_mesh_by_name.items()):
+                if not any(mname.startswith(pf) for pf in prefixes):
+                    continue
+                low = mname.lower()
+                if low.endswith(("_lod1", "_lod2", "_lod3")) or "hairshadow" in low:
+                    continue
+                if m_cab and m_cab not in extra_cab_set and m_cab != p_cab:
+                    extra_cab_set.add(m_cab)
+                    extra_cabs.append(m_cab)
+                if m_blk and m_blk not in mesh_blk_set:
+                    mesh_blk_set.add(m_blk)
+                    mesh_blks.append(m_blk)
+
+        ani_map = char_anis.get(cname, {})
+        anim_blks: list[str] = []
+        anim_blk_set: set[str] = set()
+        anim_keys: list[str] = []
+        anim_key_set: set[str] = set()
+        for _, (_, a_blk, a_key) in sorted(ani_map.items()):
+            if a_blk and a_blk not in anim_blk_set:
+                anim_blk_set.add(a_blk)
+                anim_blks.append(a_blk)
+            if a_key and a_key not in anim_key_set:
+                anim_key_set.add(a_key)
+                anim_keys.append(a_key)
+
+        chars_dict[cname] = {
+            "prefab_blk": p_blk,
+            "prefab_cab": p_cab,
+            "prefab_key": p_key,
+            "prefab_name": pname,
+            "extra_cabs": extra_cabs,
+            "mesh_blks": mesh_blks,
+            "anim_blks": anim_blks,
+            "anim_keys": anim_keys,
+        }
+
+    (map_dir / "oz_maps_index.json").write_text(
+        json.dumps({"version": 2, "maps": maps_dict}, indent=2),
+        encoding="utf-8",
+    )
+    (map_dir / "oz_characters_index.json").write_text(
+        json.dumps({"version": 2, "characters": chars_dict}, indent=2),
+        encoding="utf-8",
+    )
+
+    compat_chars = {}
+    for cname, info in chars_dict.items():
+        blks: list[str] = []
+        for b in [info["prefab_blk"], *info["mesh_blks"], *info["anim_blks"]]:
+            if b and b not in blks:
+                blks.append(b)
+        compat_chars[cname] = {"blocks": blks}
+    (map_dir / "character_index_auto.json").write_text(
+        json.dumps({"characters": compat_chars}, indent=2),
+        encoding="utf-8",
+    )
+
+    compat_stages = {}
+    for mname, info in maps_dict.items():
+        blks = []
+        for b in (info.get("streaming") or {}).get("blks", ()):
+            if b and b not in blks:
+                blks.append(b)
+        bs_blk = (info.get("base_scene") or {}).get("blk")
+        if bs_blk and bs_blk not in blks:
+            blks.append(bs_blk)
+        compat_stages[mname] = {"blocks": blks}
+    (map_dir / "stage_index_auto.json").write_text(
+        json.dumps({"stages": compat_stages}, indent=2),
+        encoding="utf-8",
+    )
+
+    sorted_fonts = sorted(font_blks_set, key=lambda b: (_blk_prio(b), b))
+    (map_dir / "fonts_index_auto.json").write_text(
+        json.dumps({"blocks": sorted_fonts}, indent=2),
+        encoding="utf-8",
+    )
+
+    if write_cab_map and cab_entries and common_base is not None:
+        cab_bin = cfg.CLI_DIR / "Maps" / "ZZZ.bin"
+        cab_meta = cfg.CLI_DIR / "Maps" / "ZZZ.ozmeta.json"
+        base_win = ("Z:" + str(common_base.resolve())).replace("/", "\\")
+        _write_cab_map_bin(cab_entries, base_win, cab_bin)
+        try:
+            cab_meta.write_text(
+                json.dumps({
+                    "version": 2,
+                    "files_root": str(files_root),
+                    "blk_count": total_blk_count if total_blk_count is not None else len(prio_cache),
+                    "cab_count": len(cab_entries),
+                }),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        _emit(log_cb, f"Wrote CABMap {cab_bin.name} ({len(cab_entries)} CAB entries)")
+
+    _emit(
+        log_cb,
+        f"Built OZ v2 indexes: {len(chars_dict)} characters, "
+        f"{len(maps_dict)} maps ({sum(1 for v in maps_dict.values() if 'streaming' in v)} streaming), "
+        f"{len(sorted_fonts)} font blocks",
+    )
+    return len(chars_dict), len(maps_dict), len(sorted_fonts)
+
+
 def build_asset_map(
     game_root: Path,
     log_cb=None,
@@ -649,8 +1160,11 @@ def build_asset_map(
                 _emit(log_cb, line.rstrip("\n"))
             ran_scripts.append({"script": script_name, "rc": proc.wait()})
 
-    _prog(25, "Scanning .blk containers...")
-    blk_files = sorted(files_root.rglob("*.blk")) if files_root.exists() else []
+    _prog(25, "Scanning .blk containers (res_version_persist + APK priority)...")
+    common_base, blk_files = cfg.collect_ordered_blks(game_root)
+    if not blk_files and files_root.exists():
+        blk_files = sorted(files_root.rglob("*.blk"))
+        common_base = files_root
     blk_names = {p.name for p in blk_files}
     blk_stems = {p.stem for p in blk_files}
 
@@ -658,84 +1172,103 @@ def build_asset_map(
     pck_files = sorted(files_root.rglob("*.pck")) if files_root.exists() else []
 
     auto_chars = auto_stages = auto_fonts = 0
-    blocks_dir = files_root / "Blocks"
-    cli_map_file = map_dir / "zzz_assets_map.json"
+    oz_maps_file = map_dir / "oz_maps_index.json"
+    oz_chars_file = map_dir / "oz_characters_index.json"
+    cab_bin = cfg.CLI_DIR / "Maps" / "ZZZ.bin"
+    cab_meta = cfg.CLI_DIR / "Maps" / "ZZZ.ozmeta.json"
+    need_cab = not cab_bin.is_file()
+    if not need_cab:
+        try:
+            cm = json.loads(cab_meta.read_text()) if cab_meta.is_file() else {}
+            if cm.get("version", 0) < 2 or cm.get("files_root") != str(files_root) or cm.get("blk_count") != len(blk_files):
+                need_cab = True
+        except Exception:
+            need_cab = True
+
     if (
         use_cli_assetmap
-        and blocks_dir.is_dir()
         and blk_files
         and cfg.CLI_EXE.is_file()
         and shutil.which("wine") is not None
+        and (not oz_maps_file.is_file() or not oz_chars_file.is_file() or need_cab)
     ):
-        if not cli_map_file.is_file():
-            _prog(35, f"Building full AnimeStudio AssetMap across {len(blk_files)} .blk files...")
+        workers = min(6, max(1, (os.cpu_count() or 4) - 2), len(blk_files))
+        _prog(35, f"Indexing {len(blk_files)} .blk files across {workers} AnimeStudio worker(s)...")
+        shard_lists: list[Path] = []
+        shard_jsonls: list[Path] = []
+        for wi in range(workers):
+            sblks = blk_files[wi::workers]
+            sl = map_dir / f"_oz_shard_{wi}.blklist"
+            sj = map_dir / f"_oz_shard_{wi}.jsonl"
+            sl.write_text(
+                "\n".join(("Z:" + str(p.resolve())).replace("/", "\\") for p in sblks) + "\n",
+                encoding="utf-8",
+            )
+            shard_lists.append(sl)
+            shard_jsonls.append(sj)
+
+        done_counts = [0] * workers
+        done_lock = threading.Lock()
+        oz_re = re.compile(r"\[OzIndex\]\s+(\d+)/(\d+)")
+        procs: list[subprocess.Popen] = []
+
+        def _run_shard(wi: int):
             env = os.environ.copy()
             env["WINEDEBUG"] = "-all"
+            env["AS_DUMP_OZ_INDEX"] = ("Z:" + str(shard_jsonls[wi].resolve())).replace("/", "\\")
+            env["AS_OZ_INDEX_BASE_DIR"] = ("Z:" + str(common_base.resolve())).replace("/", "\\")
             cmd = [
                 "wine", str(cfg.CLI_EXE),
-                "Z:" + str(blocks_dir).replace("/", "\\"),
-                "Z:" + str(map_dir).replace("/", "\\"),
+                ("Z:" + str(shard_lists[wi].resolve())).replace("/", "\\"),
+                ("Z:" + str(map_dir.resolve())).replace("/", "\\"),
                 "--game", "ZZZ",
-                "--map_op", "AssetMap",
-                "--map_type", "JSON",
-                "--map_name", "zzz_assets_map",
             ]
             proc = subprocess.Popen(
                 cmd, cwd=str(cfg.CLI_DIR), env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
             )
+            with done_lock:
+                procs.append(proc)
             assert proc.stdout is not None
             for line in proc.stdout:
                 if cancel_event is not None and cancel_event.is_set():
-                    proc.terminate()
-                    _emit(log_cb, "Full AssetMap scan skipped by user; using quick index.")
+                    with done_lock:
+                        for p in procs:
+                            try:
+                                p.terminate()
+                            except Exception:
+                                pass
                     break
                 sline = line.rstrip("\n")
-                m = _PROG_RE.search(sline)
+                m = oz_re.search(sline)
                 if m:
-                    cur, tot = int(m.group(1)), max(1, int(m.group(2)))
-                    pct = 35 + int(50 * cur / tot)
-                    _prog(pct, f"AnimeStudio AssetMap [{cur}/{tot}]")
-                elif sline.strip():
+                    cur = int(m.group(1))
+                    with done_lock:
+                        done_counts[wi] = cur
+                        tot_done = sum(done_counts)
+                    pct = 35 + int(50 * tot_done / max(1, len(blk_files)))
+                    _prog(pct, f"AnimeStudio Index [{tot_done}/{len(blk_files)}]")
+                elif "[Error]" in sline or "[Warning]" in sline:
                     _emit(log_cb, sline)
             proc.wait()
-        if cli_map_file.is_file():
-            _prog(85, "Parsing AnimeStudio AssetMap JSON...")
-            auto_chars, auto_stages, auto_fonts = _parse_cli_asset_map(
-                cli_map_file, map_dir, log_cb=log_cb, progress_cb=progress_cb
-            )
-        cab_bin = cfg.CLI_DIR / "Maps" / "ZZZ.bin"
-        if not cab_bin.is_file() and (cancel_event is None or not cancel_event.is_set()):
-            _prog(87, f"Building AnimeStudio CABMap dependency index (ZZZ.bin) across {len(blk_files)} .blk files...")
-            env = os.environ.copy()
-            env["WINEDEBUG"] = "-all"
-            cab_cmd = [
-                "wine", str(cfg.CLI_EXE),
-                "Z:" + str(blocks_dir).replace("/", "\\"),
-                "Z:" + str(map_dir).replace("/", "\\"),
-                "--game", "ZZZ",
-                "--map_op", "CABMap,Load",
-                "--map_name", "ZZZ",
-            ]
-            cab_proc = subprocess.Popen(
-                cab_cmd, cwd=str(cfg.CLI_DIR), env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
-            )
-            assert cab_proc.stdout is not None
-            for line in cab_proc.stdout:
-                if cancel_event is not None and cancel_event.is_set():
-                    cab_proc.terminate()
-                    _emit(log_cb, "CABMap build skipped by user.")
-                    break
-                sline = line.rstrip("\n")
-                m = _PROG_RE.search(sline)
-                if m:
-                    cur, tot = int(m.group(1)), max(1, int(m.group(2)))
-                    pct = 87 + int(5 * cur / tot)
-                    _prog(pct, f"AnimeStudio CABMap [{cur}/{tot}]")
-                elif sline.strip():
-                    _emit(log_cb, sline)
-            cab_proc.wait()
+
+        threads = [threading.Thread(target=_run_shard, args=(wi,), daemon=True) for wi in range(workers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        try:
+            if cancel_event is None or not cancel_event.is_set():
+                _prog(86, "Building oz_maps_index, oz_characters_index & Maps/ZZZ.bin...")
+                auto_chars, auto_stages, auto_fonts = _build_oz_indexes_from_jsonl(
+                    shard_jsonls, map_dir, game_root, common_base=common_base, write_cab_map=True, total_blk_count=len(blk_files), log_cb=log_cb
+                )
+        finally:
+            for sl in shard_lists:
+                sl.unlink(missing_ok=True)
+            for sj in shard_jsonls:
+                sj.unlink(missing_ok=True)
 
     _prog(92, "Indexing sections & cross-referencing containers...")
     sections = load_texture_sections()
@@ -789,6 +1322,7 @@ def build_asset_map(
 
     manifest = {
         "files_root": str(files_root),
+        "oz_index_version": 2,
         "blk_count": len(blk_files),
         "pck_count": len(pck_files),
         "auto_characters": auto_chars,

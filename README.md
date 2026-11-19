@@ -66,13 +66,28 @@ flowchart LR
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Launch the desktop GUI
+# Launch the desktop GUI (starts with Initial Setup on first run)
 ./run.sh
 
 # Or run CLI commands directly
 ./run.sh version
+./run.sh pull-phone --dest ~/OpenZenless_ZZZ_Android
 ./run.sh export full --dry-run
 ```
+
+### Initial Setup (First Launch or `Open Root...`)
+When you launch OpenZenless for the first time (or click **Open Root...** in the header), you have three ways to point OpenZenless at your Zenless Zone Zero build:
+
+1. **Load from Android Phone (ADB)** *(recommended if ZZZ is installed on Android)*
+   - Connect your Android phone with **USB Debugging** enabled and click **Load from Phone (ADB)...** in the setup dialog (or run `./run.sh pull-phone --dest ~/OpenZenless_ZZZ_Android` from CLI).
+   - OpenZenless automatically detects `com.HoYoverse.Nap` / `com.miHoYo.Nap`, pulls the asset folder (`Blocks/`, `Audio/`, `il2cpp/`, revisions), pulls the split APKs, and extracts base `.blk` packs from `split_UnityDataAssetPack.apk`.
+   - *(On Android 13–15, if Scoped Storage blocks direct USB ADB access to `/sdcard/Android/data/`, stage `files/` with Shizuku into `/sdcard/Download/com.HoYoverse.Nap/files/` first — see the [Mobile Extraction Guide](docs/MOBILE_EXTRACTION.md).)*
+2. **Existing Android Build Folder**
+   - Click **Browse...** and select a pre-copied Android dump folder (containing `com.HoYoverse.Nap/files/` or directly `files/`).
+3. **PC (Windows) Installation**
+   - Click **Browse...** and select your `ZenlessZoneZero Game` directory — see the [PC Copy Guide](docs/PC_GUIDE.md).
+
+> Next, OpenZenless builds its local Asset Map (`AnimeStudio.CLI` via Wine on Linux — click **Setup / Build Tools** in Batch Export if you haven't built `AnimeStudio.CLI` yet).
 
 ### Environment Variables (Optional)
 | Variable | Default | Description |
@@ -87,6 +102,6 @@ pip install -r requirements.txt
 
 - **[GUI Guide](docs/GUI.md)** — Walkthrough of Basic Mode, Advanced Mode, 3D Viewer, Batch Export, and shortcuts.
 - **[CLI Reference](docs/CLI.md)** — Full command reference for `version`, `inspect`, `unpack-pck`, `scan-blk`, and `export`.
-- **[Mobile (Android) Extraction Guide](docs/MOBILE_EXTRACTION.md)** — How to copy your mobile ZZZ build (`com.HoYoverse.Nap`) to PC via ADB or Shizuku.
+- **[Mobile (Android) Extraction Guide](docs/MOBILE_EXTRACTION.md)** — How to copy your mobile ZZZ build (`com.HoYoverse.Nap`) via **Load from Phone (ADB)**, manual ADB, or Shizuku.
 - **[PC Copy Guide](docs/PC_GUIDE.md)** — How to browse and export directly from a PC (Windows) installation of ZZZ.
 - **[Assets](assets/README.md)** — Brand logo variants.

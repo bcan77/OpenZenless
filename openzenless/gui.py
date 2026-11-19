@@ -10,6 +10,13 @@ import threading
 from pathlib import Path
 
 from . import config as cfg
+from .adb_import import (
+    detect_remote_files_dir,
+    detect_zzz_package,
+    find_adb,
+    list_adb_devices,
+    pull_from_phone,
+)
 from .containers import detect_magic, format_hex_dump, human_size, parse_akpk, scan_blk_json
 from .exporters import (
     export_audio_pck,
@@ -687,11 +694,270 @@ def launch_gui(root_path: Path):
                 return
             super().closeEvent(event)
 
+    class PhoneImportWorker(QThread):
+        log_line = Signal(str)
+        finished_ok = Signal(str)
+        failed = Signal(str)
+
+        def __init__(
+            self,
+            dest_root: Path,
+            serial: str,
+            pkg: str,
+            remote_files_dir: str,
+            pull_files: bool,
+            pull_apks: bool,
+        ):
+            super().__init__()
+            self.dest_root = dest_root
+            self.serial = serial
+            self.pkg = pkg
+            self.remote_files_dir = remote_files_dir
+            self.pull_files = pull_files
+            self.pull_apks = pull_apks
+            self._cancel_event = threading.Event()
+
+        def cancel(self):
+            self._cancel_event.set()
+
+        def run(self):
+            try:
+                out = pull_from_phone(
+                    dest_root=self.dest_root,
+                    serial=self.serial,
+                    pkg=self.pkg,
+                    remote_files_dir=self.remote_files_dir,
+                    pull_files=self.pull_files,
+                    pull_apks=self.pull_apks,
+                    extract_apk_blocks=self.pull_apks,
+                    log_cb=self.log_line.emit,
+                    cancel_event=self._cancel_event,
+                )
+                self.finished_ok.emit(str(out))
+            except Exception as ex:
+                self.failed.emit(str(ex))
+
+    class PhoneImportDialog(QDialog):
+        def __init__(self, parent=None, default_dest: Path | None = None):
+            super().__init__(parent)
+            self.setWindowTitle("Load Zenless Zone Zero from Phone (ADB)")
+            self.resize(680, 470)
+            self.dest_root: Path = default_dest or (Path.home() / "OpenZenless_ZZZ_Android")
+            self._worker: PhoneImportWorker | None = None
+            self._detected_pkg: str = "com.HoYoverse.Nap"
+            self._devices: list[dict] = []
+
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(18, 16, 18, 16)
+            lay.setSpacing(10)
+
+            title = QLabel("Import ZZZ From Connected Android Phone (ADB)")
+            title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f59e0b;")
+            lay.addWidget(title)
+
+            dev_row = QHBoxLayout()
+            dev_row.addWidget(QLabel("ADB Device:"))
+            self.dev_combo = QComboBox()
+            self.dev_combo.currentIndexChanged.connect(self._on_device_changed)
+            dev_row.addWidget(self.dev_combo, 1)
+            self.btn_refresh = QPushButton("Refresh Devices")
+            self.btn_refresh.clicked.connect(self._refresh_devices)
+            dev_row.addWidget(self.btn_refresh)
+            lay.addLayout(dev_row)
+
+            self.dev_status = QLabel("")
+            self.dev_status.setWordWrap(True)
+            lay.addWidget(self.dev_status)
+
+            form = QFormLayout()
+            form.setSpacing(8)
+            self.remote_edit = QLineEdit()
+            self.remote_edit.setPlaceholderText("/sdcard/Android/data/com.HoYoverse.Nap/files")
+            form.addRow("Phone files/ Path:", self.remote_edit)
+
+            dest_row = QHBoxLayout()
+            self.dest_edit = QLineEdit(str(self.dest_root))
+            btn_dest_browse = QPushButton("Browse...")
+            btn_dest_browse.clicked.connect(self._browse_dest)
+            dest_row.addWidget(self.dest_edit, 1)
+            dest_row.addWidget(btn_dest_browse)
+            form.addRow("Save To Folder:", dest_row)
+            lay.addLayout(form)
+
+            self.chk_files = QCheckBox("Pull game assets (Blocks/, Audio/, il2cpp/, revisions)")
+            self.chk_files.setChecked(True)
+            self.chk_apks = QCheckBox("Pull split APKs & extract base .blk packs (split_UnityDataAssetPack.apk)")
+            self.chk_apks.setChecked(True)
+            lay.addWidget(self.chk_files)
+            lay.addWidget(self.chk_apks)
+
+            self.progress = QProgressBar()
+            self.progress.setVisible(False)
+            lay.addWidget(self.progress)
+
+            self.log_box = QPlainTextEdit()
+            self.log_box.setReadOnly(True)
+            self.log_box.setPlaceholderText("ADB transfer progress will appear here...")
+            lay.addWidget(self.log_box, 1)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            self.btn_cancel = QPushButton("Cancel")
+            self.btn_cancel.setEnabled(False)
+            self.btn_cancel.clicked.connect(self._cancel_pull)
+            self.btn_close = QPushButton("Close")
+            self.btn_close.clicked.connect(self.reject)
+            self.btn_start = QPushButton("Start Pull")
+            self.btn_start.setObjectName("primaryBtn")
+            self.btn_start.clicked.connect(self._start_pull)
+            btn_row.addWidget(self.btn_cancel)
+            btn_row.addWidget(self.btn_close)
+            btn_row.addWidget(self.btn_start)
+            lay.addLayout(btn_row)
+
+            self._refresh_devices()
+
+        def _browse_dest(self):
+            start = self.dest_edit.text().strip() or str(Path.home())
+            d = QFileDialog.getExistingDirectory(self, "Select Destination Folder", start)
+            if d:
+                self.dest_edit.setText(d)
+
+        def _refresh_devices(self):
+            self.dev_combo.blockSignals(True)
+            self.dev_combo.clear()
+            self._devices = []
+            if not find_adb():
+                self.dev_status.setText(
+                    "ADB (`adb`) was not found on PATH. Install Android Platform Tools (e.g. `sudo apt install adb`) and click Refresh Devices."
+                )
+                self.dev_status.setStyleSheet("color: #f87171;")
+                self.btn_start.setEnabled(False)
+                self.dev_combo.blockSignals(False)
+                return
+            try:
+                self._devices = list_adb_devices()
+            except Exception as ex:
+                self.dev_status.setText(f"Failed to query ADB: {ex}")
+                self.dev_status.setStyleSheet("color: #f87171;")
+                self.btn_start.setEnabled(False)
+                self.dev_combo.blockSignals(False)
+                return
+
+            for dev in self._devices:
+                self.dev_combo.addItem(dev["label"], dev)
+            self.dev_combo.blockSignals(False)
+
+            if not self._devices:
+                self.dev_status.setText(
+                    "No ADB devices detected. Enable Developer Options & USB Debugging on your phone, connect via USB, and click Refresh Devices."
+                )
+                self.dev_status.setStyleSheet("color: #fbbf24;")
+                self.btn_start.setEnabled(False)
+                return
+            self._on_device_changed(0)
+
+        def _on_device_changed(self, idx: int):
+            if idx < 0 or idx >= len(self._devices):
+                self.btn_start.setEnabled(False)
+                return
+            dev = self._devices[idx]
+            serial = dev["serial"]
+            state = dev["state"]
+            if state == "unauthorized":
+                self.dev_status.setText(
+                    f"Device {serial} is unauthorized. Unlock your phone and accept the 'Allow USB debugging?' prompt, then click Refresh Devices."
+                )
+                self.dev_status.setStyleSheet("color: #fbbf24;")
+                self.btn_start.setEnabled(False)
+                return
+            if state != "device":
+                self.dev_status.setText(f"Device {serial} is `{state}` and not ready for ADB transfer.")
+                self.dev_status.setStyleSheet("color: #fbbf24;")
+                self.btn_start.setEnabled(False)
+                return
+
+            pkg, apk_paths = detect_zzz_package(serial)
+            if not pkg:
+                self.dev_status.setText(
+                    f"Connected to {serial}, but Zenless Zone Zero (`com.HoYoverse.Nap` / `com.miHoYo.Nap`) was not found on this device."
+                )
+                self.dev_status.setStyleSheet("color: #fbbf24;")
+                self.btn_start.setEnabled(False)
+                return
+
+            self._detected_pkg = pkg
+            remote_dir, msg = detect_remote_files_dir(serial, pkg)
+            if remote_dir:
+                self.remote_edit.setText(remote_dir)
+                self.dev_status.setText(f"{pkg} ({len(apk_paths)} APKs). {msg}")
+                self.dev_status.setStyleSheet("color: #4ade80;")
+            else:
+                if not self.remote_edit.text().strip():
+                    self.remote_edit.setText(f"/sdcard/Download/{pkg}/files")
+                self.dev_status.setText(f"Detected {pkg} ({len(apk_paths)} APKs). {msg}")
+                self.dev_status.setStyleSheet("color: #fbbf24;")
+            self.btn_start.setEnabled(True)
+
+        def _start_pull(self):
+            idx = self.dev_combo.currentIndex()
+            if idx < 0 or idx >= len(self._devices):
+                return
+            if not self.chk_files.isChecked() and not self.chk_apks.isChecked():
+                QMessageBox.information(self, "Nothing Selected", "Select at least one option to pull.")
+                return
+            dest = Path(self.dest_edit.text().strip() or str(Path.home() / "OpenZenless_ZZZ_Android")).expanduser()
+            serial = self._devices[idx]["serial"]
+            remote_dir = self.remote_edit.text().strip()
+
+            self.log_box.clear()
+            self.progress.setRange(0, 0)
+            self.progress.setVisible(True)
+            self.btn_start.setEnabled(False)
+            self.btn_refresh.setEnabled(False)
+            self.btn_close.setEnabled(False)
+            self.btn_cancel.setEnabled(True)
+
+            self._worker = PhoneImportWorker(
+                dest_root=dest,
+                serial=serial,
+                pkg=self._detected_pkg,
+                remote_files_dir=remote_dir,
+                pull_files=self.chk_files.isChecked(),
+                pull_apks=self.chk_apks.isChecked(),
+            )
+            self._worker.log_line.connect(self.log_box.appendPlainText)
+            self._worker.finished_ok.connect(self._on_pull_ok)
+            self._worker.failed.connect(self._on_pull_fail)
+            self._worker.start()
+
+        def _cancel_pull(self):
+            if self._worker:
+                self._worker.cancel()
+                self.btn_cancel.setEnabled(False)
+
+        def _reset_controls(self):
+            self.progress.setVisible(False)
+            self.btn_start.setEnabled(True)
+            self.btn_refresh.setEnabled(True)
+            self.btn_close.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+
+        def _on_pull_ok(self, out_path: str):
+            self._reset_controls()
+            self.dest_root = Path(out_path)
+            self.accept()
+
+        def _on_pull_fail(self, msg: str):
+            self._reset_controls()
+            self.log_box.appendPlainText(f"ERROR: {msg}")
+            QMessageBox.warning(self, "ADB Import Failed", msg)
+
     class GameRootDialog(QDialog):
         def __init__(self, initial_root: Path, parent=None):
             super().__init__(parent)
             self.setWindowTitle("OpenZenless — Select ZZZ Game Installation")
-            self.resize(640, 230)
+            self.resize(680, 260)
             self.selected_root = initial_root
 
             lay = QVBoxLayout(self)
@@ -703,8 +969,8 @@ def launch_gui(root_path: Path):
             lay.addWidget(title)
 
             desc = QLabel(
-                "Choose your ZZZ game folder (for example: ZenlessZoneZero Game, "
-                "com.HoYoverse.Nap, or its files/ folder) before indexing assets."
+                "Choose your ZZZ PC install folder (ZenlessZoneZero Game), an existing Android dump folder "
+                "(com.HoYoverse.Nap or its files/ folder), or pull directly from a connected Android phone via ADB."
             )
             desc.setWordWrap(True)
             desc.setStyleSheet("color: #94a3b8;")
@@ -716,8 +982,11 @@ def launch_gui(root_path: Path):
             self.path_edit.textChanged.connect(self._validate_path)
             btn_browse = QPushButton("Browse...")
             btn_browse.clicked.connect(self._browse)
+            btn_phone = QPushButton("Load from Phone (ADB)...")
+            btn_phone.clicked.connect(self._load_from_phone)
             row.addWidget(self.path_edit, 1)
             row.addWidget(btn_browse)
+            row.addWidget(btn_phone)
             lay.addLayout(row)
 
             self.status_lbl = QLabel("")
@@ -742,6 +1011,14 @@ def launch_gui(root_path: Path):
             d = QFileDialog.getExistingDirectory(self, "Select ZZZ Game Installation", start)
             if d:
                 self.path_edit.setText(d)
+
+        def _load_from_phone(self):
+            cur = self.path_edit.text().strip()
+            default_dest = Path(cur) if cur else (Path.home() / "OpenZenless_ZZZ_Android")
+            dlg = PhoneImportDialog(self, default_dest=default_dest)
+            if dlg.exec() == QDialog.Accepted:
+                self.path_edit.setText(str(dlg.dest_root))
+                self._validate_path(str(dlg.dest_root))
 
         def _validate_path(self, text: str):
             p = Path(text.strip()) if text.strip() else None
@@ -1462,15 +1739,15 @@ def launch_gui(root_path: Path):
             self._reload_indexes()
 
         def choose_root_folder(self):
-            d = QFileDialog.getExistingDirectory(self, "Select ZZZ Game Root", str(self.game_root))
-            if d:
-                self.game_root = Path(d)
-                cfg.save_user_config({"game_root": str(self.game_root)})
+            dlg = GameRootDialog(self.game_root, self)
+            if dlg.exec() == QDialog.Accepted:
+                self.game_root = dlg.selected_root
                 self.files_root = cfg.resolve_files_root(self.game_root)
                 if not has_asset_map(self.game_root) and self.files_root.exists():
                     AssetMapDialog(self.game_root, self).exec()
                 self._reload_indexes()
-                self.open_directory(self.files_root)
+                if self.files_root.exists():
+                    self.open_directory(self.files_root)
 
         def go_up(self):
             if self.current_mode in ("blk", "akpk") and self.current_container:

@@ -7,6 +7,13 @@ import sys
 from pathlib import Path
 
 from . import config as cfg
+from .adb_import import (
+    detect_remote_files_dir,
+    detect_zzz_package,
+    find_adb,
+    list_adb_devices,
+    pull_from_phone,
+)
 from .containers import detect_magic, format_hex_dump, human_size, parse_akpk, scan_blk_json
 from .exporters import (
     export_audio_pck,
@@ -46,6 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_blk.add_argument("blk", type=Path, help="Path to .blk file")
     p_blk.add_argument("--out-dir", type=Path, default=None, help="Output directory (defaults to cache)")
     p_blk.add_argument("--types", nargs="+", default=None, help="Unity asset types to dump")
+
+    p_phone = sub.add_parser("pull-phone", help="Pull ZZZ game files & split APKs from an ADB-connected Android phone")
+    p_phone.add_argument("--dest", type=Path, default=Path.home() / "OpenZenless_ZZZ_Android", help="Destination folder")
+    p_phone.add_argument("--serial", default="", help="ADB device serial (optional if one device connected)")
+    p_phone.add_argument("--pkg", default="", help="Android package name (default: auto-detect com.HoYoverse.Nap / com.miHoYo.Nap)")
+    p_phone.add_argument("--remote-dir", default="", help="On-device files/ directory (e.g. /sdcard/Download/com.HoYoverse.Nap/files)")
+    p_phone.add_argument("--no-files", action="store_true", help="Skip pulling files/ game assets")
+    p_phone.add_argument("--no-apks", action="store_true", help="Skip pulling split APKs")
+    p_phone.add_argument("--no-extract-apk-blocks", action="store_true", help="Skip extracting base .blk files from split_UnityDataAssetPack.apk")
 
     p_exp = sub.add_parser(
         "export",
@@ -134,6 +150,51 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {r['type']:16s} {r['name']}")
         return 0
 
+    if cmd == "pull-phone":
+        if not find_adb():
+            print("Error: `adb` executable not found in PATH. Install Android Platform Tools first.", file=sys.stderr)
+            return 1
+        devices = [d for d in list_adb_devices() if d["state"] == "device"]
+        serial = args.serial.strip()
+        if not serial:
+            if not devices:
+                print("Error: No authorized ADB device found. Check USB Debugging and `adb devices`.", file=sys.stderr)
+                return 1
+            if len(devices) > 1:
+                print("Multiple ADB devices connected; pass --serial:", file=sys.stderr)
+                for d in devices:
+                    print(f"  {d['serial']} ({d['model']})", file=sys.stderr)
+                return 2
+            serial = devices[0]["serial"]
+        pkg = args.pkg.strip()
+        if not pkg:
+            pkg, _apks = detect_zzz_package(serial)
+        if not pkg:
+            print(f"Error: ZZZ package (com.HoYoverse.Nap / com.miHoYo.Nap) not found on {serial}.", file=sys.stderr)
+            return 1
+        remote_dir = args.remote_dir.strip()
+        if not args.no_files and not remote_dir:
+            remote_dir, msg = detect_remote_files_dir(serial, pkg)
+            if not remote_dir:
+                print(f"Error: {msg}", file=sys.stderr)
+                return 1
+        try:
+            out = pull_from_phone(
+                dest_root=args.dest,
+                serial=serial,
+                pkg=pkg,
+                remote_files_dir=remote_dir or None,
+                pull_files=not args.no_files,
+                pull_apks=not args.no_apks,
+                extract_apk_blocks=not args.no_extract_apk_blocks,
+                log_cb=print,
+            )
+            print(f"Saved ZZZ files to: {out}")
+            return 0
+        except Exception as ex:
+            print(f"Error: {ex}", file=sys.stderr)
+            return 1
+
     if cmd == "export":
         files_root = cfg.resolve_files_root(args.root)
         scope = args.scope
@@ -153,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
                 resume=not args.no_resume,
                 workers=args.workers,
                 out_dir=args.out_dir,
+                game_root=args.root,
             )
         if scope == "fonts":
             src = args.source or (files_root / "Blocks")

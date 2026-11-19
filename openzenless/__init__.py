@@ -1,6 +1,8 @@
 """OpenZenless — OpenIV-style ZZZ proprietary file viewer & batch exporter."""
 from __future__ import annotations
 
+__version__ = "0.2.0"
+
 from . import config
 from .cli import build_parser, main
 from .containers import detect_magic, format_hex_dump, human_size, parse_akpk, scan_blk_json
@@ -25,6 +27,7 @@ from .indexer import (
 )
 
 __all__ = [
+    "__version__",
     "config",
     "build_parser",
     "main",
