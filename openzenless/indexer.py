@@ -130,9 +130,14 @@ def load_stage_index() -> dict[str, list[str]]:
                         filtered.append(b)
                     blks[:] = filtered
                 add_list = rich_mm if len(rich_mm) >= 5 else mm_cand
+                max_add = 12 if nap_set else 14
+                added = 0
                 for b in add_list:
                     if b not in blks:
                         blks.append(b)
+                        added += 1
+                        if added >= max_add:
+                            break
         except Exception:
             pass
     return stages

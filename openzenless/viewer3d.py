@@ -1,10 +1,12 @@
 """Native embedded OpenGL 3D Viewer for OpenZenless (.glb / .obj) without HTML/WebEngine."""
 from __future__ import annotations
 
+import ctypes
 import io
 import json
 import math
 import re
+import struct
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +71,7 @@ class GLSubMesh:
     is_sky: bool = False
     is_weapon: bool = False
     center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    bound_radius: float = 0.0
     toon_smoothness: float = 0.08
     toon_specular: float = 0.15
     rim_glow: float = 0.35
@@ -259,15 +262,55 @@ def _trs_to_mat4(t: np.ndarray, q: np.ndarray, s: np.ndarray) -> np.ndarray:
     return m
 
 
-def _read_accessor(gltf: GLTF2, blob: bytes, acc_idx: int) -> np.ndarray:
-    acc = gltf.accessors[acc_idx]
-    bv = gltf.bufferViews[acc.bufferView]
-    dtype = _COMP_DTYPES[acc.componentType]
-    ncomp = _TYPE_COUNTS[acc.type]
+def _read_glb_fast(path: Path) -> tuple[dict, bytes]:
+    with open(path, "rb") as f:
+        header = f.read(12)
+        if len(header) < 12:
+            raise ValueError(f"Truncated GLB: {path}")
+        magic, _ver, total_len = struct.unpack("<III", header)
+        if magic != 0x46546C67:
+            raise ValueError(f"Not a GLB file: {path}")
+        jdata: dict = {}
+        bdata = b""
+        pos = 12
+        while pos + 8 <= total_len:
+            ch = f.read(8)
+            if len(ch) < 8:
+                break
+            clen, ctype = struct.unpack("<II", ch)
+            payload = f.read(clen)
+            pos += 8 + clen
+            if ctype == 0x4E4F534A:
+                jdata = json.loads(payload.decode("utf-8"))
+            elif ctype == 0x004E4942:
+                bdata = payload
+    return jdata, bdata
+
+
+def _read_accessor(gltf, blob: bytes, acc_idx: int) -> np.ndarray:
+    acc = gltf["accessors"][acc_idx] if isinstance(gltf, dict) else gltf.accessors[acc_idx]
+    bvs = gltf["bufferViews"] if isinstance(gltf, dict) else gltf.bufferViews
+    if isinstance(acc, dict):
+        bv = bvs[acc["bufferView"]]
+        comp_type = acc["componentType"]
+        acc_type = acc["type"]
+        stride_raw = bv.get("byteStride")
+        offset = (bv.get("byteOffset") or 0) + (acc.get("byteOffset") or 0)
+        count = acc["count"]
+        normalized = bool(acc.get("normalized"))
+    else:
+        bv = bvs[acc.bufferView]
+        comp_type = acc.componentType
+        acc_type = acc.type
+        stride_raw = bv.byteStride
+        offset = (bv.byteOffset or 0) + (acc.byteOffset or 0)
+        count = acc.count
+        normalized = bool(acc.normalized)
+
+    dtype = _COMP_DTYPES[comp_type]
+    ncomp = _TYPE_COUNTS[acc_type]
     item_size = np.dtype(dtype).itemsize * ncomp
-    stride = bv.byteStride or item_size
-    offset = (bv.byteOffset or 0) + (acc.byteOffset or 0)
-    count = acc.count
+    stride = stride_raw or item_size
 
     if stride == item_size:
         arr = np.frombuffer(blob, dtype=dtype, count=count * ncomp, offset=offset)
@@ -278,28 +321,32 @@ def _read_accessor(gltf: GLTF2, blob: bytes, acc_idx: int) -> np.ndarray:
         arr = raw.view(dtype=dtype)
         arr = arr.reshape((count, ncomp)) if ncomp > 1 else arr.reshape((count,))
 
-    if acc.normalized and acc.componentType != 5126:
+    if normalized and comp_type != 5126:
         info = np.iinfo(dtype)
         arr = arr.astype(np.float32) / float(info.max)
     return arr
 
 
 def _node_local_matrix(node) -> np.ndarray:
-    if node.matrix:
-        return np.array(node.matrix, dtype=np.float32).reshape((4, 4)).T
+    matrix = node.get("matrix") if isinstance(node, dict) else node.matrix
+    if matrix:
+        return np.array(matrix, dtype=np.float32).reshape((4, 4)).T
     mat = np.eye(4, dtype=np.float32)
-    if node.translation:
-        mat[0:3, 3] = node.translation
-    if node.rotation:
-        x, y, z, w = node.rotation
+    trans = node.get("translation") if isinstance(node, dict) else node.translation
+    if trans:
+        mat[0:3, 3] = trans
+    rot_q = node.get("rotation") if isinstance(node, dict) else node.rotation
+    if rot_q:
+        x, y, z, w = rot_q
         rot = np.array([
             [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
             [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
             [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
         ], dtype=np.float32)
         mat[0:3, 0:3] = rot
-    if node.scale:
-        sx, sy, sz = node.scale
+    scl = node.get("scale") if isinstance(node, dict) else node.scale
+    if scl:
+        sx, sy, sz = scl
         mat[0:3, 0] *= sx
         mat[0:3, 1] *= sy
         mat[0:3, 2] *= sz
@@ -307,36 +354,49 @@ def _node_local_matrix(node) -> np.ndarray:
 
 
 def _decode_gltf_texture(
-    gltf: GLTF2,
+    gltf,
     blob: bytes,
     tex_idx: int,
     base_dir: Path,
-    cache: dict[int, tuple[bytes, int, int] | None],
-) -> tuple[bytes, int, int] | None:
+    cache: dict[int, tuple[bytes, int, int, int, float] | None],
+    max_dim: int = 1024,
+) -> tuple[bytes, int, int, int, float] | None:
     if tex_idx in cache:
         return cache[tex_idx]
     try:
-        tex = gltf.textures[tex_idx]
-        if tex.source is None:
+        texs = gltf["textures"] if isinstance(gltf, dict) else gltf.textures
+        imgs = gltf["images"] if isinstance(gltf, dict) else gltf.images
+        bvs = gltf["bufferViews"] if isinstance(gltf, dict) else gltf.bufferViews
+        tex = texs[tex_idx]
+        src = tex.get("source") if isinstance(tex, dict) else tex.source
+        if src is None:
             cache[tex_idx] = None
             return None
-        img_obj = gltf.images[tex.source]
+        img_obj = imgs[src]
+        bv_idx = img_obj.get("bufferView") if isinstance(img_obj, dict) else img_obj.bufferView
+        uri = img_obj.get("uri") if isinstance(img_obj, dict) else img_obj.uri
         raw_bytes = None
-        if img_obj.bufferView is not None:
-            bv = gltf.bufferViews[img_obj.bufferView]
-            off = bv.byteOffset or 0
-            raw_bytes = blob[off : off + bv.byteLength]
-        elif img_obj.uri and not img_obj.uri.startswith("data:"):
-            p = base_dir / img_obj.uri
+        if bv_idx is not None:
+            bv = bvs[bv_idx]
+            off = (bv.get("byteOffset") if isinstance(bv, dict) else bv.byteOffset) or 0
+            blen = bv["byteLength"] if isinstance(bv, dict) else bv.byteLength
+            raw_bytes = blob[off : off + blen]
+        elif uri and not uri.startswith("data:"):
+            p = base_dir / uri
             if p.is_file():
                 raw_bytes = p.read_bytes()
         if not raw_bytes:
             cache[tex_idx] = None
             return None
         im = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
-        if max(im.size) > 1024:
-            im.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-        res = (im.tobytes(), im.width, im.height)
+        if max(im.size) > max_dim:
+            resample = Image.Resampling.BILINEAR if max_dim <= 512 else Image.Resampling.LANCZOS
+            im.thumbnail((max_dim, max_dim), resample)
+        rgba = im.tobytes()
+        a_ch = np.frombuffer(rgba, dtype=np.uint8)[3::4]
+        a_min = int(a_ch.min()) if len(a_ch) else 255
+        a_mean = float(a_ch.mean()) if len(a_ch) else 255.0
+        res = (rgba, im.width, im.height, a_min, a_mean)
         cache[tex_idx] = res
         return res
     except Exception:
@@ -399,14 +459,35 @@ def _match_game_material(mat_map: dict[str, dict], *names: str) -> dict | None:
 
 
 def load_glb_scene(path: Path) -> GLScene:
-    gltf = GLTF2().load(str(path))
-    blob = gltf.binary_blob() or b""
-    if not blob and gltf.buffers and gltf.buffers[0].uri:
-        buf_path = path.parent / gltf.buffers[0].uri
-        if buf_path.is_file():
-            blob = buf_path.read_bytes()
+    path = Path(path)
+    is_fast_glb = path.suffix.lower() == ".glb"
+    if is_fast_glb:
+        gltf, blob = _read_glb_fast(path)
+        nodes = gltf.get("nodes") or []
+        meshes = gltf.get("meshes") or []
+        materials = gltf.get("materials") or []
+        images = gltf.get("images") or []
+        scenes = gltf.get("scenes") or []
+        scene_idx = gltf.get("scene") or 0
+    else:
+        gltf = GLTF2().load(str(path))
+        blob = gltf.binary_blob() or b""
+        if not blob and gltf.buffers and gltf.buffers[0].uri:
+            buf_path = path.parent / gltf.buffers[0].uri
+            if buf_path.is_file():
+                blob = buf_path.read_bytes()
+        nodes = gltf.nodes or []
+        meshes = gltf.meshes or []
+        materials = gltf.materials or []
+        images = gltf.images or []
+        scenes = gltf.scenes or []
+        scene_idx = gltf.scene or 0
 
-    tex_cache: dict[int, tuple[bytes, int, int] | None] = {}
+    def _g(obj, key, default=None):
+        return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+
+    max_tex_dim = 512 if len(images) > 120 else 1024
+    tex_cache: dict[int, tuple[bytes, int, int, int, float] | None] = {}
     game_mats = _load_game_materials(path.parent)
     submeshes: list[GLSubMesh] = []
     bmin = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
@@ -416,22 +497,28 @@ def load_glb_scene(path: Path) -> GLScene:
 
     def _visit(node_idx: int, parent_mat: np.ndarray):
         nonlocal bmin, bmax, total_verts, total_tris
-        node = gltf.nodes[node_idx]
+        node = nodes[node_idx]
         world = parent_mat @ _node_local_matrix(node)
-        if node.mesh is not None:
-            mesh = gltf.meshes[node.mesh]
+        n_mesh = _g(node, "mesh")
+        n_name = _g(node, "name") or ""
+        if n_mesh is not None:
+            mesh = meshes[n_mesh]
+            m_name = _g(mesh, "name") or ""
             rot3 = world[:3, :3]
             try:
                 norm_mat = np.linalg.inv(rot3).T.astype(np.float32)
             except np.linalg.LinAlgError:
                 norm_mat = rot3
-            for prim in mesh.primitives:
-                if prim.attributes.POSITION is None:
+            for prim in (_g(mesh, "primitives") or ()):
+                attrs = _g(prim, "attributes")
+                pos_acc = _g(attrs, "POSITION")
+                if pos_acc is None:
                     continue
-                pos = _read_accessor(gltf, blob, prim.attributes.POSITION).astype(np.float32)
+                pos = _read_accessor(gltf, blob, pos_acc).astype(np.float32)
                 pos_w = (pos @ rot3.T) + world[:3, 3]
-                if prim.attributes.NORMAL is not None:
-                    nrm = _read_accessor(gltf, blob, prim.attributes.NORMAL).astype(np.float32)
+                nrm_acc = _g(attrs, "NORMAL")
+                if nrm_acc is not None:
+                    nrm = _read_accessor(gltf, blob, nrm_acc).astype(np.float32)
                     nrm_w = nrm @ norm_mat.T
                     lens = np.linalg.norm(nrm_w, axis=1, keepdims=True)
                     nrm_w = np.divide(nrm_w, np.maximum(lens, 1e-6))
@@ -439,13 +526,16 @@ def load_glb_scene(path: Path) -> GLScene:
                     nrm_w = np.tile(np.array([0.0, 1.0, 0.0], dtype=np.float32), (len(pos_w), 1))
 
                 uvs = None
-                if prim.attributes.TEXCOORD_0 is not None:
-                    uvs = _read_accessor(gltf, blob, prim.attributes.TEXCOORD_0).astype(np.float32)
-                elif getattr(prim.attributes, "TEXCOORD_1", None) is not None:
-                    uvs = _read_accessor(gltf, blob, prim.attributes.TEXCOORD_1).astype(np.float32)
+                uv0_acc = _g(attrs, "TEXCOORD_0")
+                uv1_acc = _g(attrs, "TEXCOORD_1")
+                if uv0_acc is not None:
+                    uvs = _read_accessor(gltf, blob, uv0_acc).astype(np.float32)
+                elif uv1_acc is not None:
+                    uvs = _read_accessor(gltf, blob, uv1_acc).astype(np.float32)
 
-                if prim.indices is not None:
-                    idx = _read_accessor(gltf, blob, prim.indices).astype(np.uint32).reshape(-1)
+                ind_acc = _g(prim, "indices")
+                if ind_acc is not None:
+                    idx = _read_accessor(gltf, blob, ind_acc).astype(np.uint32).reshape(-1)
                 else:
                     idx = np.arange(len(pos_w), dtype=np.uint32)
 
@@ -455,24 +545,29 @@ def load_glb_scene(path: Path) -> GLScene:
                 alpha_cutoff = 0.5
                 double_sided = False
                 mat_name = ""
-                if prim.material is not None and prim.material < len(gltf.materials):
-                    mat = gltf.materials[prim.material]
-                    mat_name = mat.name or ""
-                    alpha_mode = (mat.alphaMode or "OPAQUE").upper()
-                    if mat.alphaCutoff is not None:
-                        alpha_cutoff = float(mat.alphaCutoff)
-                    double_sided = bool(mat.doubleSided)
-                    pbr = mat.pbrMetallicRoughness
+                mat_idx = _g(prim, "material")
+                if mat_idx is not None and mat_idx < len(materials):
+                    mat = materials[mat_idx]
+                    mat_name = _g(mat, "name") or ""
+                    alpha_mode = (_g(mat, "alphaMode") or "OPAQUE").upper()
+                    ac = _g(mat, "alphaCutoff")
+                    if ac is not None:
+                        alpha_cutoff = float(ac)
+                    double_sided = bool(_g(mat, "doubleSided"))
+                    pbr = _g(mat, "pbrMetallicRoughness")
                     if pbr is not None:
-                        if pbr.baseColorFactor:
-                            c = pbr.baseColorFactor
-                            color = (float(c[0]), float(c[1]), float(c[2]), float(c[3]))
-                        if pbr.baseColorTexture is not None:
-                            tex_data = _decode_gltf_texture(
-                                gltf, blob, pbr.baseColorTexture.index, path.parent, tex_cache
-                            )
+                        bcf = _g(pbr, "baseColorFactor")
+                        if bcf:
+                            color = (float(bcf[0]), float(bcf[1]), float(bcf[2]), float(bcf[3]))
+                        bct = _g(pbr, "baseColorTexture")
+                        if bct is not None:
+                            bct_idx = _g(bct, "index")
+                            if bct_idx is not None:
+                                tex_data = _decode_gltf_texture(
+                                    gltf, blob, bct_idx, path.parent, tex_cache, max_dim=max_tex_dim
+                                )
 
-                hint = f"{node.name or ''} {mesh.name or ''} {mat_name}".lower()
+                hint = f"{n_name} {m_name} {mat_name}".lower()
                 if "hairshadow" in hint or "shadowproxy" in hint:
                     continue
                 is_weapon = "weapon" in hint
@@ -483,13 +578,12 @@ def load_glb_scene(path: Path) -> GLScene:
                     if alpha_mode == "OPAQUE" and tex_data is not None:
                         alpha_mode = "BLEND"
                 elif alpha_mode in ("OPAQUE", "BLEND") and tex_data is not None and is_cutout:
-                    a_min = int(np.frombuffer(tex_data[0], dtype=np.uint8)[3::4].min())
-                    if a_min < 250:
+                    if tex_data[3] < 250:
                         alpha_mode = "MASK"
                     elif alpha_mode == "BLEND":
                         alpha_mode = "OPAQUE"
 
-                gm = _match_game_material(game_mats, mat_name, mesh.name or "", node.name or "")
+                gm = _match_game_material(game_mats, mat_name, m_name, n_name) if game_mats else None
                 toon_smooth = 0.08
                 toon_spec = 0.15
                 rim_glow = 0.35
@@ -510,13 +604,13 @@ def load_glb_scene(path: Path) -> GLScene:
                     rim_col = gm["rim_color"]
 
                 if alpha_mode == "BLEND" and tex_data is not None and not is_sky and not any(t in hint for t in ("glass", "window", "water", "eff", "fx", "decal", "trans")):
-                    a_mean = float(np.frombuffer(tex_data[0], dtype=np.uint8)[3::4].mean())
-                    if a_mean < 5.0:
+                    if tex_data[4] < 5.0:
                         alpha_mode = "OPAQUE"
                 elif alpha_mode == "MASK" and tex_data is not None:
-                    a_arr = np.frombuffer(tex_data[0], dtype=np.uint8)[3::4]
-                    if float((a_arr >= int(alpha_cutoff * 255)).mean()) < 0.03:
-                        alpha_mode = "OPAQUE"
+                    if tex_data[4] < 8.0 and tex_data[3] >= 0:
+                        a_arr = np.frombuffer(tex_data[0], dtype=np.uint8)[3::4]
+                        if float((a_arr >= int(alpha_cutoff * 255)).mean()) < 0.03:
+                            alpha_mode = "OPAQUE"
 
                 if len(pos_w) > 0:
                     pmin = pos_w.min(axis=0)
@@ -524,8 +618,10 @@ def load_glb_scene(path: Path) -> GLScene:
                     bmin = np.minimum(bmin, pmin)
                     bmax = np.maximum(bmax, pmax)
                     sm_center = tuple(((pmin + pmax) * 0.5).tolist())
+                    sm_radius = max(0.001, float(np.linalg.norm((pmax - pmin) * 0.5)))
                 else:
                     sm_center = (0.0, 0.0, 0.0)
+                    sm_radius = 0.001
                 total_verts += len(pos_w)
                 total_tris += len(idx) // 3
                 submeshes.append(
@@ -544,50 +640,52 @@ def load_glb_scene(path: Path) -> GLScene:
                         is_sky=is_sky,
                         is_weapon=is_weapon,
                         center=sm_center,
+                        bound_radius=sm_radius,
                         toon_smoothness=toon_smooth,
                         toon_specular=toon_spec,
                         rim_glow=rim_glow,
                         rim_color=rim_col,
                     )
                 )
-        for ch in (node.children or ()):
+        for ch in (_g(node, "children") or ()):
             _visit(ch, world)
 
     bones: list[GLBone] = []
 
     def _visit_bone(node_idx: int, parent_world: np.ndarray, parent_bone: int) -> int:
-        node = gltf.nodes[node_idx]
-        if node.matrix:
-            loc = np.array(node.matrix, dtype=np.float32).reshape(4, 4).T
+        node = nodes[node_idx]
+        n_mat = _g(node, "matrix")
+        if n_mat:
+            loc = np.array(n_mat, dtype=np.float32).reshape(4, 4).T
             t = loc[:3, 3].copy()
             s = np.linalg.norm(loc[:3, :3], axis=0).astype(np.float32)
             q = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         else:
-            t = np.array(node.translation or [0.0, 0.0, 0.0], dtype=np.float32)
-            q = np.array(node.rotation or [0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-            s = np.array(node.scale or [1.0, 1.0, 1.0], dtype=np.float32)
+            t = np.array(_g(node, "translation") or [0.0, 0.0, 0.0], dtype=np.float32)
+            q = np.array(_g(node, "rotation") or [0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            s = np.array(_g(node, "scale") or [1.0, 1.0, 1.0], dtype=np.float32)
             loc = _trs_to_mat4(t, q, s)
         world = parent_world @ loc
         b_idx = -1
-        if node.mesh is None:
+        if _g(node, "mesh") is None:
             b_idx = len(bones)
             bones.append(GLBone(
-                name=node.name or f"node_{node_idx}",
+                name=_g(node, "name") or f"node_{node_idx}",
                 parent=parent_bone,
                 translation=t,
                 rotation=q,
                 scale=s,
                 rest_world=world,
             ))
-        for ch in (node.children or ()):
+        for ch in (_g(node, "children") or ()):
             _visit_bone(ch, world, b_idx if b_idx >= 0 else parent_bone)
         return b_idx
 
-    if gltf.scenes:
-        sc = gltf.scenes[gltf.scene or 0]
-        root_nodes = sc.nodes or []
+    if scenes:
+        sc = scenes[scene_idx]
+        root_nodes = _g(sc, "nodes") or []
     else:
-        root_nodes = list(range(len(gltf.nodes)))
+        root_nodes = list(range(len(nodes)))
 
     ident = np.eye(4, dtype=np.float32)
     for rn in root_nodes:
@@ -640,7 +738,7 @@ def load_obj_scene(path: Path) -> GLScene:
         center = np.zeros(3, dtype=np.float32)
         radius = 1.0
         bmin_y = 0.0
-    sub = GLSubMesh(pos, nrm, None, idx, (0.78, 0.80, 0.85, 1.0)) if len(idx) else None
+    sub = GLSubMesh(pos, nrm, None, idx, (0.78, 0.80, 0.85, 1.0), center=tuple(center.tolist()), bound_radius=radius) if len(idx) else None
     return GLScene(
         source_path=path,
         submeshes=[sub] if sub else [],
@@ -743,6 +841,23 @@ class GLBViewport(QOpenGLWidget):
         super().__init__(parent)
         self.scene: GLScene | None = None
         self.tex_ids: list[int] = []
+        self._tex_max_mip: dict[int, int] = {}
+        self._active_tex_lod: int = 0
+        self._vbo_chunks: list[tuple[int, int]] = []
+        self._sm_vbo_idx: list[int] = []
+        self._sm_idx_bytes: list[int] = []
+        self._sm_idx_counts: list[int] = []
+        self._cull_centers: np.ndarray = np.zeros((0, 3), dtype=np.float32)
+        self._cull_radii: np.ndarray = np.zeros((0,), dtype=np.float32)
+        self._cull_is_blend: np.ndarray = np.zeros((0,), dtype=bool)
+        self._cull_is_weapon: np.ndarray = np.zeros((0,), dtype=bool)
+        self._cull_is_sky: np.ndarray = np.zeros((0,), dtype=bool)
+        self._cull_valid: np.ndarray = np.zeros((0,), dtype=bool)
+        self._ref_distance: float = 3.0
+        self.culling_enabled = True
+        self.zoom_lod_enabled = True
+        self.last_render_stats: dict = {"drawn": 0, "total": 0, "culled": 0, "tex_lod": 0}
+        self._stats_cb = None
         self.wireframe = False
         self.show_textures = True
         self.show_grid = True
@@ -769,6 +884,7 @@ class GLBViewport(QOpenGLWidget):
 
     def set_scene(self, scene: GLScene):
         self.makeCurrent()
+        self._free_vbos()
         self._free_textures()
         self.scene = scene
         self.anim_clip = None
@@ -780,6 +896,8 @@ class GLBViewport(QOpenGLWidget):
         self._inv_rest_worlds = []
         self._mesh_bind = []
         self._upload_textures()
+        self._build_static_vbos()
+        self._build_cull_arrays()
         self.reset_camera()
         self.doneCurrent()
         self.update()
@@ -818,9 +936,112 @@ class GLBViewport(QOpenGLWidget):
         else:
             self.target = np.zeros(3, dtype=np.float32)
             self.distance = 3.0
+        self._ref_distance = max(0.05, float(self.distance))
         self.yaw = 35.0
         self.pitch = 20.0
         self.update()
+
+    def _free_vbos(self):
+        if self._vbo_chunks:
+            try:
+                ids = [bid for pair in self._vbo_chunks for bid in pair if bid]
+                if ids:
+                    gl.glDeleteBuffers(len(ids), ids)
+            except Exception:
+                pass
+            self._vbo_chunks.clear()
+        self._sm_vbo_idx.clear()
+        self._sm_idx_bytes.clear()
+        self._sm_idx_counts.clear()
+
+    def _build_static_vbos(self):
+        self._free_vbos()
+        if not self.scene or not self.scene.submeshes:
+            return
+        max_verts_per_chunk = 900_000
+        v_parts: list[np.ndarray] = []
+        i_parts: list[np.ndarray] = []
+        v_count = 0
+        i_byte_off = 0
+        chunk_idx = 0
+
+        def _flush():
+            nonlocal v_parts, i_parts, v_count, i_byte_off, chunk_idx
+            if not v_parts:
+                return
+            v_arr = np.ascontiguousarray(np.concatenate(v_parts, axis=0), dtype=np.float32)
+            i_arr = np.ascontiguousarray(np.concatenate(i_parts, axis=0), dtype=np.uint32)
+            vbo, ibo = gl.glGenBuffers(2)
+            vbo = int(vbo)
+            ibo = int(ibo)
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+            gl.glBufferData(gl.GL_ARRAY_BUFFER, v_arr.nbytes, v_arr, gl.GL_STATIC_DRAW)
+            gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, ibo)
+            gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, i_arr.nbytes, i_arr, gl.GL_STATIC_DRAW)
+            self._vbo_chunks.append((vbo, ibo))
+            v_parts = []
+            i_parts = []
+            v_count = 0
+            i_byte_off = 0
+            chunk_idx += 1
+
+        try:
+            for sm in self.scene.submeshes:
+                n_v = len(sm.positions)
+                n_i = len(sm.indices)
+                if n_v == 0 or n_i == 0:
+                    self._sm_vbo_idx.append(-1)
+                    self._sm_idx_bytes.append(0)
+                    self._sm_idx_counts.append(0)
+                    continue
+                if v_count > 0 and (v_count + n_v > max_verts_per_chunk):
+                    _flush()
+                uvs = sm.uvs if (sm.uvs is not None and len(sm.uvs) == n_v) else np.zeros((n_v, 2), dtype=np.float32)
+                packed = np.empty((n_v, 8), dtype=np.float32)
+                packed[:, 0:3] = sm.positions
+                packed[:, 3:6] = sm.normals
+                packed[:, 6:8] = uvs
+                v_parts.append(packed)
+                i_parts.append(sm.indices.astype(np.uint32) + np.uint32(v_count))
+                self._sm_vbo_idx.append(chunk_idx)
+                self._sm_idx_bytes.append(i_byte_off)
+                self._sm_idx_counts.append(n_i)
+                v_count += n_v
+                i_byte_off += n_i * 4
+            _flush()
+        except Exception:
+            self._free_vbos()
+        finally:
+            try:
+                gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+                gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, 0)
+            except Exception:
+                pass
+
+    def _build_cull_arrays(self):
+        if not self.scene or not self.scene.submeshes:
+            self._cull_centers = np.zeros((0, 3), dtype=np.float32)
+            self._cull_radii = np.zeros((0,), dtype=np.float32)
+            self._cull_is_blend = np.zeros((0,), dtype=bool)
+            self._cull_is_weapon = np.zeros((0,), dtype=bool)
+            self._cull_is_sky = np.zeros((0,), dtype=bool)
+            self._cull_valid = np.zeros((0,), dtype=bool)
+            return
+        sms = self.scene.submeshes
+        self._cull_centers = np.asarray([sm.center for sm in sms], dtype=np.float32)
+        radii = []
+        for sm in sms:
+            r = sm.bound_radius
+            if r <= 0.0 and len(sm.positions):
+                pmin = sm.positions.min(axis=0)
+                pmax = sm.positions.max(axis=0)
+                r = max(0.001, float(np.linalg.norm((pmax - pmin) * 0.5)))
+            radii.append(max(0.001, float(r)))
+        self._cull_radii = np.asarray(radii, dtype=np.float32)
+        self._cull_is_blend = np.asarray([sm.alpha_mode == "BLEND" for sm in sms], dtype=bool)
+        self._cull_is_weapon = np.asarray([sm.is_weapon for sm in sms], dtype=bool)
+        self._cull_is_sky = np.asarray([sm.is_sky for sm in sms], dtype=bool)
+        self._cull_valid = np.asarray([len(sm.indices) > 0 and len(sm.positions) > 0 for sm in sms], dtype=bool)
 
     def _free_textures(self):
         if self.tex_ids:
@@ -831,6 +1052,8 @@ class GLBViewport(QOpenGLWidget):
             except Exception:
                 pass
             self.tex_ids.clear()
+        self._tex_max_mip.clear()
+        self._active_tex_lod = -1
 
     def _upload_textures(self):
         if not self.scene:
@@ -843,7 +1066,6 @@ class GLBViewport(QOpenGLWidget):
                 if tid is None:
                     tid = int(gl.glGenTextures(1))
                     gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
-                    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
                     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
                     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT)
                     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT)
@@ -851,11 +1073,50 @@ class GLBViewport(QOpenGLWidget):
                         gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, sm.tex_w, sm.tex_h, 0,
                         gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, sm.tex_rgba,
                     )
+                    max_mip = int(math.floor(math.log2(max(1, sm.tex_w, sm.tex_h))))
+                    try:
+                        gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+                        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR_MIPMAP_LINEAR)
+                        self._tex_max_mip[tid] = max_mip
+                    except Exception:
+                        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR)
+                        self._tex_max_mip[tid] = 0
                     uploaded[key] = tid
                 self.tex_ids.append(tid)
             else:
                 self.tex_ids.append(0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        self._active_tex_lod = 0
+
+    def _update_tex_lod(self):
+        if not self._tex_max_mip:
+            self._active_tex_lod = 0
+            return
+        if not self.zoom_lod_enabled:
+            target_lvl = 0
+        else:
+            ref = max(0.05, self._ref_distance)
+            zr = self.distance / ref
+            if zr < 0.35:
+                target_lvl = 0
+            elif zr < 0.85:
+                target_lvl = 1
+            elif zr < 1.65:
+                target_lvl = 2
+            else:
+                target_lvl = 3
+        if target_lvl == self._active_tex_lod:
+            return
+        try:
+            for tid, max_mip in self._tex_max_mip.items():
+                if max_mip > 0:
+                    eff = min(target_lvl, max(0, max_mip - 4))
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
+                    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_BASE_LEVEL, eff)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        except Exception:
+            pass
+        self._active_tex_lod = target_lvl
 
     def initializeGL(self):
         gl.glClearColor(0.06, 0.075, 0.105, 1.0)
@@ -882,18 +1143,34 @@ class GLBViewport(QOpenGLWidget):
                     "u_toon_smooth", "u_toon_spec", "u_rim_glow", "u_rim_color", "u_shadow_tint",
                 )
             }
+        if self.scene is not None:
+            if not self.tex_ids:
+                self._upload_textures()
+            if not self._vbo_chunks:
+                self._build_static_vbos()
+            if len(self._cull_centers) == 0:
+                self._build_cull_arrays()
 
-    def _set_projection(self, w: int, h: int):
+    def _set_projection(self, w: int, h: int) -> np.ndarray:
         h = max(1, h)
         aspect = w / float(h)
         scene_r = self.scene.radius if self.scene else 1.0
         near = max(0.0005, min(self.distance * 0.002, scene_r * 0.001))
         far = max(200.0, self.distance * 50.0, scene_r * 25.0)
-        top = near * math.tan(math.radians(45.0) * 0.5)
+        tan_half = math.tan(math.radians(45.0) * 0.5)
+        top = near * tan_half
         right = top * aspect
         gl.glMatrixMode(gl.GL_PROJECTION)
         gl.glLoadIdentity()
         gl.glFrustum(-right, right, -top, top, near, far)
+        f = 1.0 / tan_half
+        proj = np.zeros((4, 4), dtype=np.float32)
+        proj[0, 0] = f / aspect
+        proj[1, 1] = f
+        proj[2, 2] = -(far + near) / (far - near)
+        proj[2, 3] = -(2.0 * far * near) / (far - near)
+        proj[3, 2] = -1.0
+        return proj
 
     def resizeGL(self, w: int, h: int):
         h = max(1, h)
@@ -901,45 +1178,108 @@ class GLBViewport(QOpenGLWidget):
         self._set_projection(w, h)
         gl.glMatrixMode(gl.GL_MODELVIEW)
 
+    @staticmethod
+    def _extract_frustum_planes(clip: np.ndarray) -> np.ndarray:
+        planes = np.empty((6, 4), dtype=np.float32)
+        planes[0] = clip[3] + clip[0]
+        planes[1] = clip[3] - clip[0]
+        planes[2] = clip[3] + clip[1]
+        planes[3] = clip[3] - clip[1]
+        planes[4] = clip[3] + clip[2]
+        planes[5] = clip[3] - clip[2]
+        norms = np.linalg.norm(planes[:, :3], axis=1, keepdims=True)
+        planes /= np.maximum(norms, 1e-8)
+        return planes
+
     def paintGL(self):
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
-        self._set_projection(max(1, self.width()), max(1, self.height()))
+        w = max(1, self.width())
+        h = max(1, self.height())
+        proj_m = self._set_projection(w, h)
 
         gl.glMatrixMode(gl.GL_MODELVIEW)
         gl.glLoadIdentity()
 
         yr = math.radians(self.yaw)
         pr = math.radians(self.pitch)
-        cx = self.target[0] + self.distance * math.cos(pr) * math.sin(yr)
-        cy = self.target[1] + self.distance * math.sin(pr)
-        cz = self.target[2] + self.distance * math.cos(pr) * math.cos(yr)
-        self._glu_look_at(cx, cy, cz, self.target[0], self.target[1], self.target[2])
+        cx = float(self.target[0] + self.distance * math.cos(pr) * math.sin(yr))
+        cy = float(self.target[1] + self.distance * math.sin(pr))
+        cz = float(self.target[2] + self.distance * math.cos(pr) * math.cos(yr))
+        mv_m = self._glu_look_at(cx, cy, cz, self.target[0], self.target[1], self.target[2])
 
         if self.show_grid:
             self._draw_grid()
 
-        if not self.scene:
+        if not self.scene or not self.scene.submeshes:
             return
 
+        if len(self._cull_centers) != len(self.scene.submeshes):
+            self._build_cull_arrays()
+
+        self._update_tex_lod()
+
+        sms = self.scene.submeshes
+        n_total = len(sms)
+        vis = self._cull_valid.copy()
+        if not self.show_weapons:
+            vis &= ~self._cull_is_weapon
+
+        d2: np.ndarray | None = None
+        if n_total > 64:
+            planes = self._extract_frustum_planes(proj_m @ mv_m)
+            signed = self._cull_centers @ planes[:, :3].T + planes[:, 3]
+            vis &= np.all(signed >= -self._cull_radii[:, None], axis=1)
+
+        if self.culling_enabled and n_total > 250 and np.any(vis):
+            diff = self._cull_centers - np.array([cx, cy, cz], dtype=np.float32)
+            d2 = np.einsum("ij,ij->i", diff, diff)
+            px_scale = float(h) / math.tan(math.radians(45.0) * 0.5)
+            proj_px = (self._cull_radii / np.sqrt(np.maximum(d2, 1e-6))) * px_scale
+            zr = self.distance / max(0.05, self._ref_distance)
+            if n_total > 1000:
+                min_px = 1.0 if zr < 0.4 else (2.5 if zr < 1.0 else (5.0 if zr < 1.65 else 8.0))
+            else:
+                min_px = 0.8 if zr < 0.4 else (1.6 if zr < 1.0 else 2.6)
+            vis &= (self._cull_is_sky | (proj_px >= min_px))
+
+        opaque_idx = np.flatnonzero(vis & ~self._cull_is_blend)
+        blend_idx = np.flatnonzero(vis & self._cull_is_blend)
+
+        use_vbo = bool(self._vbo_chunks) and self.anim_clip is None and len(self._sm_vbo_idx) == n_total
+        tex_ids = self.tex_ids
+        n_tids = len(tex_ids)
+        opaque_list = opaque_idx.tolist()
+        if use_vbo:
+            sm_vbo = self._sm_vbo_idx
+            opaque_list.sort(key=lambda i: (sm_vbo[i], tex_ids[i] if i < n_tids else 0))
+        else:
+            opaque_list.sort(key=lambda i: (tex_ids[i] if i < n_tids else 0))
+
+        blend_list: list[int] = []
+        if len(blend_idx):
+            if d2 is None:
+                diff = self._cull_centers[blend_idx] - np.array([cx, cy, cz], dtype=np.float32)
+                bd2 = np.einsum("ij,ij->i", diff, diff)
+            else:
+                bd2 = d2[blend_idx]
+            order = np.argsort(-bd2)
+            blend_list = blend_idx[order].tolist()
+
+        drawn_n = len(opaque_list) + len(blend_list)
+        total_valid = int(self._cull_valid.sum())
+        self.last_render_stats = {
+            "drawn": drawn_n,
+            "total": total_valid,
+            "culled": max(0, total_valid - drawn_n),
+            "tex_lod": self._active_tex_lod,
+        }
+        if self._stats_cb is not None:
+            self._stats_cb(self.last_render_stats)
+
         gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE if self.wireframe else gl.GL_FILL)
+        gl.glDisable(gl.GL_CULL_FACE)
         gl.glEnableClientState(gl.GL_VERTEX_ARRAY)
         gl.glEnableClientState(gl.GL_NORMAL_ARRAY)
-
-        opaque_items = []
-        blend_items = []
-        for i, sm in enumerate(self.scene.submeshes):
-            if len(sm.indices) == 0:
-                continue
-            if sm.is_weapon and not self.show_weapons:
-                continue
-            if sm.alpha_mode == "BLEND":
-                dx = sm.center[0] - cx
-                dy = sm.center[1] - cy
-                dz = sm.center[2] - cz
-                blend_items.append((dx * dx + dy * dy + dz * dz, i, sm))
-            else:
-                opaque_items.append((i, sm))
-        blend_items.sort(key=lambda it: it[0], reverse=True)
 
         use_shader = self._toon_prog is not None and not self.wireframe
         ul = self._u_locs
@@ -948,50 +1288,73 @@ class GLBViewport(QOpenGLWidget):
             if ul.get("u_toon_enabled", -1) >= 0:
                 gl.glUniform1i(ul["u_toon_enabled"], 1 if self.toon_enabled else 0)
             if ul.get("u_cam_pos", -1) >= 0:
-                gl.glUniform3f(ul["u_cam_pos"], float(cx), float(cy), float(cz))
+                gl.glUniform3f(ul["u_cam_pos"], cx, cy, cz)
             if ul.get("u_light_dir", -1) >= 0:
                 gl.glUniform3f(ul["u_light_dir"], 0.45, 0.78, 0.42)
             if ul.get("u_tex", -1) >= 0:
                 gl.glUniform1i(ul["u_tex"], 0)
 
-        def _draw_sm(i: int, sm: GLSubMesh):
-            gl.glDisable(gl.GL_CULL_FACE)
-            tid = self.tex_ids[i] if i < len(self.tex_ids) else 0
+        bound_chunk = -2
+        bound_tid = -1
+        tex_state_on = None
+        last_u = {}
+
+        def _draw_sm(i: int):
+            nonlocal bound_chunk, bound_tid, tex_state_on
+            sm = sms[i]
+            tid = tex_ids[i] if i < n_tids else 0
             has_tex = bool(self.show_textures and tid and sm.uvs is not None)
             if has_tex:
-                gl.glActiveTexture(gl.GL_TEXTURE0)
-                gl.glEnable(gl.GL_TEXTURE_2D)
-                gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
-                gl.glEnableClientState(gl.GL_TEXTURE_COORD_ARRAY)
-                gl.glTexCoordPointer(2, gl.GL_FLOAT, 0, sm.uvs)
-                col = sm.color
+                if tex_state_on is not True:
+                    gl.glActiveTexture(gl.GL_TEXTURE0)
+                    gl.glEnable(gl.GL_TEXTURE_2D)
+                    gl.glEnableClientState(gl.GL_TEXTURE_COORD_ARRAY)
+                    tex_state_on = True
+                if tid != bound_tid:
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
+                    bound_tid = tid
+                if not use_vbo:
+                    gl.glTexCoordPointer(2, gl.GL_FLOAT, 0, sm.uvs)
             else:
-                gl.glDisable(gl.GL_TEXTURE_2D)
-                gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
-                col = sm.color
+                if tex_state_on is not False:
+                    gl.glDisable(gl.GL_TEXTURE_2D)
+                    gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
+                    tex_state_on = False
+                    bound_tid = 0
 
+            col = sm.color
             if use_shader:
                 am_int = 2 if sm.alpha_mode == "BLEND" else (1 if sm.alpha_mode == "MASK" else 0)
-                if ul.get("u_use_tex", -1) >= 0:
-                    gl.glUniform1i(ul["u_use_tex"], 1 if has_tex else 0)
-                if ul.get("u_color", -1) >= 0:
+                ut = 1 if has_tex else 0
+                if last_u.get("use_tex") != ut and ul.get("u_use_tex", -1) >= 0:
+                    gl.glUniform1i(ul["u_use_tex"], ut)
+                    last_u["use_tex"] = ut
+                if last_u.get("col") != col and ul.get("u_color", -1) >= 0:
                     gl.glUniform4f(ul["u_color"], float(col[0]), float(col[1]), float(col[2]), float(col[3]))
-                if ul.get("u_alpha_mode", -1) >= 0:
+                    last_u["col"] = col
+                if last_u.get("am") != am_int and ul.get("u_alpha_mode", -1) >= 0:
                     gl.glUniform1i(ul["u_alpha_mode"], am_int)
-                if ul.get("u_alpha_cutoff", -1) >= 0:
+                    last_u["am"] = am_int
+                if am_int == 1 and last_u.get("ac") != sm.alpha_cutoff and ul.get("u_alpha_cutoff", -1) >= 0:
                     gl.glUniform1f(ul["u_alpha_cutoff"], float(sm.alpha_cutoff))
-                if ul.get("u_is_sky", -1) >= 0:
-                    gl.glUniform1i(ul["u_is_sky"], 1 if sm.is_sky else 0)
-                if ul.get("u_toon_smooth", -1) >= 0:
-                    gl.glUniform1f(ul["u_toon_smooth"], float(sm.toon_smoothness))
-                if ul.get("u_toon_spec", -1) >= 0:
-                    gl.glUniform1f(ul["u_toon_spec"], float(sm.toon_specular))
-                if ul.get("u_rim_glow", -1) >= 0:
-                    gl.glUniform1f(ul["u_rim_glow"], float(sm.rim_glow))
-                if ul.get("u_rim_color", -1) >= 0:
-                    gl.glUniform3f(ul["u_rim_color"], float(sm.rim_color[0]), float(sm.rim_color[1]), float(sm.rim_color[2]))
-                if ul.get("u_shadow_tint", -1) >= 0:
-                    gl.glUniform3f(ul["u_shadow_tint"], float(sm.shadow_tint[0]), float(sm.shadow_tint[1]), float(sm.shadow_tint[2]))
+                    last_u["ac"] = sm.alpha_cutoff
+                sky_i = 1 if sm.is_sky else 0
+                if last_u.get("sky") != sky_i and ul.get("u_is_sky", -1) >= 0:
+                    gl.glUniform1i(ul["u_is_sky"], sky_i)
+                    last_u["sky"] = sky_i
+                toon_key = (sm.toon_smoothness, sm.toon_specular, sm.rim_glow, sm.rim_color, sm.shadow_tint)
+                if last_u.get("toon") != toon_key:
+                    if ul.get("u_toon_smooth", -1) >= 0:
+                        gl.glUniform1f(ul["u_toon_smooth"], float(sm.toon_smoothness))
+                    if ul.get("u_toon_spec", -1) >= 0:
+                        gl.glUniform1f(ul["u_toon_spec"], float(sm.toon_specular))
+                    if ul.get("u_rim_glow", -1) >= 0:
+                        gl.glUniform1f(ul["u_rim_glow"], float(sm.rim_glow))
+                    if ul.get("u_rim_color", -1) >= 0:
+                        gl.glUniform3f(ul["u_rim_color"], float(sm.rim_color[0]), float(sm.rim_color[1]), float(sm.rim_color[2]))
+                    if ul.get("u_shadow_tint", -1) >= 0:
+                        gl.glUniform3f(ul["u_shadow_tint"], float(sm.shadow_tint[0]), float(sm.shadow_tint[1]), float(sm.shadow_tint[2]))
+                    last_u["toon"] = toon_key
             else:
                 gl.glColor4f(*col)
                 if sm.alpha_mode == "MASK":
@@ -1000,26 +1363,51 @@ class GLBViewport(QOpenGLWidget):
                 else:
                     gl.glDisable(gl.GL_ALPHA_TEST)
 
-            gl.glVertexPointer(3, gl.GL_FLOAT, 0, sm.positions)
-            gl.glNormalPointer(gl.GL_FLOAT, 0, sm.normals)
-            gl.glDrawElements(gl.GL_TRIANGLES, len(sm.indices), gl.GL_UNSIGNED_INT, sm.indices)
+            if use_vbo:
+                v_idx = self._sm_vbo_idx[i]
+                if v_idx < 0:
+                    return
+                if v_idx != bound_chunk:
+                    vbo, ibo = self._vbo_chunks[v_idx]
+                    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+                    gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, ibo)
+                    gl.glVertexPointer(3, gl.GL_FLOAT, 32, ctypes.c_void_p(0))
+                    gl.glNormalPointer(gl.GL_FLOAT, 32, ctypes.c_void_p(12))
+                    gl.glTexCoordPointer(2, gl.GL_FLOAT, 32, ctypes.c_void_p(24))
+                    bound_chunk = v_idx
+                gl.glDrawElements(
+                    gl.GL_TRIANGLES,
+                    self._sm_idx_counts[i],
+                    gl.GL_UNSIGNED_INT,
+                    ctypes.c_void_p(self._sm_idx_bytes[i]),
+                )
+            else:
+                gl.glVertexPointer(3, gl.GL_FLOAT, 0, sm.positions)
+                gl.glNormalPointer(gl.GL_FLOAT, 0, sm.normals)
+                gl.glDrawElements(gl.GL_TRIANGLES, len(sm.indices), gl.GL_UNSIGNED_INT, sm.indices)
 
-        gl.glDisable(gl.GL_BLEND)
-        gl.glDepthMask(gl.GL_TRUE)
-        for i, sm in opaque_items:
-            _draw_sm(i, sm)
-
-        if blend_items:
-            gl.glEnable(gl.GL_BLEND)
-            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
-            gl.glDepthMask(gl.GL_FALSE)
-            for _d2, i, sm in blend_items:
-                _draw_sm(i, sm)
-            gl.glDepthMask(gl.GL_TRUE)
+        try:
             gl.glDisable(gl.GL_BLEND)
+            gl.glDepthMask(gl.GL_TRUE)
+            for i in opaque_list:
+                _draw_sm(i)
+
+            if blend_list:
+                gl.glEnable(gl.GL_BLEND)
+                gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+                gl.glDepthMask(gl.GL_FALSE)
+                for i in blend_list:
+                    _draw_sm(i)
+                gl.glDepthMask(gl.GL_TRUE)
+                gl.glDisable(gl.GL_BLEND)
+        finally:
+            if use_vbo and bound_chunk >= 0:
+                gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+                gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, 0)
 
         if use_shader:
             self._toon_prog.release()
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
         gl.glDisable(gl.GL_ALPHA_TEST)
         gl.glDisable(gl.GL_CULL_FACE)
         gl.glDisableClientState(gl.GL_TEXTURE_COORD_ARRAY)
@@ -1032,7 +1420,7 @@ class GLBViewport(QOpenGLWidget):
             self._draw_skeleton()
 
     @staticmethod
-    def _glu_look_at(ex, ey, ez, tx, ty, tz):
+    def _glu_look_at(ex, ey, ez, tx, ty, tz) -> np.ndarray:
         f = np.array([tx - ex, ty - ey, tz - ez], dtype=np.float32)
         f /= max(1e-6, np.linalg.norm(f))
         up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -1049,7 +1437,9 @@ class GLBViewport(QOpenGLWidget):
         m[2, :3] = -f
         t = np.eye(4, dtype=np.float32)
         t[:3, 3] = [-ex, -ey, -ez]
-        gl.glMultMatrixf((m @ t).T)
+        mv = (m @ t).astype(np.float32)
+        gl.glMultMatrixf(mv.T)
+        return mv
 
     def _draw_grid(self):
         gl.glDisable(gl.GL_LIGHTING)
@@ -1394,8 +1784,16 @@ class NativeViewerWidget(QWidget):
         self.btn_toon.setCheckable(True)
         self.btn_toon.setChecked(True)
         self.btn_toon.toggled.connect(self._toggle_toon)
+        self.btn_cull = QPushButton("Culling")
+        self.btn_cull.setCheckable(True)
+        self.btn_cull.setChecked(True)
+        self.btn_cull.toggled.connect(self._toggle_cull)
+        self.btn_lod = QPushButton("Zoom LOD")
+        self.btn_lod.setCheckable(True)
+        self.btn_lod.setChecked(True)
+        self.btn_lod.toggled.connect(self._toggle_zoom_lod)
 
-        for b in (btn_open, btn_refresh, btn_reset, self.btn_wire, self.btn_tex, self.btn_toon):
+        for b in (btn_open, btn_refresh, btn_reset, self.btn_wire, self.btn_tex, self.btn_toon, self.btn_cull, self.btn_lod):
             bar.addWidget(b)
         root.addLayout(bar)
 
@@ -1454,6 +1852,7 @@ class NativeViewerWidget(QWidget):
         left.setMaximumWidth(320)
 
         self.viewport = GLBViewport()
+        self.viewport._stats_cb = self._on_render_stats
         splitter.addWidget(left)
         splitter.addWidget(self.viewport)
         splitter.setStretchFactor(1, 1)
@@ -1470,6 +1869,25 @@ class NativeViewerWidget(QWidget):
     def _toggle_toon(self, checked: bool):
         self.viewport.toon_enabled = checked
         self.viewport.update()
+
+    def _toggle_cull(self, checked: bool):
+        self.viewport.culling_enabled = checked
+        self.viewport.update()
+
+    def _toggle_zoom_lod(self, checked: bool):
+        self.viewport.zoom_lod_enabled = checked
+        self.viewport.update()
+
+    def _on_render_stats(self, st: dict):
+        sc = self.viewport.scene
+        if not sc or self._anim_playing:
+            return
+        lod_div = 1 << max(0, int(st.get("tex_lod", 0)))
+        self.status_lbl.setText(
+            f"{sc.source_path.name} • {st['drawn']:,}/{st['total']:,} meshes • "
+            f"{sc.triangle_count:,} tris • tex 1/{lod_div}x "
+            f"(Drag: Orbit, Shift/Right-Drag: Pan, Wheel: Zoom)"
+        )
 
     def _open_file_dialog(self):
         f, _ = QFileDialog.getOpenFileName(

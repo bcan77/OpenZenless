@@ -55,6 +55,7 @@ def export_blk_asset_types(
     map_name: str = "",
     diffuse_only: bool = False,
     skip_proxies: bool = False,
+    stage_tokens: str = "",
 ) -> int:
     if not source_path.exists():
         raise FileNotFoundError(f"Source path not found: {source_path}")
@@ -78,6 +79,8 @@ def export_blk_asset_types(
         env["AS_DIFFUSE_ONLY"] = "1"
     if skip_proxies:
         env["AS_SKIP_PROXIES"] = "1"
+    if stage_tokens:
+        env["AS_STAGE_TOKENS"] = stage_tokens
     cmd = [
         "wine", str(cfg.CLI_EXE),
         "Z:" + str(source_path).replace("/", "\\"),
@@ -146,6 +149,7 @@ def export_blks_batch(
     use_cab_map: bool | None = None,
     diffuse_only: bool = False,
     skip_proxies: bool = False,
+    stage_tokens: str = "",
 ) -> int:
     if not blk_paths:
         return 0
@@ -157,6 +161,7 @@ def export_blks_batch(
             blk_paths[0], out_dir, types=types, export_mode=export_mode,
             name_filter=name_filter, log_cb=log_cb,
             map_op=map_op, map_name=map_name, diffuse_only=diffuse_only, skip_proxies=skip_proxies,
+            stage_tokens=stage_tokens,
         )
     if cab_active:
         with tempfile.NamedTemporaryFile("w", suffix=".blklist", delete=False, encoding="utf-8") as tf:
@@ -168,6 +173,7 @@ def export_blks_batch(
                 list_path, out_dir, types=types, export_mode=export_mode,
                 name_filter=name_filter, log_cb=log_cb,
                 map_op=map_op, map_name=map_name, diffuse_only=diffuse_only, skip_proxies=skip_proxies,
+                stage_tokens=stage_tokens,
             )
         finally:
             list_path.unlink(missing_ok=True)
@@ -180,6 +186,7 @@ def export_blks_batch(
         return export_blk_asset_types(
             stage_dir, out_dir, types=types, export_mode=export_mode,
             name_filter=name_filter, log_cb=log_cb, diffuse_only=diffuse_only, skip_proxies=skip_proxies,
+            stage_tokens=stage_tokens,
         )
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
@@ -559,14 +566,14 @@ def _blender_convert_chunk(
         "    ml = m.name.lower()\n"
         "    if 'shadowproxy' in ml:\n"
         "        return True\n"
-        "    if (ml == 'lit' or ml.startswith('lit.')) and not _mat_has_img(m):\n"
+        "    if (ml == 'lit' or ml.startswith('lit.') or ml == 'unlit' or ml.startswith('unlit.') or 'mihoyo_unlit_unlit' in ml) and not _mat_has_img(m):\n"
         "        return True\n"
         "    return False\n"
         "def _is_proxy_obj(obj):\n"
         "    cur = obj\n"
         "    while cur is not None:\n"
         "        nl = cur.name.lower()\n"
-        "        if _re.search(r'(?:_col(?:$|_|lider)|_proxy(?:$|_|\\s|\\.|[0-9])|_hairshadow(?:$|_|\\s|\\.|[0-9])|_lod[1-3](?:$|_|\\s|\\.|[0-9])|^scenepropcollider_|^blockout_|^stage_.*_ld$|^sm_merged_bp_|^napmesh,)', nl):\n"
+        "        if _re.search(r'(?:_col(?:$|_|lider)|_proxy(?:$|_|\\s|\\.|[0-9])|_hairshadow(?:$|_|\\s|\\.|[0-9])|_lod[1-3](?:$|_|\\s|\\.|[0-9])|^volumetricfog|^scenepropcollider_|^blockout_|^stage_.*_ld$|^sm_merged_bp_|^napmesh,)', nl):\n"
         "            return True\n"
         "        cur = cur.parent\n"
         "    if obj.type == 'MESH' and obj.data and obj.data.materials:\n"
@@ -935,6 +942,9 @@ def export_scene_map(
                         map_types = ["GameObject"]
                         if export_shaders:
                             map_types.append("Shader")
+                        clean_stage = re.sub(r"^(?:Stage|Env|Scene|Map)_", "", sname)
+                        st_toks = [t.lower() for t in clean_stage.split("_") if len(t) >= 3 and not t.isdigit()]
+                        stage_tokens_str = ",".join(st_toks)
                         rc = export_blks_batch(
                             resolved, dest,
                             types=map_types,
@@ -944,6 +954,7 @@ def export_scene_map(
                             use_cab_map=True,
                             diffuse_only=(not export_shaders),
                             skip_proxies=True,
+                            stage_tokens=stage_tokens_str,
                         )
                     else:
                         map_types = ["Mesh", "Texture2D", "GameObject", "Animator", "Material"]
