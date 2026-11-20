@@ -984,6 +984,30 @@ def _build_oz_indexes_from_jsonl(
         if not chosen:
             continue
 
+        if not chosen_lods:
+            cname_low = cname.lower()
+            model_hint = f"{cname_low}_model"
+            alt = None
+            for oname, opinfo in prefabs_by_name.items():
+                if oname == chosen[4] or not oname.lower().startswith(cname_low):
+                    continue
+                olods = lods_by_cab.get((opinfo[1], opinfo[2]), [])
+                if not olods:
+                    continue
+                if not any(model_hint in mesh_path.lower() for _, mesh_path in olods):
+                    continue
+                score = (len(olods), -opinfo[0][0], -opinfo[0][1])
+                if alt is None or score > alt[0]:
+                    alt = (score, opinfo, oname, olods)
+            if alt is not None:
+                chosen = (*alt[1], alt[2])
+                chosen_lods = alt[3]
+                _emit(
+                    log_cb,
+                    f"Index: {cname} prefab has no LODs; using variant {chosen[4]} "
+                    f"({len(chosen_lods)} LODs)",
+                )
+
         _, p_blk, p_cab, p_key, pname = chosen
         extra_cabs: list[str] = []
         extra_cab_set: set[str] = set()

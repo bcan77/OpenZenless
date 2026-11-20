@@ -91,6 +91,7 @@ if not (CACHE_DIR / "asset_map").exists() and (_LEGACY_TMP_CACHE / "asset_map").
     except Exception:
         pass
 ASSETS_DIR = APP_DIR / "assets"
+TOON_PRESETS_DIR = ASSETS_DIR / "toon_presets"
 LOGO_HEADER = ASSETS_DIR / "OpenZenless_Header.png"
 LOGO_ICON = ASSETS_DIR / "OpenZenless_WhiteText.png"
 SECTIONS_INDEX_FILE = APP_DIR / "texture_sections_index.json"
@@ -358,3 +359,36 @@ def collect_game_version(game_root: Path) -> dict:
         "cli_exists": CLI_EXE.is_file(),
         "wine_exists": shutil.which("wine") is not None,
     }
+
+
+def configure_gpu_env(apply: bool = True) -> dict[str, str]:
+    """Return (and optionally apply) discrete GPU PRIME offload environment variables."""
+    if os.environ.get("OPENZENLESS_GPU", "").strip().lower() in ("igpu", "cpu", "0", "off"):
+        return {}
+    env_vars: dict[str, str] = {}
+    if os.name == "posix":
+        has_nvidia = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia/version")
+        if has_nvidia:
+            env_vars = {
+                "__NV_PRIME_RENDER_OFFLOAD": "1",
+                "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
+                "__VK_LAYER_NV_optimus": "NVIDIA_only",
+            }
+        else:
+            try:
+                v0 = Path("/sys/class/drm/card0/device/vendor").read_text().strip().lower()
+                v1 = Path("/sys/class/drm/card1/device/vendor").read_text().strip().lower()
+                if v0 == "0x8086" and v1 == "0x1002":
+                    env_vars = {"DRI_PRIME": "1"}
+            except Exception:
+                pass
+    if apply:
+        for k, v in env_vars.items():
+            os.environ.setdefault(k, v)
+    return env_vars
+
+
+def default_worker_count(max_workers: int = 4) -> int:
+    """Return default parallel worker count tuned for the host CPU core count."""
+    return min(max_workers, max(1, (os.cpu_count() or 4) // 4))
+

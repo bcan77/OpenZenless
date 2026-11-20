@@ -19,6 +19,8 @@ mkdir -p "$APPDIR/usr/share/openzenless" "$APPDIR/usr/share/applications" "$APPD
 
 cp "$ROOT/openzenless.py" "$ROOT/README.md" "$ROOT/requirements.txt" "$ROOT/texture_sections_index.json" "$APPDIR/usr/share/openzenless/"
 cp -r "$ROOT/openzenless" "$ROOT/assets" "$ROOT/docs" "$APPDIR/usr/share/openzenless/"
+find "$APPDIR/usr/share/openzenless" -name "__pycache__" -type d -exec rm -rf {} +
+find "$APPDIR/usr/share/openzenless" -name "*.py[cod]" -delete
 
 # Generate a square 256x256 PNG icon from OpenZenless_WhiteText.png
 python3 - "$ROOT/assets/OpenZenless_WhiteText.png" "$APPDIR/openzenless.png" <<'PY'
@@ -57,6 +59,11 @@ cat > "$APPDIR/AppRun" <<'RUN'
 set -euo pipefail
 APPDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_MAIN="$APPDIR/usr/share/openzenless/openzenless.py"
+if [ -e /dev/nvidia0 ] && [[ "${OPENZENLESS_GPU:-}" != "igpu" && "${OPENZENLESS_GPU:-}" != "cpu" && "${OPENZENLESS_GPU:-}" != "0" && "${OPENZENLESS_GPU:-}" != "off" ]]; then
+  export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
+  export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+  export __VK_LAYER_NV_optimus="${__VK_LAYER_NV_optimus:-NVIDIA_only}"
+fi
 if [ "$#" -eq 0 ]; then
   exec python3 "$APP_MAIN" gui
 else

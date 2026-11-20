@@ -4,6 +4,7 @@ from __future__ import annotations
 __version__ = "0.2.0"
 
 from . import config
+config.configure_gpu_env()
 from .cli import build_parser, main
 from .containers import detect_magic, format_hex_dump, human_size, parse_akpk, scan_blk_json
 from .exporters import (

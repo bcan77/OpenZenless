@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from . import config as cfg
+cfg.configure_gpu_env()
 from .adb_import import (
     detect_remote_files_dir,
     detect_zzz_package,

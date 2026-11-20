@@ -403,7 +403,7 @@ def launch_gui(root_path: Path):
             self.chk_dry = QCheckBox("Dry Run (Preview Full Plan)")
             self.spin_workers = QSpinBox()
             self.spin_workers.setRange(1, 8)
-            self.spin_workers.setValue(1)
+            self.spin_workers.setValue(cfg.default_worker_count(4))
             workers_row = QHBoxLayout()
             workers_row.setContentsMargins(0, 0, 0, 0)
             workers_row.addWidget(QLabel("Map Workers:"))
@@ -1556,7 +1556,10 @@ def launch_gui(root_path: Path):
             elif cat == "maps":
                 self._run_basic_export(
                     f"Exporting Map {r['id']}",
-                    lambda cb: export_scene_map(r["id"], resume=True, workers=1, out_dir=out_dir, log_cb=cb, game_root=self.game_root, export_shaders=export_shaders),
+                    lambda cb: export_scene_map(
+                        r["id"], resume=True, workers=cfg.default_worker_count(4),
+                        out_dir=out_dir, log_cb=cb, game_root=self.game_root, export_shaders=export_shaders,
+                    ),
                 )
             elif cat == "textures":
                 blks = [self.files_root / "Blocks" / os.path.basename(b) for b in r.get("blocks", [])]
@@ -2065,6 +2068,15 @@ def launch_gui(root_path: Path):
             self.status.showMessage("Error")
             QMessageBox.warning(self, "BlkExplorer Error", msg)
 
+    cfg.configure_gpu_env()
+    from PySide6.QtGui import QSurfaceFormat
+    fmt = QSurfaceFormat()
+    fmt.setRenderableType(QSurfaceFormat.OpenGL)
+    fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
+    fmt.setDepthBufferSize(24)
+    fmt.setSamples(4)
+    fmt.setSwapInterval(1)
+    QSurfaceFormat.setDefaultFormat(fmt)
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_QSS)
     should_index = True
