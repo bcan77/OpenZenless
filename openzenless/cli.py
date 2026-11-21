@@ -21,8 +21,13 @@ from .exporters import (
     export_blk_asset_types,
     export_character_animations_only,
     export_character_full,
+    export_data_pack,
+    export_entity_full,
+    export_fonts,
     export_full_game,
     export_scene_map,
+    export_spine_rig,
+    export_ui_sprite_group,
 )
 
 
@@ -66,26 +71,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_exp = sub.add_parser(
         "export",
-        help="Batch/pipeline export: character, animations, map, stage, fonts, assets, audio, or full",
+        help="Batch/pipeline export: character, animations, monster, npc, weapon, prop, map, stage, spine, sprites, data, fonts, assets, audio, or full",
     )
     p_exp.add_argument(
         "scope",
-        choices=["character", "animations", "map", "stage", "scene", "fonts", "assets", "audio", "full"],
+        choices=[
+            "character", "animations", "monster", "npc", "weapon", "prop",
+            "map", "stage", "scene", "spine", "sprites", "data",
+            "fonts", "assets", "audio", "full",
+        ],
         help="What to export",
     )
-    p_exp.add_argument("--name", default="", help="Character, map, or stage name (or 'all' for maps)")
+    p_exp.add_argument("--name", default="", help="Character, entity, map, stage, spine rig, sprite pack, or data pack name")
     p_exp.add_argument("--root", type=Path, default=cfg.GAME_ROOT, help="Path to ZZZ build root")
     p_exp.add_argument("--source", type=Path, default=None, help="Source .blk, .pck, or folder (for fonts/assets/audio)")
     p_exp.add_argument("--out-dir", type=Path, default=cfg.FINAL_ROOT / "Exports", help="Destination directory")
     p_exp.add_argument("--types", nargs="+", default=["Texture2D", "Sprite"], help="Unity asset types (for 'assets' scope)")
     p_exp.add_argument("--mode", choices=["Convert", "JSON", "Raw"], default="Convert", help="AnimeStudio CLI export mode")
     p_exp.add_argument("--filter", default="", help="Asset name substring filter (for 'assets' scope)")
-    p_exp.add_argument("--glb", action="store_true", help="Convert character FBX to GLB + facial morphs via Blender")
+    p_exp.add_argument("--glb", action="store_true", help="Convert character/entity FBX to GLB + facial morphs via Blender")
     p_exp.add_argument("--no-resume", action="store_true", help="Disable resume for map/stage pipeline")
     p_exp.add_argument("--workers", type=int, default=1, help="Concurrent map workers")
     p_exp.add_argument("--limit", type=int, default=0, help="Max audio entries per .pck (0 = all)")
     p_exp.add_argument("--no-wwise-map", action="store_true", help="Disable AnimeWwise nap.map auto-naming/sorting")
     p_exp.add_argument("--wav", action="store_true", help="Decode extracted .wem audio to .wav via vgmstream-cli")
+    p_exp.add_argument("--no-bnk", action="store_true", help="Do not extract embedded .wem entries from Wwise .bnk SoundBanks")
     p_exp.add_argument("--skip-chars", action="store_true", help="Skip characters in 'full' export")
     p_exp.add_argument("--skip-scenes", action="store_true", help="Skip scenes in 'full' export")
     p_exp.add_argument("--skip-fonts", action="store_true", help="Skip fonts in 'full' export")
@@ -209,6 +219,21 @@ def main(argv: list[str] | None = None) -> int:
                 print("--name is required for 'animations' export", file=sys.stderr)
                 return 2
             return export_character_animations_only(args.name, args.root, args.out_dir)
+        if scope in ("monster", "npc", "weapon", "prop"):
+            if not args.name:
+                print(f"--name is required for '{scope}' export", file=sys.stderr)
+                return 2
+            cat_map = {"monster": "monsters", "npc": "npcs", "weapon": "weapons", "prop": "props"}
+            return export_entity_full(args.name, category=cat_map[scope], out_dir=args.out_dir, convert_glb=args.glb, game_root=args.root)
+        if scope in ("spine", "sprites", "data"):
+            if not args.name:
+                print(f"--name is required for '{scope}' export", file=sys.stderr)
+                return 2
+            if scope == "spine":
+                return export_spine_rig(args.name, args.root, args.out_dir)
+            if scope == "sprites":
+                return export_ui_sprite_group(args.name, args.root, args.out_dir)
+            return export_data_pack(args.name, args.root, args.out_dir)
         if scope in ("map", "stage", "scene"):
             return export_scene_map(
                 args.name or "all",
@@ -218,8 +243,7 @@ def main(argv: list[str] | None = None) -> int:
                 game_root=args.root,
             )
         if scope == "fonts":
-            src = args.source or (files_root / "Blocks")
-            return export_blk_asset_types(src, args.out_dir / "Fonts", ["Font"], "Convert")
+            return export_fonts(args.root, args.out_dir / "Fonts", source_path=args.source)
         if scope == "assets":
             src = args.source or (files_root / "Blocks")
             return export_blk_asset_types(src, args.out_dir / "Assets", args.types, args.mode, args.filter)
@@ -230,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                 limit=args.limit,
                 use_wwise_map=not args.no_wwise_map,
                 decode_wav=args.wav,
+                extract_bnk=not args.no_bnk,
             )
         if scope == "full":
             return export_full_game(

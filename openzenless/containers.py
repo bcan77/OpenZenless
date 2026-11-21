@@ -108,6 +108,74 @@ def parse_akpk(path: Path) -> dict:
     }
 
 
+def parse_bnk(source: Path | bytes | bytearray | memoryview) -> dict:
+    """Parse Wwise BKHD SoundBank chunks (BKHD / DIDX / DATA) and embedded WEM entries."""
+    raw = source.read_bytes() if isinstance(source, Path) else source
+    buf = memoryview(raw)
+    total_len = len(buf)
+    if total_len < 8 or bytes(buf[:4]) != b"BKHD":
+        return {"error": "Not a valid Wwise BKHD SoundBank", "entries": []}
+
+    version = 0
+    bank_id = 0
+    chunks: list[str] = []
+    didx_records: list[tuple[int, int, int]] = []
+    data_offset: int | None = None
+    data_size = 0
+
+    pos = 0
+    while pos + 8 <= total_len:
+        tag = bytes(buf[pos : pos + 4])
+        chunk_size = struct.unpack_from("<I", buf, pos + 4)[0]
+        payload_start = pos + 8
+        payload_end = min(total_len, payload_start + chunk_size)
+        chunks.append(tag.decode("ascii", errors="replace"))
+        if tag == b"BKHD" and payload_end - payload_start >= 8:
+            version, bank_id = struct.unpack_from("<II", buf, payload_start)
+        elif tag == b"DIDX":
+            n_recs = (payload_end - payload_start) // 12
+            for i in range(n_recs):
+                rec_off = payload_start + i * 12
+                wem_id, rel_off, wem_size = struct.unpack_from("<III", buf, rec_off)
+                didx_records.append((wem_id, rel_off, wem_size))
+        elif tag == b"DATA":
+            data_offset = payload_start
+            data_size = payload_end - payload_start
+        pos = payload_start + chunk_size
+
+    entries: list[dict] = []
+    if data_offset is not None and didx_records:
+        for wem_id, rel_off, wem_size in didx_records:
+            abs_off = data_offset + rel_off
+            if rel_off >= 0 and wem_size > 0 and rel_off + wem_size <= data_size and abs_off + wem_size <= total_len:
+                entries.append({
+                    "type": "Wwise BNK WEM",
+                    "name": f"{wem_id}.wem",
+                    "id": str(wem_id),
+                    "offset": abs_off,
+                    "size": wem_size,
+                    "lang_id": 0,
+                })
+
+    return {
+        "version": version,
+        "bank_id": bank_id,
+        "chunks": chunks,
+        "entries": entries,
+    }
+
+
+def extract_bnk_wems(data: Path | bytes | bytearray | memoryview) -> list[tuple[str, bytes]]:
+    """Extract embedded ``(wem_id, bytes)`` payloads from a Wwise BKHD SoundBank."""
+    raw = data.read_bytes() if isinstance(data, Path) else data
+    buf = memoryview(raw)
+    parsed = parse_bnk(buf)
+    return [
+        (e["id"], bytes(buf[e["offset"] : e["offset"] + e["size"]]))
+        for e in parsed.get("entries", [])
+    ]
+
+
 def scan_blk_json(blk_path: Path, out_dir: Path | None = None, types: list[str] | None = None) -> tuple[Path, list[dict], str]:
     if not cfg.CLI_EXE.exists():
         raise FileNotFoundError(f"AnimeStudio.CLI.exe not found at {cfg.CLI_EXE}")

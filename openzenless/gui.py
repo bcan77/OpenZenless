@@ -17,20 +17,35 @@ from .adb_import import (
     list_adb_devices,
     pull_from_phone,
 )
-from .containers import detect_magic, format_hex_dump, human_size, parse_akpk, scan_blk_json
+from . import catalog
+from .containers import detect_magic, extract_bnk_wems, format_hex_dump, human_size, parse_akpk, parse_bnk, scan_blk_json
 from .exporters import (
+    export_audio_entries,
     export_audio_pck,
     export_blk_asset_types,
     export_character_animations_only,
+    export_character_family,
     export_character_full,
+    export_data_pack,
+    export_entity_animations_only,
+    export_entity_full,
+    export_fonts,
     export_full_game,
     export_scene_map,
+    export_spine_rig,
+    export_texture_section,
+    export_ui_sprite_group,
+    scan_audio_groups,
 )
 from .indexer import (
     build_asset_map,
     has_asset_map,
     load_character_index,
     load_character_names,
+    load_oz_character_index,
+    load_oz_entities_index,
+    load_oz_map_index,
+    load_oz_media_index,
     load_curated_map_index,
     load_stage_index,
     load_texture_sections,
@@ -43,10 +58,10 @@ def launch_gui(root_path: Path):
     from PySide6.QtCore import Qt, QThread, Signal, QSize
     from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap, QShortcut
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+        QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
         QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
         QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
-        QProgressBar, QPushButton, QSpinBox, QSplitter, QStackedWidget,
+        QProgressBar, QPushButton, QSizePolicy, QSpinBox, QSplitter, QStackedWidget,
         QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser,
         QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
     )
@@ -309,21 +324,34 @@ def launch_gui(root_path: Path):
             self.btn_skip.setEnabled(True)
             self.btn_skip.setText("Continue Anyway")
 
+        def reject(self):
+            if self.worker.isRunning():
+                self.worker.cancel_event.set()
+                self.worker.wait(3000)
+            super().reject()
+
         def closeEvent(self, event):
             if self.worker.isRunning():
                 self.worker.cancel_event.set()
-                self.worker.wait(1500)
+                self.worker.wait(3000)
+            super().closeEvent(event)
             super().closeEvent(event)
 
     class ExportDialog(QDialog):
         SCOPES = [
-            ("character", "Whole Character (FBX + Textures + Optional GLB)"),
+            ("character", "Whole Character / Bangboo (FBX + Textures + Optional GLB)"),
             ("animations", "Character Animations Only (AnimationClip / Animator)"),
+            ("monster", "Monster / Boss (FBX + Textures + Optional GLB)"),
+            ("npc", "NPC (FBX + Textures + Optional GLB)"),
+            ("weapon", "W-Engine / Proxy Accessory / Prop (FBX + Optional GLB)"),
             ("map", "Curated Map (GLB Pipeline)"),
             ("stage", "Raw Stage (.blk Export / GLB)"),
+            ("sprites", "UI Sprite Pack (Portraits, Mindscapes, Icons)"),
+            ("spine", "Spine 2D Rig (.skel + .atlas + Texture2D)"),
+            ("data", "Game Data Pack (Subtitles, .cloth, .human, Shaders)"),
             ("fonts", "Fonts (TTF / OTF from .blk)"),
             ("assets", "Custom Asset Types (Textures, Shaders, TextAsset, Mesh, ...)"),
-            ("audio", "Wwise Audio (.pck -> Auto-Named Voices / WAV)"),
+            ("audio", "Wwise Audio (.pck / .bnk -> Auto-Named Voices / WAV)"),
             ("full", "Full Export (Characters + Maps + Fonts + Voices)"),
         ]
 
@@ -398,6 +426,8 @@ def launch_gui(root_path: Path):
             opts_lay.setVerticalSpacing(8)
             self.chk_glb = QCheckBox("Convert Character to GLB + Facial Morphs (Blender)")
             self.chk_shaders = QCheckBox("Export Shaders & Materials")
+            self.chk_extract_bnk = QCheckBox("Extract embedded .bnk SoundBanks")
+            self.chk_extract_bnk.setChecked(True)
             self.chk_resume = QCheckBox("Resume Map Checkpoints")
             self.chk_resume.setChecked(True)
             self.chk_dry = QCheckBox("Dry Run (Preview Full Plan)")
@@ -431,6 +461,7 @@ def launch_gui(root_path: Path):
             opts_lay.addWidget(self.chk_wav, 1, 1)
             opts_lay.addWidget(self.chk_dry, 1, 2)
             opts_lay.addWidget(self.chk_shaders, 2, 0)
+            opts_lay.addWidget(self.chk_extract_bnk, 2, 1)
 
             full_row = QHBoxLayout()
             full_row.setContentsMargins(0, 4, 0, 0)
@@ -441,7 +472,7 @@ def launch_gui(root_path: Path):
             full_row.addWidget(self.chk_inc_fonts)
             full_row.addWidget(self.chk_inc_audio)
             full_row.addStretch()
-            opts_lay.addLayout(full_row, 2, 0, 1, 3)
+            opts_lay.addLayout(full_row, 3, 0, 1, 3)
             lay.addWidget(opts)
 
             self.log_box = QPlainTextEdit()
@@ -537,13 +568,15 @@ def launch_gui(root_path: Path):
             chars = sorted(self.parent_win.char_blocks.keys())
             curated_maps = sorted(self.parent_win.curated_maps.keys())
             stages = sorted(self.parent_win.stage_blocks.keys())
+            ents = self.parent_win.entities_index
+            media = self.parent_win.media_index
             cur = self.parent_win.current_container
             if scope == "full":
                 default_src = str(self.parent_win.game_root)
             elif scope == "audio":
                 default_src = (
                     str(cur)
-                    if (cur and cur.is_file() and cur.suffix.lower() == ".pck")
+                    if (cur and cur.is_file() and cur.suffix.lower() in (".pck", ".bnk"))
                     else str(self.parent_win.files_root / "Audio")
                 )
             else:
@@ -555,41 +588,48 @@ def launch_gui(root_path: Path):
             self.source_edit.setText(default_src)
             if self.target_combo.lineEdit():
                 self.target_combo.lineEdit().setPlaceholderText("")
+            uses_target = scope in (
+                "character", "animations", "monster", "npc", "weapon",
+                "map", "stage", "sprites", "spine", "data",
+            )
             if scope in ("character", "animations"):
                 self.target_combo.addItems(chars)
                 if not chars and self.target_combo.lineEdit():
                     self.target_combo.lineEdit().setPlaceholderText("No characters mapped yet — check Game/Extractor root")
-                self.target_combo.setEnabled(True)
-                self.source_edit.setEnabled(False)
-                self.btn_browse_file.setEnabled(False)
-                self.btn_browse_src.setEnabled(False)
+            elif scope == "monster":
+                self.target_combo.addItems(sorted((ents.get("monsters") or {}).keys()))
+            elif scope == "npc":
+                self.target_combo.addItems(sorted((ents.get("npcs") or {}).keys()))
+            elif scope == "weapon":
+                self.target_combo.addItems(sorted({**(ents.get("weapons") or {}), **(ents.get("props") or {})}.keys()))
             elif scope == "map":
                 self.target_combo.addItem("all")
                 self.target_combo.addItems(curated_maps)
-                self.target_combo.setEnabled(True)
-                self.source_edit.setEnabled(False)
-                self.btn_browse_file.setEnabled(False)
-                self.btn_browse_src.setEnabled(False)
             elif scope == "stage":
                 self.target_combo.addItems(stages)
                 if not stages and self.target_combo.lineEdit():
                     self.target_combo.lineEdit().setPlaceholderText("No stages mapped yet — check Game/Extractor root")
-                self.target_combo.setEnabled(True)
-                self.source_edit.setEnabled(False)
-                self.btn_browse_file.setEnabled(False)
-                self.btn_browse_src.setEnabled(False)
+            elif scope == "sprites":
+                self.target_combo.addItems(list((media.get("ui_sprites") or {}).keys()))
+            elif scope == "spine":
+                self.target_combo.addItems(sorted((media.get("spine") or {}).keys()))
+            elif scope == "data":
+                self.target_combo.addItems(list((media.get("data_packs") or {}).keys()))
             else:
                 self.target_combo.addItem("(Uses Source Path)")
-                self.target_combo.setEnabled(False)
-                self.source_edit.setEnabled(scope != "full")
-                self.btn_browse_file.setEnabled(scope != "full")
-                self.btn_browse_src.setEnabled(scope != "full")
+
+            self.target_combo.setEnabled(uses_target)
+            allow_src = scope in ("fonts", "assets", "audio")
+            self.source_edit.setEnabled(allow_src)
+            self.btn_browse_file.setEnabled(allow_src)
+            self.btn_browse_src.setEnabled(allow_src)
 
             self.types_edit.setEnabled(scope == "assets")
             self.mode_combo.setEnabled(scope == "assets")
             self.filter_edit.setEnabled(scope == "assets")
-            self.chk_glb.setEnabled(scope in ("character", "full"))
-            self.chk_shaders.setEnabled(scope in ("character", "map", "stage", "full"))
+            self.chk_glb.setEnabled(scope in ("character", "monster", "npc", "weapon", "full"))
+            self.chk_shaders.setEnabled(scope in ("character", "monster", "npc", "weapon", "map", "stage", "full"))
+            self.chk_extract_bnk.setEnabled(scope in ("audio", "full"))
             self.chk_resume.setEnabled(scope in ("map", "stage", "full"))
             self.spin_workers.setEnabled(scope in ("map", "stage"))
             self.chk_dry.setEnabled(scope == "full")
@@ -609,10 +649,10 @@ def launch_gui(root_path: Path):
             if not out_text:
                 QMessageBox.warning(self, "Export Error", "Please specify a Destination Folder.")
                 return
-            if scope in ("character", "animations", "map", "stage") and not target:
+            if scope in ("character", "animations", "monster", "npc", "weapon", "map", "stage", "sprites", "spine", "data") and not target:
                 QMessageBox.warning(self, "Export Error", f"Please select or enter a Target for '{scope}' export.")
                 return
-            if scope in ("fonts", "assets", "audio") and (not src_text or not src.exists()):
+            if scope in ("assets", "audio") and (not src_text or not src.exists()):
                 QMessageBox.warning(self, "Export Error", f"Source path does not exist:\n{src_text}")
                 return
             inc_chars = self.chk_inc_chars.isChecked()
@@ -627,6 +667,7 @@ def launch_gui(root_path: Path):
             game_root = self.parent_win.game_root
             convert_glb = self.chk_glb.isChecked()
             export_shaders = self.chk_shaders.isChecked()
+            extract_bnk = self.chk_extract_bnk.isChecked()
             resume = self.chk_resume.isChecked()
             dry_run = self.chk_dry.isChecked()
             workers = self.spin_workers.value()
@@ -644,16 +685,25 @@ def launch_gui(root_path: Path):
                     return export_character_full(target, out_dir=out, convert_glb=convert_glb, log_cb=cb, game_root=game_root, export_shaders=export_shaders)
                 if scope == "animations":
                     return export_character_animations_only(target, game_root, out, log_cb=cb)
+                if scope in ("monster", "npc", "weapon"):
+                    cat_map = {"monster": "monsters", "npc": "npcs", "weapon": "weapons" if target.startswith(("Weapon_", "Belle_", "Wise_")) else "props"}
+                    return export_entity_full(target, category=cat_map[scope], out_dir=out, convert_glb=convert_glb, log_cb=cb, game_root=game_root, export_shaders=export_shaders)
                 if scope in ("map", "stage"):
                     return export_scene_map(target, resume=resume, workers=workers, out_dir=out, log_cb=cb, game_root=game_root, export_shaders=export_shaders)
+                if scope == "sprites":
+                    return export_ui_sprite_group(target, game_root, out, log_cb=cb)
+                if scope == "spine":
+                    return export_spine_rig(target, game_root, out, log_cb=cb)
+                if scope == "data":
+                    return export_data_pack(target, game_root, out, log_cb=cb)
                 if scope == "fonts":
-                    return export_blk_asset_types(src, out / "Fonts", ["Font"], "Convert", log_cb=cb)
+                    return export_fonts(game_root, out / "Fonts", source_path=src if src.is_file() else None, log_cb=cb)
                 if scope == "assets":
                     return export_blk_asset_types(src, out / "Assets", types or ["Texture2D"], mode, flt, log_cb=cb)
                 if scope == "audio":
                     return export_audio_pck(
                         src, out / "Audio",
-                        use_wwise_map=use_wwise, decode_wav=decode_wav, log_cb=cb,
+                        use_wwise_map=use_wwise, decode_wav=decode_wav, extract_bnk=extract_bnk, log_cb=cb,
                     )
                 return export_full_game(
                     game_root, out,
@@ -696,6 +746,7 @@ def launch_gui(root_path: Path):
 
     class PhoneImportWorker(QThread):
         log_line = Signal(str)
+        progress_changed = Signal(int, str)
         finished_ok = Signal(str)
         failed = Signal(str)
 
@@ -732,6 +783,7 @@ def launch_gui(root_path: Path):
                     extract_apk_blocks=self.pull_apks,
                     log_cb=self.log_line.emit,
                     cancel_event=self._cancel_event,
+                    progress_cb=self.progress_changed.emit,
                 )
                 self.finished_ok.emit(str(out))
             except Exception as ex:
@@ -791,12 +843,21 @@ def launch_gui(root_path: Path):
             lay.addWidget(self.chk_files)
             lay.addWidget(self.chk_apks)
 
+            self.transfer_status = QLabel("")
+            self.transfer_status.setStyleSheet("color: #93c5fd; font-weight: 600;")
+            self.transfer_status.setMinimumWidth(0)
+            self.transfer_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self.transfer_status.setVisible(False)
+            lay.addWidget(self.transfer_status)
+
             self.progress = QProgressBar()
             self.progress.setVisible(False)
             lay.addWidget(self.progress)
 
             self.log_box = QPlainTextEdit()
             self.log_box.setReadOnly(True)
+            self.log_box.setMaximumBlockCount(2000)
+            self.log_box.setFont(QFont("JetBrains Mono, Consolas, monospace", 9))
             self.log_box.setPlaceholderText("ADB transfer progress will appear here...")
             lay.addWidget(self.log_box, 1)
 
@@ -911,12 +972,18 @@ def launch_gui(root_path: Path):
             remote_dir = self.remote_edit.text().strip()
 
             self.log_box.clear()
+            self.transfer_status.setText("Starting ADB import...")
+            self.transfer_status.setStyleSheet("color: #93c5fd; font-weight: 600;")
+            self.transfer_status.setVisible(True)
             self.progress.setRange(0, 0)
             self.progress.setVisible(True)
             self.btn_start.setEnabled(False)
             self.btn_refresh.setEnabled(False)
             self.btn_close.setEnabled(False)
             self.btn_cancel.setEnabled(True)
+            self.log_box.appendPlainText(
+                f"Device: {serial} | Package: {self._detected_pkg} | Destination: {dest}"
+            )
 
             self._worker = PhoneImportWorker(
                 dest_root=dest,
@@ -927,12 +994,25 @@ def launch_gui(root_path: Path):
                 pull_apks=self.chk_apks.isChecked(),
             )
             self._worker.log_line.connect(self.log_box.appendPlainText)
+            self._worker.progress_changed.connect(self._on_progress)
             self._worker.finished_ok.connect(self._on_pull_ok)
             self._worker.failed.connect(self._on_pull_fail)
             self._worker.start()
 
+        def _on_progress(self, pct: int, status_text: str):
+            self.transfer_status.setText(status_text)
+            self.transfer_status.setVisible(bool(status_text))
+            if pct < 0:
+                self.progress.setRange(0, 0)
+            else:
+                self.progress.setRange(0, 100)
+                self.progress.setValue(max(0, min(100, pct)))
+
         def _cancel_pull(self):
             if self._worker:
+                self.transfer_status.setText("Cancelling ADB transfer...")
+                self.transfer_status.setStyleSheet("color: #fbbf24; font-weight: 600;")
+                self.log_box.appendPlainText("Cancellation requested; stopping active ADB process...")
                 self._worker.cancel()
                 self.btn_cancel.setEnabled(False)
 
@@ -945,11 +1025,14 @@ def launch_gui(root_path: Path):
 
         def _on_pull_ok(self, out_path: str):
             self._reset_controls()
+            self.transfer_status.setStyleSheet("color: #4ade80; font-weight: 600;")
             self.dest_root = Path(out_path)
             self.accept()
 
         def _on_pull_fail(self, msg: str):
             self._reset_controls()
+            self.transfer_status.setText(f"Failed: {msg}")
+            self.transfer_status.setStyleSheet("color: #f87171; font-weight: 600;")
             self.log_box.appendPlainText(f"ERROR: {msg}")
             QMessageBox.warning(self, "ADB Import Failed", msg)
 
@@ -1051,6 +1134,9 @@ def launch_gui(root_path: Path):
             self.files_root = cfg.resolve_files_root(initial_root)
             self.current_dir: Path | None = None
             self.current_container: Path | None = None
+            self.current_bnk_bytes: bytes | None = None
+            self.current_bnk_parent: Path | None = None
+            self.current_bnk_parent_offset: int = 0
             self.current_mode = "dir"
             self.all_rows: list[dict] = []
             self.hex_file: Path | None = None
@@ -1061,7 +1147,10 @@ def launch_gui(root_path: Path):
             self.curated_maps = load_curated_map_index()
             self.char_blocks = self._load_char_blocks()
             self.char_names = load_character_names()
+            self.entities_index = load_oz_entities_index()
+            self.media_index = load_oz_media_index()
             self.texture_sections = load_texture_sections()
+            self.audio_groups_cache: list[dict] | None = None
             self.basic_all_items: list[dict] = []
 
             self._build_ui()
@@ -1307,13 +1396,7 @@ def launch_gui(root_path: Path):
 
         def apply_output_root(self, new_root: Path):
             cfg.set_final_root(new_root)
-            self.stage_blocks = self._load_stage_blocks()
-            self.curated_maps = load_curated_map_index()
-            self.char_blocks = self._load_char_blocks()
-            self.char_names = load_character_names()
-            self._populate_tree()
-            self._populate_basic_categories()
-            self._refresh_version_badge()
+            self._reload_indexes()
             self.viewer_widget.refresh_catalog()
             self.status.showMessage(f"Output Root set to {cfg.FINAL_ROOT}")
 
@@ -1330,22 +1413,30 @@ def launch_gui(root_path: Path):
             mid_lay.setContentsMargins(0, 0, 0, 0)
             mid_lay.setSpacing(6)
             self.basic_search = QLineEdit()
-            self.basic_search.setPlaceholderText("Search category items (name, ID, section)...")
+            self.basic_search.setPlaceholderText("Search category items (name, ID, skin, section)...")
             self.basic_search.textChanged.connect(self._filter_basic_items)
             mid_lay.addWidget(self.basic_search)
 
-            self.basic_table = QTableWidget(0, 3)
-            self.basic_table.setHorizontalHeaderLabels(["Name / Section", "Count / Status", "Identifier"])
-            self.basic_table.setAlternatingRowColors(True)
-            self.basic_table.setSelectionBehavior(QTableWidget.SelectRows)
-            self.basic_table.setEditTriggers(QTableWidget.NoEditTriggers)
-            self.basic_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
-            self.basic_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-            self.basic_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-            self.basic_table.setColumnWidth(0, 300)
-            self.basic_table.itemSelectionChanged.connect(self._on_basic_item_selected)
-            self.basic_table.itemDoubleClicked.connect(lambda _it: self._basic_inspect_in_advanced())
-            mid_lay.addWidget(self.basic_table)
+            self.basic_kind_combo = QComboBox()
+            self.basic_kind_combo.setToolTip("Filter by detected type / category")
+            self.basic_kind_combo.currentIndexChanged.connect(self._on_basic_kind_changed)
+            mid_lay.addWidget(self.basic_kind_combo)
+
+            self.basic_tree = QTreeWidget()
+            self.basic_tree.setHeaderLabels(["Name / Group", "Count / Status", "Identifier"])
+            self.basic_tree.setAlternatingRowColors(True)
+            self.basic_tree.setRootIsDecorated(True)
+            self.basic_tree.setUniformRowHeights(True)
+            self.basic_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+            self.basic_tree.setSortingEnabled(False)
+            hdr = self.basic_tree.header()
+            hdr.setSectionResizeMode(0, QHeaderView.Interactive)
+            hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            hdr.setSectionResizeMode(2, QHeaderView.Stretch)
+            self.basic_tree.setColumnWidth(0, 320)
+            self.basic_tree.itemSelectionChanged.connect(self._on_basic_item_selected)
+            self.basic_tree.itemDoubleClicked.connect(lambda _it, _col: self._basic_inspect_in_advanced())
+            mid_lay.addWidget(self.basic_tree)
             page.addWidget(mid)
 
             detail = QWidget()
@@ -1373,11 +1464,19 @@ def launch_gui(root_path: Path):
             self.btn_basic_export2 = QPushButton("Animations Only")
             self.btn_basic_export2.clicked.connect(self._basic_export_secondary)
             self.btn_basic_export2.setVisible(False)
+            self.btn_basic_export_group = QPushButton("Export All in Group")
+            self.btn_basic_export_group.clicked.connect(self._basic_export_group)
+            self.btn_basic_export_group.setVisible(False)
             self.chk_basic_shaders = QCheckBox("Export Shaders & Materials")
+            self.chk_basic_bnk = QCheckBox("Extract .bnk SFX")
+            self.chk_basic_bnk.setChecked(True)
+            self.chk_basic_bnk.setVisible(False)
             btn_row.addWidget(self.btn_basic_inspect)
             btn_row.addWidget(self.btn_basic_export1)
             btn_row.addWidget(self.btn_basic_export2)
+            btn_row.addWidget(self.btn_basic_export_group)
             btn_row.addWidget(self.chk_basic_shaders)
+            btn_row.addWidget(self.chk_basic_bnk)
             d_lay.addLayout(btn_row)
 
             page.addWidget(detail)
@@ -1386,13 +1485,28 @@ def launch_gui(root_path: Path):
 
         def _populate_basic_categories(self):
             self.basic_cats.clear()
+            oz_chars = load_oz_character_index()
+            char_fams = catalog.build_character_tree(oz_chars, include_bangboo=False) if oz_chars else []
+            n_chars = len(char_fams) if char_fams else len(self.char_blocks)
+            n_bangboo = len(catalog.classify_bangboo(oz_chars)) if oz_chars else 0
+            n_monsters = len((self.entities_index.get("monsters") or {}))
+            n_npcs = len((self.entities_index.get("npcs") or {}))
+            n_weapons = len((self.entities_index.get("weapons") or {})) + len((self.entities_index.get("props") or {}))
+            n_spine = len((self.media_index.get("spine") or {}))
+            n_sprites = len((self.media_index.get("ui_sprites") or {}))
+            n_clean_tex = sum(1 for k in self.texture_sections if catalog.is_texture_section(k))
             pcks = list((self.files_root / "Audio").rglob("*.pck")) if (self.files_root / "Audio").exists() else []
+            n_data = 1 + len((self.media_index.get("data_packs") or {}))
             entries = [
-                ("characters", f"Characters ({len(self.char_blocks)})"),
+                ("characters", f"Characters ({n_chars})"),
+                ("bangboo", f"Bangboo ({n_bangboo})"),
+                ("monsters", f"Monsters & Bosses ({n_monsters})"),
+                ("npcs", f"NPCs ({n_npcs})"),
+                ("weapons", f"W-Engines & Props ({n_weapons})"),
                 ("maps", f"Curated Maps ({len(self.curated_maps)})"),
-                ("textures", f"Texture2D Sections ({len(self.texture_sections)})"),
-                ("audio", f"Audio Archives ({len(pcks)})"),
-                ("fonts", "Fonts & Localization"),
+                ("media2d", f"UI, Sprites & Spine 2D ({n_sprites + n_spine + n_clean_tex})"),
+                ("audio", f"Audio ({len(pcks)} .pck)"),
+                ("fonts", f"Fonts & Game Data ({n_data})"),
             ]
             for key, label in entries:
                 it = QListWidgetItem(label)
@@ -1400,70 +1514,527 @@ def launch_gui(root_path: Path):
                 self.basic_cats.addItem(it)
             self.basic_cats.setCurrentRow(0)
 
+        def _on_basic_kind_changed(self):
+            it = self.basic_cats.currentItem()
+            if it and it.data(Qt.UserRole) == "audio":
+                kf = self.basic_kind_combo.currentData()
+                if kf == "mapped" and self.audio_groups_cache is None:
+                    self.audio_groups_cache = scan_audio_groups(self.files_root / "Audio", use_wwise_map=True)
+                    existing_ids = {r["id"] for r in self.basic_all_items}
+                    for grp in self.audio_groups_cache:
+                        gid = grp["group_key"]
+                        if gid in existing_ids:
+                            continue
+                        self.basic_all_items.append({
+                            "cat": "audio",
+                            "subkind": "mapped_group",
+                            "kind_key": "mapped",
+                            "name": grp["label"],
+                            "status": f"{grp['count']} entries • {human_size(grp['total_size'])}",
+                            "id": gid,
+                            "entries": grp["entries"],
+                            "pck_paths": grp["pck_paths"],
+                            "count": grp["count"],
+                            "bnk_count": grp["bnk_count"],
+                        })
+            self._filter_basic_items()
+
         def _on_basic_category_changed(self, row: int):
             it = self.basic_cats.item(row)
             if not it:
                 return
             cat = it.data(Qt.UserRole)
             items: list[dict] = []
+            glb_roots = [cfg.FINAL_ROOT]
+            self.basic_kind_combo.blockSignals(True)
+            self.basic_kind_combo.clear()
+
             if cat == "characters":
-                for cid in sorted(self.char_blocks.keys()):
-                    loc = self.char_names.get(cid, cid)
-                    out_dir = cfg.FINAL_ROOT / "Characters" / cid
-                    has_glb = (out_dir / "Model").exists() and any((out_dir / "Model").glob("*.glb"))
-                    status = f"{len(self.char_blocks[cid])} .blk" + (" • GLB Ready" if has_glb else "")
-                    items.append({"cat": cat, "name": loc, "status": status, "id": cid, "blocks": self.char_blocks[cid]})
+                for label, key in (
+                    ("Playable Agents & Proxies (default)", "playable"),
+                    ("Playable Agents", "agent"),
+                    ("Proxies (Belle & Wise)", "proxy"),
+                    ("Has Skins / Alt Forms", "multi"),
+                    ("Companions & Weapons", "companions"),
+                    ("Limited / Model only", "limited_model"),
+                    ("Needs attention / Empty stubs", "issues"),
+                    ("All Characters", "all"),
+                ):
+                    self.basic_kind_combo.addItem(label, key)
+                self.basic_kind_combo.setVisible(True)
+                oz_chars = load_oz_character_index()
+                if oz_chars:
+                    families = catalog.build_character_tree(oz_chars, include_bangboo=False)
+                    for grp in families:
+                        pinfo = grp["primary_info"]
+                        pid = grp["primary_id"]
+                        p_name = self.char_names.get(pid) or grp["display"]
+                        has_glb = catalog.find_exported_glb(pid, glb_roots) is not None
+                        child_rows: list[dict] = []
+                        child_search_tokens: list[str] = []
+                        for cinfo in grp["children"]:
+                            cid = cinfo["id"]
+                            cname = self.char_names.get(cid) or cinfo["short_label"]
+                            c_glb = catalog.find_exported_glb(cid, glb_roots) is not None
+                            c_st = catalog.char_status_text(cinfo) + (" • GLB Ready" if c_glb else "")
+                            c_blks = [b for b in [oz_chars[cid].get("prefab_blk", ""), *(oz_chars[cid].get("mesh_blks") or [])] if b]
+                            child_search_tokens.extend([cname.lower(), cinfo["display"].lower(), cid.lower()])
+                            child_rows.append({
+                                "cat": "characters",
+                                "name": cname,
+                                "status": c_st,
+                                "id": cid,
+                                "blocks": c_blks,
+                                "kind_key": cinfo["kind"],
+                                "issues": cinfo["issues"],
+                                "info": cinfo,
+                                "search_extra": f"{p_name.lower()} {cinfo['display'].lower()}",
+                            })
+                        stat_parts = [catalog.CHAR_KIND_LABELS.get(pinfo["kind"], pinfo["kind"])]
+                        if grp["skin_count"]:
+                            stat_parts.append(f"{grp['skin_count']} skin{'s' if grp['skin_count'] > 1 else ''}")
+                        if grp["alt_count"]:
+                            stat_parts.append(f"{grp['alt_count']} alt")
+                        if grp["companion_count"]:
+                            stat_parts.append(f"{grp['companion_count']} comp")
+                        if pinfo["anim_count"]:
+                            stat_parts.append(f"{pinfo['anim_count']} anims")
+                        if has_glb:
+                            stat_parts.append("GLB Ready")
+                        p_blks = [b for b in [oz_chars[pid].get("prefab_blk", ""), *(oz_chars[pid].get("mesh_blks") or [])] if b]
+                        items.append({
+                            "cat": "characters",
+                            "name": p_name,
+                            "status": " • ".join(stat_parts),
+                            "id": pid,
+                            "blocks": p_blks,
+                            "kind_key": pinfo["kind"],
+                            "role": grp["role"],
+                            "primary_info": pinfo,
+                            "info": pinfo,
+                            "issues": grp["issues"],
+                            "children": child_rows,
+                            "family_member_ids": grp["member_ids"],
+                            "search_extra": " ".join(child_search_tokens),
+                        })
+                else:
+                    for cid in sorted(self.char_blocks):
+                        has_glb = catalog.find_exported_glb(cid, glb_roots) is not None
+                        items.append({
+                            "cat": "characters",
+                            "name": self.char_names.get(cid) or catalog.display_name(cid),
+                            "status": f"{len(self.char_blocks[cid])} .blk" + (" • GLB Ready" if has_glb else ""),
+                            "id": cid,
+                            "blocks": self.char_blocks[cid],
+                            "kind_key": "character",
+                            "role": "agent",
+                            "primary_info": {"kind": "character"},
+                            "issues": [],
+                            "children": [],
+                            "family_member_ids": [cid],
+                        })
+
+            elif cat == "bangboo":
+                for label, key in (
+                    ("Playable / Full Bangboo (default)", "valid"),
+                    ("All Bangboo", "all"),
+                    ("Needs attention", "issues"),
+                ):
+                    self.basic_kind_combo.addItem(label, key)
+                self.basic_kind_combo.setVisible(True)
+                oz_chars = load_oz_character_index()
+                bmap = catalog.classify_bangboo(oz_chars)
+                for bid, info in bmap.items():
+                    e = oz_chars.get(bid) or {}
+                    blks = [b for b in [e.get("prefab_blk", ""), *(e.get("mesh_blks") or [])] if b]
+                    has_glb = catalog.find_exported_glb(bid, glb_roots) is not None
+                    st_parts = ["Bangboo", f"{len(blks)} .blk"]
+                    if info["anim_count"]:
+                        st_parts.append(f"{info['anim_count']} anims")
+                    if has_glb:
+                        st_parts.append("GLB Ready")
+                    items.append({
+                        "cat": "bangboo",
+                        "name": info["display"],
+                        "status": " • ".join(st_parts),
+                        "id": bid,
+                        "blocks": blks,
+                        "kind_key": info["kind"],
+                        "issues": info["issues"],
+                        "info": info,
+                    })
+
+            elif cat == "monsters":
+                for label, key in (
+                    ("All Monsters & Bosses", "all"),
+                    ("Bosses", "boss"),
+                    ("Regular Enemies", "enemy"),
+                    ("Has Animations", "animated"),
+                ):
+                    self.basic_kind_combo.addItem(label, key)
+                self.basic_kind_combo.setVisible(True)
+                raw_m = self.entities_index.get("monsters") or {}
+                cmap = catalog.classify_monsters(raw_m)
+                for mid, info in cmap.items():
+                    e = raw_m.get(mid) or {}
+                    blks = e.get("blocks") or e.get("mesh_blks") or []
+                    has_glb = catalog.find_exported_glb(mid, glb_roots) is not None
+                    st_parts = ["Boss" if info["kind"] == "boss" else "Monster", f"{len(blks)} .blk"]
+                    if info["anim_count"]:
+                        st_parts.append(f"{info['anim_count']} anims")
+                    if has_glb:
+                        st_parts.append("GLB Ready")
+                    items.append({
+                        "cat": "monsters",
+                        "name": info["display"],
+                        "status": " • ".join(st_parts),
+                        "id": mid,
+                        "blocks": blks,
+                        "kind_key": info["kind"],
+                        "anim_count": info["anim_count"],
+                        "info": info,
+                    })
+
+            elif cat == "npcs":
+                for label, key in (
+                    ("Named NPCs (default)", "named"),
+                    ("All NPCs", "all"),
+                    ("Numeric / Crowd NPCs", "numeric"),
+                    ("Has Animations", "animated"),
+                ):
+                    self.basic_kind_combo.addItem(label, key)
+                self.basic_kind_combo.setVisible(True)
+                raw_n = self.entities_index.get("npcs") or {}
+                cmap = catalog.classify_npcs(raw_n)
+                for nid, info in cmap.items():
+                    e = raw_n.get(nid) or {}
+                    blks = e.get("blocks") or e.get("mesh_blks") or []
+                    has_glb = catalog.find_exported_glb(nid, glb_roots) is not None
+                    st_parts = ["Named NPC" if info["kind"] == "named" else "Numeric NPC", f"{len(blks)} .blk"]
+                    if info["anim_count"]:
+                        st_parts.append(f"{info['anim_count']} anims")
+                    if has_glb:
+                        st_parts.append("GLB Ready")
+                    items.append({
+                        "cat": "npcs",
+                        "name": info["display"],
+                        "status": " • ".join(st_parts),
+                        "id": nid,
+                        "blocks": blks,
+                        "kind_key": info["kind"],
+                        "anim_count": info["anim_count"],
+                        "info": info,
+                    })
+
+            elif cat == "weapons":
+                for label, key in (
+                    ("W-Engines & Proxy Accessories (default)", "gear"),
+                    ("All W-Engines & Props", "all"),
+                    ("W-Engines", "wengine"),
+                    ("Proxy Accessories (Belle / Wise)", "accessory"),
+                    ("Items", "item"),
+                    ("Devices & Interactables", "device"),
+                    ("Destructibles", "destruction"),
+                    ("Game Props", "prop"),
+                ):
+                    self.basic_kind_combo.addItem(label, key)
+                self.basic_kind_combo.setVisible(True)
+                raw_w = self.entities_index.get("weapons") or {}
+                raw_p = self.entities_index.get("props") or {}
+                wmap = catalog.classify_weapons_props(raw_w, raw_p)
+                grouped: dict[str, list[dict]] = {}
+                for eid, info in wmap.items():
+                    src_d = raw_w if info["category_src"] == "weapons" else raw_p
+                    e = src_d.get(eid) or {}
+                    blks = e.get("blocks") or e.get("mesh_blks") or []
+                    has_glb = catalog.find_exported_glb(eid, glb_roots) is not None
+                    st = f"{info['group_label']} • {len(blks)} .blk" + (" • GLB Ready" if has_glb else "")
+                    grouped.setdefault(info["group_label"], []).append({
+                        "cat": "weapons",
+                        "name": info["display"],
+                        "status": st,
+                        "id": eid,
+                        "blocks": blks,
+                        "kind_key": info["kind"],
+                        "category_src": info["category_src"],
+                        "info": info,
+                        "search_extra": info["group_label"].lower(),
+                    })
+                for glabel, children in grouped.items():
+                    kinds = sorted({c["kind_key"] for c in children})
+                    items.append({
+                        "cat": "weapons",
+                        "is_folder": True,
+                        "name": glabel,
+                        "status": f"{len(children)} item(s)",
+                        "id": f"group:{glabel}",
+                        "blocks": [],
+                        "kind_key": kinds[0] if len(kinds) == 1 else "all",
+                        "sub_kinds": set(kinds),
+                        "children": children,
+                        "search_extra": " ".join(c["name"].lower() + " " + c["id"].lower() for c in children),
+                    })
+
             elif cat == "maps":
-                for st in sorted(self.curated_maps.keys()):
-                    glb = cfg.FINAL_ROOT / "Maps_Combined" / f"{st}_full.glb"
-                    status = f"{len(self.curated_maps[st])} .blk" + (" • GLB Ready" if glb.exists() else "")
-                    items.append({"cat": cat, "name": st, "status": status, "id": st, "blocks": self.curated_maps[st]})
-            elif cat == "textures":
+                for label, key in (
+                    ("Curated maps (default)", "curated"),
+                    ("Open areas, hubs & bosses", "top"),
+                    ("All stages & maps", "all"),
+                    ("Open areas (streaming)", "open"),
+                    ("Hubs / city", "hub"),
+                    ("Combat stages", "combat"),
+                    ("Boss arenas", "boss"),
+                    ("Zero Abyss / Complex rooms", "zero"),
+                    ("NPC worksites", "npc"),
+                    ("VR / training", "vr"),
+                    ("Minigames", "minigame"),
+                    ("Internal / test", "internal"),
+                ):
+                    self.basic_kind_combo.addItem(label, key)
+                self.basic_kind_combo.setVisible(True)
+                all_stages = self.stage_blocks or {}
+                oz_maps = load_oz_map_index()
+                minfo = catalog.classify_maps(oz_maps) if oz_maps else {}
+                names = sorted(set(all_stages) | set(self.curated_maps), key=lambda n: (n.lower().replace("_streaming", ""), "_streaming" in n.lower()))
+                for st in names:
+                    info = minfo.get(st)
+                    blks = self.curated_maps.get(st) or all_stages.get(st, [])
+                    has_glb = catalog.find_exported_glb(st, glb_roots) is not None
+                    if info:
+                        status = catalog.map_status_text(info) + f" • {len(blks)} .blk"
+                        disp = catalog.map_display_name(st, info)
+                        cat_key = info["category"]
+                    else:
+                        status = f"{len(blks)} .blk"
+                        disp, cat_key = st, "hub"
+                    if has_glb:
+                        status += " • GLB Ready"
+                    items.append({
+                        "cat": cat, "name": st if disp == st else f"{disp}", "status": status, "id": st,
+                        "blocks": blks, "kind_key": cat_key, "issues": (info or {}).get("issues", []),
+                        "curated": st in self.curated_maps, "info": info,
+                    })
+
+            elif cat == "media2d":
+                for label, key in (
+                    ("Curated 2D (Sprites, Spine & Clean Sections)", "curated2d"),
+                    ("UI Sprite Packs", "sprite_pack"),
+                    ("Spine 2D Rigs (.skel + .atlas)", "spine"),
+                    ("Texture2D Sections (clean)", "tex_clean"),
+                    ("All Raw Sections (incl. VoiceBlocks / Data)", "tex_all"),
+                ):
+                    self.basic_kind_combo.addItem(label, key)
+                self.basic_kind_combo.setVisible(True)
+                for skey, sinfo in (self.media_index.get("ui_sprites") or {}).items():
+                    blks = sinfo.get("blks") or []
+                    items.append({
+                        "cat": "media2d",
+                        "subkind": "sprite_pack",
+                        "kind_key": "sprite_pack",
+                        "name": f"[UI Pack] {sinfo.get('label', skey)}",
+                        "status": f"{sinfo.get('count', 0):,} sprites • {len(blks)} .blk",
+                        "id": skey,
+                        "blocks": blks,
+                        "samples": sinfo.get("samples") or [],
+                    })
+                for rkey, rinfo in sorted((self.media_index.get("spine") or {}).items(), key=lambda kv: kv[0].lower()):
+                    blks = rinfo.get("blks") or []
+                    n_sk = len(rinfo.get("skel_names") or [])
+                    n_at = len(rinfo.get("atlas_names") or [])
+                    items.append({
+                        "cat": "media2d",
+                        "subkind": "spine",
+                        "kind_key": "spine",
+                        "name": f"[Spine 2D] {rinfo.get('name', rkey)}",
+                        "status": f"{n_sk} skel / {n_at} atlas • {len(blks)} .blk",
+                        "id": rkey,
+                        "blocks": blks,
+                        "samples": [*(rinfo.get("skel_names") or []), *(rinfo.get("atlas_names") or [])],
+                    })
                 for sec, info in sorted(self.texture_sections.items()):
                     blks = info.get("blocks", [])
-                    items.append({"cat": cat, "name": sec, "status": f"{len(blks)} .blk", "id": sec, "blocks": blks, "samples": info.get("samples", [])})
+                    is_clean = catalog.is_texture_section(sec)
+                    items.append({
+                        "cat": "media2d",
+                        "subkind": "texture_section",
+                        "kind_key": "tex_clean" if is_clean else "tex_noise",
+                        "name": sec,
+                        "status": f"{len(blks)} .blk",
+                        "id": sec,
+                        "blocks": blks,
+                        "samples": info.get("samples", []),
+                    })
+
             elif cat == "audio":
+                for label, key in (
+                    ("Audio Archives (.pck)", "pck"),
+                    ("Mapped Voices, Music & SoundBanks (nap.map)", "mapped"),
+                ):
+                    self.basic_kind_combo.addItem(label, key)
+                self.basic_kind_combo.setVisible(True)
                 audio_root = self.files_root / "Audio"
                 if audio_root.exists():
                     for pck in sorted(audio_root.rglob("*.pck")):
                         rel = str(pck.relative_to(audio_root))
-                        items.append({"cat": cat, "name": pck.name, "status": human_size(pck.stat().st_size), "id": rel, "path": str(pck)})
+                        items.append({
+                            "cat": cat,
+                            "subkind": "pck",
+                            "kind_key": "pck",
+                            "name": pck.name,
+                            "status": human_size(pck.stat().st_size),
+                            "id": rel,
+                            "path": str(pck),
+                        })
+                if self.audio_groups_cache:
+                    for grp in self.audio_groups_cache:
+                        items.append({
+                            "cat": "audio",
+                            "subkind": "mapped_group",
+                            "kind_key": "mapped",
+                            "name": grp["label"],
+                            "status": f"{grp['count']} entries • {human_size(grp['total_size'])}",
+                            "id": grp["group_key"],
+                            "entries": grp["entries"],
+                            "pck_paths": grp["pck_paths"],
+                            "count": grp["count"],
+                            "bnk_count": grp["bnk_count"],
+                        })
+
             elif cat == "fonts":
+                font_blks = []
+                f_idx = cfg.CACHE_DIR / "asset_map" / "fonts_index_auto.json"
+                if f_idx.is_file():
+                    try:
+                        font_blks = json.loads(f_idx.read_text()).get("blocks") or []
+                    except Exception:
+                        font_blks = []
                 items.append({
-                    "cat": cat,
+                    "cat": "fonts",
+                    "subkind": "fonts_all",
                     "name": "All Game Fonts (TTF / OTF)",
-                    "status": "AnimeStudio CLI",
-                    "id": str(self.files_root / "Blocks"),
+                    "status": f"{len(font_blks)} indexed .blk" if font_blks else "AnimeStudio CLI",
+                    "id": "fonts_all",
+                    "blocks": font_blks,
                 })
+                for dk, dp in (self.media_index.get("data_packs") or {}).items():
+                    blks = dp.get("blks") or []
+                    items.append({
+                        "cat": "fonts",
+                        "subkind": "data_pack",
+                        "pack_key": dk,
+                        "name": dp.get("label", dk),
+                        "status": f"{dp.get('count', 0):,} assets • {len(blks)} .blk",
+                        "id": dk,
+                        "blocks": blks,
+                        "samples": dp.get("samples") or [],
+                    })
+
+            if cat in ("fonts",):
+                self.basic_kind_combo.setVisible(False)
+            self.basic_kind_combo.setCurrentIndex(0)
+            self.basic_kind_combo.blockSignals(False)
             self.basic_all_items = items
             self._filter_basic_items()
 
         def _filter_basic_items(self):
             q = self.basic_search.text().strip().lower()
-            filtered = [
-                r for r in self.basic_all_items
-                if not q or q in r["name"].lower() or q in r["id"].lower() or q in r["status"].lower()
-            ]
-            self.basic_table.setSortingEnabled(False)
-            self.basic_table.setRowCount(len(filtered))
-            for i, r in enumerate(filtered):
-                c0 = QTableWidgetItem(r["name"])
-                c0.setData(Qt.UserRole, r)
-                c1 = QTableWidgetItem(r["status"])
-                c2 = QTableWidgetItem(r["id"])
-                self.basic_table.setItem(i, 0, c0)
-                self.basic_table.setItem(i, 1, c1)
-                self.basic_table.setItem(i, 2, c2)
-            self.basic_table.setSortingEnabled(True)
-            if filtered:
-                self.basic_table.selectRow(0)
+            kf = self.basic_kind_combo.currentData() if self.basic_kind_combo.isVisible() else "all"
+
+            def _row_matches_q(row_d: dict, include_extra: bool = True) -> bool:
+                if not q:
+                    return True
+                if (
+                    q in row_d["name"].lower()
+                    or q in row_d["id"].lower()
+                    or q in row_d["status"].lower()
+                ):
+                    return True
+                return include_extra and (q in row_d.get("search_extra", ""))
+
+            def _kind_ok(r: dict) -> bool:
+                if kf in (None, "all"):
+                    return True
+                if kf == "curated":
+                    return bool(r.get("curated", True))
+                if kf == "top":
+                    return bool(r.get("curated", True)) and r.get("kind_key") in catalog.MAP_TOP_CATEGORIES
+                if kf == "playable":
+                    return (r.get("primary_info") or {}).get("kind", r.get("kind_key")) != "stub"
+                if kf == "agent":
+                    return r.get("role") == "agent" and r.get("kind_key") in ("character", "limited", "model")
+                if kf == "proxy":
+                    return r.get("role") == "proxy"
+                if kf == "multi":
+                    return bool(r.get("children"))
+                if kf == "companions":
+                    return any((c.get("info") or {}).get("kind") in ("companion", "attachment") for c in r.get("children", ()))
+                if kf == "limited_model":
+                    return r.get("kind_key") in ("limited", "model") or any(
+                        (c.get("info") or {}).get("kind") in ("limited", "model") for c in r.get("children", ())
+                    )
+                if kf == "issues":
+                    return bool(r.get("issues"))
+                if kf == "valid":
+                    return r.get("kind_key") == "bangboo"
+                if kf == "animated":
+                    return int(r.get("anim_count") or 0) > 0
+                if kf == "gear":
+                    return bool(r.get("sub_kinds", {r.get("kind_key")}) & {"wengine", "accessory"})
+                if kf == "curated2d":
+                    return r.get("kind_key") in ("sprite_pack", "spine", "tex_clean")
+                if kf == "tex_all":
+                    return r.get("kind_key") in ("tex_clean", "tex_noise")
+                if "sub_kinds" in r:
+                    return kf in r["sub_kinds"]
+                return r.get("kind_key") == kf
+
+            def _visible_children(parent_r: dict) -> tuple[list[dict], bool]:
+                ch_list = parent_r.get("children") or []
+                if not ch_list:
+                    return [], False
+                if kf == "companions":
+                    ch_list = [c for c in ch_list if (c.get("info") or {}).get("kind") in ("companion", "attachment")]
+                elif kf == "issues":
+                    ch_list = [c for c in ch_list if c.get("issues")]
+                elif kf == "limited_model":
+                    ch_list = [c for c in ch_list if (c.get("info") or {}).get("kind") in ("limited", "model")]
+                if not q:
+                    return ch_list, bool(parent_r.get("is_folder"))
+                matched = [c for c in ch_list if _row_matches_q(c, include_extra=True)]
+                if matched:
+                    return matched, True
+                if _row_matches_q(parent_r, include_extra=False):
+                    return ch_list, bool(parent_r.get("is_folder"))
+                return ch_list, bool(parent_r.get("is_folder"))
+
+            self.basic_tree.clear()
+            first_item: QTreeWidgetItem | None = None
+            for r in self.basic_all_items:
+                if not _kind_ok(r):
+                    continue
+                if q and not _row_matches_q(r, include_extra=True) and not any(
+                    _row_matches_q(c, include_extra=True) for c in r.get("children", ())
+                ):
+                    continue
+                top = QTreeWidgetItem([r["name"], r["status"], r["id"]])
+                top.setData(0, Qt.UserRole, r)
+                vis_children, expand_node = _visible_children(r)
+                for c in vis_children:
+                    ch_it = QTreeWidgetItem([c["name"], c["status"], c["id"]])
+                    ch_it.setData(0, Qt.UserRole, c)
+                    top.addChild(ch_it)
+                self.basic_tree.addTopLevelItem(top)
+                if expand_node and vis_children:
+                    top.setExpanded(True)
+                if first_item is None:
+                    first_item = top
+            if first_item is not None:
+                self.basic_tree.setCurrentItem(first_item)
+            self._on_basic_item_selected()
 
         def _selected_basic_item(self) -> dict | None:
-            sel = self.basic_table.selectedItems()
-            if not sel:
-                return None
-            it = self.basic_table.item(sel[0].row(), 0)
-            return it.data(Qt.UserRole) if it else None
+            it = self.basic_tree.currentItem()
+            return it.data(0, Qt.UserRole) if it else None
 
         def _on_basic_item_selected(self):
             r = self._selected_basic_item()
@@ -1471,51 +2042,139 @@ def launch_gui(root_path: Path):
                 self.btn_basic_inspect.setEnabled(False)
                 self.btn_basic_export1.setEnabled(False)
                 self.btn_basic_export2.setVisible(False)
+                self.btn_basic_export_group.setVisible(False)
+                self.chk_basic_shaders.setVisible(False)
+                self.chk_basic_bnk.setVisible(False)
                 return
             cat = r["cat"]
+            is_folder = bool(r.get("is_folder"))
             self.basic_title.setText(r["name"])
-            self.btn_basic_inspect.setEnabled(True)
-            self.btn_basic_export1.setEnabled(True)
-            self.btn_basic_export2.setVisible(cat == "characters")
+            can_inspect = (not is_folder) and (
+                bool(r.get("blocks")) or bool(r.get("path")) or bool(r.get("pck_paths")) or cat == "fonts"
+            )
+            self.btn_basic_inspect.setEnabled(can_inspect)
+            self.btn_basic_export1.setEnabled(not is_folder)
+            self.btn_basic_export2.setVisible((not is_folder) and cat in ("characters", "bangboo", "monsters", "npcs"))
+            mem_ids = r.get("family_member_ids") or []
+            self.btn_basic_export_group.setVisible(cat == "characters" and len(mem_ids) > 1)
+            self.chk_basic_shaders.setVisible(cat in ("characters", "bangboo", "monsters", "npcs", "weapons", "maps"))
+            self.chk_basic_bnk.setVisible(cat == "audio")
 
             lines = [f"Category : {cat}", f"ID / Key : {r['id']}", f"Status   : {r['status']}"]
-            if cat == "characters":
-                self.btn_basic_export1.setText("Export Whole Character")
+            info = r.get("info")
+            if info:
+                if cat == "characters":
+                    lines.append(f"Type     : {catalog.CHAR_KIND_LABELS.get(info['kind'], info['kind'])}")
+                    if info.get("base"):
+                        lines.append(f"Base     : {info['base']}")
+                    if info.get("family_display") and len(mem_ids) > 1:
+                        lines.append(f"Family   : {info['family_display']} ({len(mem_ids)} member(s))")
+                    lines.append(f"Meshes   : {info['mesh_count']} .blk")
+                    anim_src = f" (inherited from {info['anim_inherited_from']})" if info.get("anim_inherited_from") else ""
+                    lines.append(f"Animations: {info['anim_count']} clips{anim_src}")
+                elif cat in ("bangboo", "monsters", "npcs", "weapons"):
+                    lines.append(f"Type     : {info.get('kind', cat)}")
+                    lines.append(f"Meshes   : {info.get('mesh_count', 0)} .blk")
+                    lines.append(f"Animations: {info.get('anim_count', 0)} clips")
+                elif cat == "maps":
+                    lines.append(f"Type     : {catalog.MAP_CATEGORY_LABELS.get(info['category'], info['category'])}")
+                    if info.get("layer_of"):
+                        lines.append(f"Layer of : {info['layer_of']}")
+                    if info.get("variant_of"):
+                        lines.append(f"Duplicate of: {info['variant_of']}")
+                    if info["sectors"]:
+                        lines.append(f"Sectors  : {info['sectors']} (coverage {(info['coverage'] or 0) * 100:.0f}%)")
+                    if info.get("extra_scenes"):
+                        oz_m = load_oz_map_index().get(r["id"]) or {}
+                        ex_list = [
+                            str(e.get("cab") or e.get("blk") or "")
+                            for e in (oz_m.get("extra_scenes") or ())
+                            if isinstance(e, dict)
+                        ]
+                        lines.append(f"Extra scenes: {len(ex_list)} ({', '.join(ex_list)})")
+                for iss in r.get("issues", []):
+                    lines.append(f"! Issue  : {iss}")
+
+            if cat in ("characters", "bangboo", "monsters", "npcs", "weapons"):
+                btn_lbls = {
+                    "characters": "Export Whole Character",
+                    "bangboo": "Export Bangboo (GLB)",
+                    "monsters": "Export Monster / Boss",
+                    "npcs": "Export NPC",
+                    "weapons": "Export 3D Model",
+                }
+                self.btn_basic_export1.setText(btn_lbls[cat])
                 self.btn_basic_export2.setText("Export Animations Only")
-                cdir = cfg.FINAL_ROOT / "Characters" / r["id"]
-                lines.append(f"Blocks   : {', '.join(r['blocks'][:15])}")
-                if cdir.exists():
-                    files = sorted(str(p.relative_to(cdir)) for p in cdir.rglob("*") if p.is_file())
+                if len(mem_ids) > 1:
+                    self.btn_basic_export_group.setText(f"Export Family ({len(mem_ids)})")
+                if r.get("blocks"):
+                    lines.append(f"Blocks   : {', '.join(r['blocks'][:15])}")
+                if is_folder:
+                    lines.append(f"Subgroup contains {len(r.get('children') or [])} item(s). Expand to select and export one.")
+                exp_dir = {
+                    "characters": cfg.FINAL_ROOT / "Characters" / r["id"],
+                    "bangboo": cfg.FINAL_ROOT / "Exports" / r["id"],
+                    "monsters": cfg.FINAL_ROOT / "Exports" / "Monsters" / r["id"],
+                    "npcs": cfg.FINAL_ROOT / "Exports" / "NPCs" / r["id"],
+                    "weapons": cfg.FINAL_ROOT / "Exports" / ("Weapons" if r.get("category_src") == "weapons" else "Props") / r["id"],
+                }.get(cat)
+                if exp_dir and exp_dir.exists():
+                    files = sorted(str(p.relative_to(exp_dir)) for p in exp_dir.rglob("*") if p.is_file())
                     lines.append(f"\nExported Files ({len(files)}):")
                     lines.extend(f"  - {f}" for f in files[:30])
             elif cat == "maps":
                 self.btn_basic_export1.setText("Export Curated Map (GLB)")
                 lines.append(f"Blocks ({len(r['blocks'])}): {', '.join(r['blocks'][:20])}")
-            elif cat == "textures":
-                self.btn_basic_export1.setText("Export Section Texture2Ds")
+            elif cat == "media2d":
+                sk = r.get("subkind")
+                self.btn_basic_export1.setText(
+                    "Export UI Sprite Pack" if sk == "sprite_pack"
+                    else "Export Spine 2D Rig" if sk == "spine"
+                    else "Export Section Texture2Ds"
+                )
                 lines.append(f"Blocks ({len(r['blocks'])}): {', '.join(r['blocks'][:20])}")
                 if r.get("samples"):
-                    lines.append("\nSample Asset Paths:")
+                    lines.append("\nSample Assets:")
                     lines.extend(f"  - {s}" for s in r["samples"])
             elif cat == "audio":
-                self.btn_basic_export1.setText("Unpack .pck Audio")
-                lines.append(f"File Path: {r['path']}")
+                if r.get("subkind") == "mapped_group":
+                    self.btn_basic_export1.setText("Extract Mapped Group")
+                    lines.append(f"Source .pck(s): {', '.join(Path(p).name for p in r.get('pck_paths', [])[:10])}")
+                    lines.append(f"Entries  : {r.get('count', 0)} (SoundBanks: {r.get('bnk_count', 0)})")
+                else:
+                    self.btn_basic_export1.setText("Unpack .pck Audio")
+                    lines.append(f"File Path: {r.get('path', '')}")
             elif cat == "fonts":
-                self.btn_basic_export1.setText("Export All Fonts (TTF/OTF)")
+                if r.get("subkind") == "data_pack":
+                    self.btn_basic_export1.setText("Export Data Pack")
+                    lines.append(f"Blocks ({len(r['blocks'])}): {', '.join(r['blocks'][:20])}")
+                    if r.get("samples"):
+                        lines.append("\nSample Assets:")
+                        lines.extend(f"  - {s}" for s in r["samples"])
+                else:
+                    self.btn_basic_export1.setText("Export All Fonts (TTF/OTF)")
+                    if r.get("blocks"):
+                        lines.append(f"Font Blocks ({len(r['blocks'])}): {', '.join(r['blocks'][:20])}")
             self.basic_info.setPlainText("\n".join(lines))
 
         def _basic_inspect_in_advanced(self):
             r = self._selected_basic_item()
-            if not r:
+            if not r or r.get("is_folder"):
                 return
             cat = r["cat"]
             self._switch_mode(1)
-            if cat in ("characters", "maps", "textures"):
+            if cat in ("characters", "bangboo", "monsters", "npcs", "weapons", "maps", "media2d"):
                 self._open_block_group(f"{cat.title()}: {r['name']}", r.get("blocks", []))
             elif cat == "audio":
-                self.open_akpk(Path(r["path"]))
+                if r.get("path"):
+                    self.open_akpk(Path(r["path"]))
+                elif r.get("pck_paths"):
+                    self.open_akpk(Path(r["pck_paths"][0]))
             elif cat == "fonts":
-                self.open_directory(self.files_root / "Blocks")
+                if r.get("blocks"):
+                    self._open_block_group(f"Fonts / Data: {r['name']}", r.get("blocks", []))
+                else:
+                    self.open_directory(self.files_root / "Blocks")
 
         def _run_basic_export(self, title: str, fn):
             dlg = QDialog(self)
@@ -1540,7 +2199,7 @@ def launch_gui(root_path: Path):
 
         def _basic_export_primary(self):
             r = self._selected_basic_item()
-            if not r:
+            if not r or r.get("is_folder"):
                 return
             cat = r["cat"]
             out = QFileDialog.getExistingDirectory(self, "Select Export Destination", str(cfg.FINAL_ROOT / "Exports"))
@@ -1548,10 +2207,17 @@ def launch_gui(root_path: Path):
                 return
             out_dir = Path(out)
             export_shaders = self.chk_basic_shaders.isChecked()
-            if cat == "characters":
+            extract_bnk = self.chk_basic_bnk.isChecked()
+            if cat in ("characters", "bangboo"):
                 self._run_basic_export(
                     f"Exporting {r['name']}",
                     lambda cb: export_character_full(r["id"], out_dir=out_dir, convert_glb=True, log_cb=cb, game_root=self.game_root, export_shaders=export_shaders),
+                )
+            elif cat in ("monsters", "npcs", "weapons"):
+                ent_cat = r.get("category_src") if cat == "weapons" else cat
+                self._run_basic_export(
+                    f"Exporting {r['name']}",
+                    lambda cb: export_entity_full(r["id"], category=ent_cat, out_dir=out_dir, convert_glb=True, log_cb=cb, game_root=self.game_root, export_shaders=export_shaders),
                 )
             elif cat == "maps":
                 self._run_basic_export(
@@ -1561,39 +2227,89 @@ def launch_gui(root_path: Path):
                         out_dir=out_dir, log_cb=cb, game_root=self.game_root, export_shaders=export_shaders,
                     ),
                 )
-            elif cat == "textures":
-                blks = [self.files_root / "Blocks" / os.path.basename(b) for b in r.get("blocks", [])]
-                blks = [b for b in blks if b.is_file()]
-                def run_sec(cb):
-                    rc = 0
-                    for b in blks:
-                        rc = export_blk_asset_types(b, out_dir / r["id"].replace("/", "_"), ["Texture2D", "Sprite"], "Convert", log_cb=cb)
-                    return rc
-                self._run_basic_export(f"Exporting Texture2D: {r['name']}", run_sec)
+            elif cat == "media2d":
+                sk = r.get("subkind")
+                if sk == "sprite_pack":
+                    self._run_basic_export(
+                        f"Exporting UI Pack: {r['name']}",
+                        lambda cb: export_ui_sprite_group(r["id"], self.game_root, out_dir, log_cb=cb),
+                    )
+                elif sk == "spine":
+                    self._run_basic_export(
+                        f"Exporting Spine 2D: {r['name']}",
+                        lambda cb: export_spine_rig(r["id"], self.game_root, out_dir, log_cb=cb),
+                    )
+                else:
+                    self._run_basic_export(
+                        f"Exporting Texture2D: {r['name']}",
+                        lambda cb: export_texture_section(r["id"], r.get("blocks", []), self.game_root, out_dir, log_cb=cb),
+                    )
             elif cat == "audio":
-                self._run_basic_export(
-                    f"Unpacking {r['name']} (AnimeWwise Auto-Named)",
-                    lambda cb: export_audio_pck(
-                        Path(r["path"]), out_dir / "Audio",
-                        use_wwise_map=True, decode_wav=cfg.VGMSTREAM_CLI.is_file(), log_cb=cb,
-                    ),
-                )
+                if r.get("subkind") == "mapped_group":
+                    self._run_basic_export(
+                        f"Extracting Audio: {r['name']}",
+                        lambda cb: export_audio_entries(
+                            r.get("entries", []), out_dir / "Audio",
+                            decode_wav=cfg.VGMSTREAM_CLI.is_file(), extract_bnk=extract_bnk, log_cb=cb,
+                        ),
+                    )
+                else:
+                    self._run_basic_export(
+                        f"Unpacking {r['name']} (AnimeWwise Auto-Named)",
+                        lambda cb: export_audio_pck(
+                            Path(r["path"]), out_dir / "Audio",
+                            use_wwise_map=True, decode_wav=cfg.VGMSTREAM_CLI.is_file(),
+                            extract_bnk=extract_bnk, log_cb=cb,
+                        ),
+                    )
             elif cat == "fonts":
-                self._run_basic_export(
-                    "Exporting Fonts",
-                    lambda cb: export_blk_asset_types(self.files_root / "Blocks", out_dir / "Fonts", ["Font"], "Convert", log_cb=cb),
-                )
+                if r.get("subkind") == "data_pack":
+                    self._run_basic_export(
+                        f"Exporting {r['name']}",
+                        lambda cb: export_data_pack(r["pack_key"], self.game_root, out_dir, log_cb=cb),
+                    )
+                else:
+                    self._run_basic_export(
+                        "Exporting Fonts",
+                        lambda cb: export_fonts(self.game_root, out_dir / "Fonts", log_cb=cb),
+                    )
 
         def _basic_export_secondary(self):
             r = self._selected_basic_item()
-            if not r or r["cat"] != "characters":
+            if not r or r.get("is_folder") or r["cat"] not in ("characters", "bangboo", "monsters", "npcs"):
                 return
             out = QFileDialog.getExistingDirectory(self, "Select Animations Destination", str(cfg.FINAL_ROOT / "Exports"))
             if not out:
                 return
+            cat = r["cat"]
+            if cat in ("characters", "bangboo"):
+                self._run_basic_export(
+                    f"Exporting Animations: {r['name']}",
+                    lambda cb: export_character_animations_only(r["id"], self.game_root, Path(out), log_cb=cb),
+                )
+            else:
+                self._run_basic_export(
+                    f"Exporting Animations: {r['name']}",
+                    lambda cb: export_entity_animations_only(r["id"], self.game_root, Path(out), category=cat, log_cb=cb),
+                )
+
+        def _basic_export_group(self):
+            r = self._selected_basic_item()
+            if not r or r["cat"] != "characters":
+                return
+            mem_ids = r.get("family_member_ids") or []
+            if len(mem_ids) <= 1:
+                return
+            out = QFileDialog.getExistingDirectory(self, "Select Family Export Destination", str(cfg.FINAL_ROOT / "Exports"))
+            if not out:
+                return
+            export_shaders = self.chk_basic_shaders.isChecked()
             self._run_basic_export(
-                f"Exporting Animations: {r['name']}",
-                lambda cb: export_character_animations_only(r["id"], self.game_root, Path(out), log_cb=cb),
+                f"Exporting Family: {r['name']} ({len(mem_ids)} members)",
+                lambda cb: export_character_family(
+                    mem_ids, Path(out), convert_glb=True, log_cb=cb,
+                    game_root=self.game_root, export_shaders=export_shaders,
+                ),
             )
 
         def _refresh_current_view(self):
@@ -1718,6 +2434,9 @@ def launch_gui(root_path: Path):
             self.curated_maps = load_curated_map_index()
             self.char_blocks = self._load_char_blocks()
             self.char_names = load_character_names()
+            self.entities_index = load_oz_entities_index()
+            self.media_index = load_oz_media_index()
+            self.audio_groups_cache = None
             self._populate_tree()
             self._populate_basic_categories()
             self._refresh_version_badge()
@@ -1727,9 +2446,14 @@ def launch_gui(root_path: Path):
             for fname in (
                 "manifest.json",
                 "zzz_assets_map.json",
+                "oz_maps_index.json",
+                "oz_characters_index.json",
+                "oz_entities_index.json",
+                "oz_media_index.json",
                 "character_index_auto.json",
                 "stage_index_auto.json",
                 "fonts_index_auto.json",
+                "shaders_index_auto.json",
             ):
                 p = map_dir / fname
                 if p.exists():
@@ -1753,7 +2477,9 @@ def launch_gui(root_path: Path):
                     self.open_directory(self.files_root)
 
         def go_up(self):
-            if self.current_mode in ("blk", "akpk") and self.current_container:
+            if self.current_mode == "bnk" and self.current_bnk_parent and self.current_bnk_parent.is_file():
+                self.open_akpk(self.current_bnk_parent)
+            elif self.current_mode in ("blk", "akpk", "bnk") and self.current_container:
                 self.open_directory(self.current_container.parent)
             elif self.current_dir and self.current_dir.parent != self.current_dir:
                 self.open_directory(self.current_dir.parent)
@@ -1767,6 +2493,8 @@ def launch_gui(root_path: Path):
                     self.open_blk(p)
                 elif p.suffix.lower() == ".pck":
                     self.open_akpk(p)
+                elif p.suffix.lower() == ".bnk":
+                    self.open_bnk(p, str(p))
 
         def open_directory(self, path: Path):
             self.current_mode = "dir"
@@ -1795,13 +2523,20 @@ def launch_gui(root_path: Path):
             self.path_bar.setText(label)
             blocks_dir = self.files_root / "Blocks"
             rows = []
+            seen: set[str] = set()
             for bn in blk_names:
-                p = blocks_dir / os.path.basename(bn)
-                if p.exists():
+                p = cfg.resolve_blk_path(self.game_root, str(bn))
+                disp_name = p.name if p is not None else os.path.basename(str(bn))
+                key_n = str(p) if p is not None else disp_name
+                if key_n in seen:
+                    continue
+                seen.add(key_n)
+                if p is not None and p.exists():
                     magic, _ = detect_magic(p)
                     rows.append({"name": p.name, "type": magic, "size": p.stat().st_size, "details": str(p), "path": str(p), "is_dir": False})
                 else:
-                    rows.append({"name": os.path.basename(bn), "type": "Missing .blk", "size": -1, "details": str(p), "path": str(p), "is_dir": False})
+                    cand = blocks_dir / os.path.basename(str(bn))
+                    rows.append({"name": os.path.basename(str(bn)), "type": "Missing .blk", "size": -1, "details": str(cand), "path": str(cand), "is_dir": False})
             self._set_rows(rows)
             self.status.showMessage(f"{label} — {len(rows)} .blk files")
 
@@ -1861,7 +2596,7 @@ def launch_gui(root_path: Path):
                 return
             p = Path(r["path"])
             self.btn_open_view.setEnabled(True)
-            self.btn_export.setEnabled(self.current_mode in ("blk", "akpk") or p.is_file())
+            self.btn_export.setEnabled(self.current_mode in ("blk", "akpk", "bnk") or p.is_file())
             is_blk_tex = (
                 self.current_mode == "blk"
                 and r["type"] in ("Texture2D", "Sprite")
@@ -1916,10 +2651,23 @@ def launch_gui(root_path: Path):
                     f"Size: {r['size']:,} bytes ({human_size(r['size'])})",
                     f"Language ID: {r.get('lang_id')}",
                 ]
+                if r["type"] == "Wwise BNK":
+                    info.append("Hint: Double-click or click Open/View to inspect embedded DIDX/DATA WEM streams.")
                 self.props_view.setPlainText("\n".join(info))
                 if self.current_container and self.current_container.exists():
                     self.hex_file = self.current_container
                     self._load_hex_chunk(r["offset"])
+            elif self.current_mode == "bnk":
+                info = [
+                    f"Embedded WEM: {r['name']}",
+                    f"WEM ID: {r.get('id')}",
+                    f"Offset in .bnk: 0x{r['offset']:X} ({r['offset']:,})",
+                    f"Size: {r['size']:,} bytes ({human_size(r['size'])})",
+                ]
+                self.props_view.setPlainText("\n".join(info))
+                if self.current_container and self.current_container.exists():
+                    self.hex_file = self.current_container
+                    self._load_hex_chunk(self.current_bnk_parent_offset + r["offset"])
 
         def open_selected_item(self):
             r = self._selected_row()
@@ -1928,10 +2676,22 @@ def launch_gui(root_path: Path):
             p = Path(r["path"])
             if r.get("is_dir"):
                 self.open_directory(p)
-            elif p.is_file() and p.suffix.lower() == ".blk":
+            elif self.current_mode == "akpk" and r["type"] == "Wwise BNK" and self.current_container and self.current_container.is_file():
+                with self.current_container.open("rb") as fh:
+                    fh.seek(r["offset"])
+                    raw_bnk = fh.read(r["size"])
+                self.open_bnk(
+                    raw_bnk,
+                    f"{self.current_container} :: {r['name']}",
+                    parent_pck=self.current_container,
+                    parent_offset=r["offset"],
+                )
+            elif p.is_file() and p.suffix.lower() == ".blk" and self.current_mode in ("dir", "group"):
                 self.open_blk(p)
-            elif p.is_file() and p.suffix.lower() == ".pck":
+            elif p.is_file() and p.suffix.lower() == ".pck" and self.current_mode == "dir":
                 self.open_akpk(p)
+            elif p.is_file() and p.suffix.lower() == ".bnk" and self.current_mode == "dir":
+                self.open_bnk(p, str(p))
             elif self.current_mode == "blk" and r["type"] in ("Texture2D", "Sprite"):
                 self.preview_selected_texture()
             elif p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
@@ -1972,6 +2732,9 @@ def launch_gui(root_path: Path):
                 return
             self.current_mode = "akpk"
             self.current_container = pck_path
+            self.current_bnk_bytes = None
+            self.current_bnk_parent = None
+            self.current_bnk_parent_offset = 0
             self.path_bar.setText(str(pck_path))
             rows = [{
                 "name": e["name"],
@@ -1985,6 +2748,30 @@ def launch_gui(root_path: Path):
             } for e in parsed["entries"]]
             self._set_rows(rows)
             self.status.showMessage(f"AKPK: {pck_path.name} — {len(rows)} embedded audio entries")
+
+        def open_bnk(self, bnk_source: Path | bytes, label: str, parent_pck: Path | None = None, parent_offset: int = 0):
+            raw = bnk_source.read_bytes() if isinstance(bnk_source, Path) else bnk_source
+            parsed = parse_bnk(raw)
+            if parsed.get("error"):
+                QMessageBox.warning(self, "BNK Parse Error", parsed["error"])
+                return
+            self.current_mode = "bnk"
+            self.current_bnk_bytes = raw
+            self.current_bnk_parent = parent_pck
+            self.current_bnk_parent_offset = parent_offset
+            self.current_container = parent_pck or (bnk_source if isinstance(bnk_source, Path) else None)
+            self.path_bar.setText(label)
+            rows = [{
+                "name": e["name"],
+                "type": e["type"],
+                "size": e["size"],
+                "details": f"bnk_id={parsed.get('bank_id')} chunks={','.join(parsed.get('chunks', []))} offset=0x{e['offset']:X}",
+                "path": str(self.current_container or label),
+                "offset": e["offset"],
+                "id": e["id"],
+            } for e in parsed["entries"]]
+            self._set_rows(rows)
+            self.status.showMessage(f"BNK SoundBank ({len(rows)} embedded WEM streams)")
 
         def load_selected_blk(self):
             r = self._selected_row()
@@ -2050,6 +2837,10 @@ def launch_gui(root_path: Path):
                     src.seek(r["offset"])
                     dest.write_bytes(src.read(r["size"]))
                 self.status.showMessage(f"Exported {dest}")
+            elif self.current_mode == "bnk" and self.current_bnk_bytes is not None:
+                dest = dest_root / r["name"]
+                dest.write_bytes(self.current_bnk_bytes[r["offset"] : r["offset"] + r["size"]])
+                self.status.showMessage(f"Extracted BNK WEM -> {dest}")
             elif self.current_mode == "blk" and self.current_container:
                 shutil.copy2(r["path"], dest_root / Path(r["path"]).name)
                 self.status.showMessage(f"Copied JSON to {dest_root}")

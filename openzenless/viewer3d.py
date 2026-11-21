@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QTreeWidget,
@@ -3717,6 +3718,9 @@ class NativeViewerWidget(QWidget):
         bar = QHBoxLayout()
         self.status_lbl = QLabel("Native 3D GLB Viewer — Select a Character or Map")
         self.status_lbl.setStyleSheet("color: #94a3b8; font-weight: 600;")
+        # Long status text must never force the window wider than the screen.
+        self.status_lbl.setMinimumWidth(0)
+        self.status_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         bar.addWidget(self.status_lbl, 1)
 
         if choose_output_cb is not None:
@@ -3764,14 +3768,24 @@ class NativeViewerWidget(QWidget):
         self.btn_lod.setChecked(True)
         self.btn_lod.toggled.connect(self._toggle_zoom_lod)
 
-        for b in (btn_open, btn_refresh, btn_reset, self.btn_wire, self.btn_tex, self.btn_skybox, self.btn_fly, self.btn_toon, self.toon_preset_combo, self.btn_cull, self.btn_lod):
+        for b in (btn_open, btn_refresh, btn_reset):
             bar.addWidget(b)
         root.addLayout(bar)
+
+        view_bar = QHBoxLayout()
+        for b in (self.btn_wire, self.btn_tex, self.btn_skybox, self.btn_fly, self.btn_toon, self.toon_preset_combo, self.btn_cull, self.btn_lod):
+            view_bar.addWidget(b)
+        view_bar.addStretch(1)
+        self.toon_preset_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.toon_preset_combo.setMinimumContentsLength(14)
+        root.addLayout(view_bar)
 
         anim_bar = QHBoxLayout()
         anim_bar.addWidget(QLabel("Animation:"))
         self.anim_combo = QComboBox()
-        self.anim_combo.setMinimumWidth(220)
+        self.anim_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.anim_combo.setMinimumContentsLength(18)
+        self.anim_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.anim_combo.currentIndexChanged.connect(self._on_anim_combo_changed)
         anim_bar.addWidget(self.anim_combo)
 
@@ -3855,10 +3869,46 @@ class NativeViewerWidget(QWidget):
         self.btn_fly.blockSignals(False)
 
     @staticmethod
+    def _lookup_oz_kind(path: Path) -> str | None:
+        from .indexer import load_oz_character_index, load_oz_entities_index, load_oz_map_index
+
+        stem = path.stem
+        stem_no_full = stem[:-5] if stem.lower().endswith("_full") else stem
+        parent = path.parent.name
+        par2 = path.parent.parent.name if path.parent.parent != path.parent else ""
+        cands = tuple(c.lower() for c in (stem, stem_no_full, parent, par2) if c)
+
+        oz_maps = load_oz_map_index()
+        if oz_maps:
+            map_ci = {k.lower() for k in oz_maps}
+            if any(c in map_ci for c in cands):
+                return "map"
+        oz_chars = load_oz_character_index()
+        if oz_chars:
+            char_ci = {k.lower() for k in oz_chars}
+            if any(c in char_ci for c in cands):
+                return "char"
+        oz_ents = load_oz_entities_index()
+        if oz_ents:
+            ent_ci = {k.lower() for cat_m in oz_ents.values() if isinstance(cat_m, dict) for k in cat_m}
+            if any(c in ent_ci for c in cands):
+                return "char"
+        return None
+
+    @staticmethod
     def _is_map_scene(scene: GLScene) -> bool:
+        oz_kind = NativeViewerWidget._lookup_oz_kind(scene.source_path)
+        if oz_kind == "map":
+            return True
+        if oz_kind == "char":
+            return False
         nm = scene.source_path.stem.lower()
         pr = str(scene.source_path.parent).lower()
         if nm.startswith("avatar_") or "avatar_" in pr:
+            return False
+        if (nm.startswith("bangboo_") or "bangboo_" in pr) and not any(
+            t in nm or t in pr for t in ("amusement", "autochess", "knockout", "megarobot", "platformer", "pinball")
+        ) and len(scene.submeshes) <= 40:
             return False
         has_char_rig = bool(
             scene.bones
@@ -3874,7 +3924,12 @@ class NativeViewerWidget(QWidget):
             return True
         return any(
             t in nm or t in pr
-            for t in ("stage", "map", "env_", "site", "mine", "ring", "suburbs", "skyscraper", "roscaelifer", "maincity", "street")
+            for t in (
+                "stage", "map", "env_", "site", "mine", "ring", "suburbs",
+                "skyscraper", "roscaelifer", "whitfield", "maincity", "street",
+                "fortune", "reverbarena", "handoffice", "beach", "amusementpark",
+                "hiddenreef", "airshipport", "belltowersquare",
+            )
         )
 
     def _toggle_toon(self, checked: bool):
@@ -3921,8 +3976,33 @@ class NativeViewerWidget(QWidget):
             cfg.FINAL_ROOT / "Maps_Combined",
             cfg.FINAL_ROOT,
         ]
+        from . import catalog as _cat
+        from .indexer import load_oz_character_index, load_oz_entities_index, load_oz_map_index
+
+        map_ci = {k.lower() for k in load_oz_map_index()}
+        oz_chars = load_oz_character_index()
+        bangboo_ci = {k.lower() for k in _cat.classify_bangboo(oz_chars)}
+        char_ci = {k.lower() for k in oz_chars} - bangboo_ci
+        ents = load_oz_entities_index()
+        monster_ci = {k.lower() for k in (ents.get("monsters") or {})}
+        npc_ci = {k.lower() for k in (ents.get("npcs") or {})}
+        weapon_ci = {
+            k.lower()
+            for ck in ("weapons", "props")
+            for k in (ents.get(ck) or {})
+        }
+        map_tokens = (
+            "stage", "map", "env_", "site", "mine", "ring", "suburbs",
+            "skyscraper", "roscaelifer", "whitfield", "maincity", "fortune",
+            "reverbarena", "handoffice", "beach", "amusementpark", "hiddenreef",
+            "airshipport", "belltowersquare", "bangboo",
+        )
         seen: set[Path] = set()
         chars_node = QTreeWidgetItem(self.tree, ["Characters"])
+        bangboo_node = QTreeWidgetItem(self.tree, ["Bangboo"])
+        monsters_node = QTreeWidgetItem(self.tree, ["Monsters & Bosses"])
+        npcs_node = QTreeWidgetItem(self.tree, ["NPCs"])
+        weapons_node = QTreeWidgetItem(self.tree, ["W-Engines & Props"])
         maps_node = QTreeWidgetItem(self.tree, ["Maps / Stages"])
         other_node = QTreeWidgetItem(self.tree, ["Other Models"])
 
@@ -3935,9 +4015,25 @@ class NativeViewerWidget(QWidget):
                     continue
                 seen.add(rp)
                 name = glb.stem
-                if name.startswith("Avatar_") or glb.parent.name.startswith("Avatar_"):
+                nlow = name.lower()
+                n_nofull = nlow[:-5] if nlow.endswith("_full") else nlow
+                plow = glb.parent.name.lower()
+                par_full = str(glb.parent).lower()
+                cands = (nlow, plow)
+                is_bb_minigame = any(t in nlow or t in par_full for t in ("amusement", "autochess", "knockout", "megarobot", "platformer", "pinball"))
+                if any(c in map_ci for c in (nlow, n_nofull, plow)):
+                    parent = maps_node
+                elif any(c in bangboo_ci for c in cands) or (name.startswith(("Bangboo_", "Avatar_Bangboo_")) and not is_bb_minigame):
+                    parent = bangboo_node
+                elif any(c in monster_ci for c in cands) or name.startswith("Monster_"):
+                    parent = monsters_node
+                elif any(c in npc_ci for c in cands) or name.startswith("NPC_"):
+                    parent = npcs_node
+                elif any(c in weapon_ci for c in cands) or name.startswith(("Weapon_", "Device_", "Item_", "Destruction_")):
+                    parent = weapons_node
+                elif any(c in char_ci for c in cands) or name.startswith("Avatar_") or glb.parent.name.startswith("Avatar_"):
                     parent = chars_node
-                elif any(t in name or t in str(glb.parent) for t in ("Stage", "Map", "Env_", "Site", "Mine", "Ring", "Suburbs", "SkyScraper")):
+                elif "maps_combined" in par_full or any(t in nlow or t in par_full for t in map_tokens):
                     parent = maps_node
                 else:
                     parent = other_node
@@ -3945,9 +4041,11 @@ class NativeViewerWidget(QWidget):
                 it.setData(0, Qt.UserRole, str(glb))
                 it.setToolTip(0, str(glb))
 
-        for node in (chars_node, maps_node, other_node):
+        for node in (chars_node, bangboo_node, monsters_node, npcs_node, weapons_node, maps_node, other_node):
             node.setExpanded(True)
             node.setText(0, f"{node.text(0)} ({node.childCount()})")
+            if node not in (chars_node, maps_node) and node.childCount() == 0:
+                node.setHidden(True)
         self.status_lbl.setText(f"Native 3D Viewer • {len(seen)} .glb model(s) in {cfg.FINAL_ROOT}")
 
     def _filter_tree(self, txt: str):
