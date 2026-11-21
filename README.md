@@ -29,7 +29,7 @@
 ---
 
 > [!WARNING]
-> **Experimental Linux-first release:** OpenZenless is under active development and may not work out of the box on every system. Native Windows support is not yet verified — the app currently targets **Linux** (with `Wine` for `AnimeStudio.CLI.exe`).
+> **RELEASE NOTES:** OpenZenless is under (somewhat) active development and may not work out of the box on every system. Native Windows support is not yet verified and the app currently targets **Linux** (with `Wine` for `AnimeStudio.CLI.exe`).
 
 ---
 
@@ -58,7 +58,7 @@ Powered by the **OZ v4 Indexer** (`AnimeStudio.CLI` + `openzenless/catalog.py`),
 - Inspect block counts, container lists, and existing exports at a glance before exporting.
 - One-click **Export Whole Character / Entity**, **Export Animations Only**, **Export Family**, optional **Shaders** and **Extract `.bnk` WEMs** toggles, plus **Open in Advanced Mode** to jump straight to the underlying `.blk` files.
 
-### 2. Advanced Mode — OpenIV-Style Archive & Hex Inspector
+### 2. Advanced Mode — Specialised Archive & Hex Inspector
 - Browse `Blocks/`, `Audio/`, `il2cpp/Metadata/`, `Video/`, extracted split APKs, and virtual Stage/Character bookmarks.
 - Natively unpack and inspect **Wwise `.pck` (`AKPK`)** packages and **`.bnk` SoundBanks** directly in the file table.
 - Dump Unity asset JSONs from `.blk` containers via `AnimeStudio.CLI.exe`, preview decoded PNG/JPG/WebP textures, or inspect raw binaries in a **4 KB paged Hex + ASCII viewer** with `0x...` offset jumping.
