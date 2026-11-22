@@ -663,7 +663,7 @@ def has_asset_map(game_root: Path) -> bool:
                 has_core = (cfg.CACHE_DIR / "asset_map" / "oz_maps_index.json").is_file() and (cfg.CACHE_DIR / "asset_map" / "oz_characters_index.json").is_file()
                 has_supp = (cfg.CACHE_DIR / "asset_map" / "oz_entities_index.json").is_file() and (cfg.CACHE_DIR / "asset_map" / "oz_media_index.json").is_file()
                 can_rebuild_cli = (files_root / "Blocks").exists() and cfg.CLI_EXE.is_file()
-                min_ver = 4 if can_rebuild_cli else 2
+                min_ver = 5 if can_rebuild_cli else 2
                 if has_core and data.get("oz_index_version", 0) >= min_ver and (not can_rebuild_cli or has_supp):
                     return True
                 if data.get("user_skipped"):
@@ -706,7 +706,7 @@ def _parse_cli_asset_map(
     mat_mesh_blocks: dict[str, dict[str, int]] = {}
     mesh_pref_counts: dict[str, dict[str, int]] = {}
     hlod_mesh_blks: set[str] = set()
-    _HLOD_MESH_RE = re.compile(r"^(?:[A-Z]{1,3}|BRG)_[0-9]+_HLOD")
+    _HLOD_MESH_RE = re.compile(r"^[A-Z][A-Z0-9]{0,5}_[0-9]+_HLOD")
     _TECH_MESH_PREFS = frozenset((
         "curveplacetool", "interiorsegment", "combinegroundquadmesh", "volumetricfog",
         "loop", "roof", "dynamicobjects", "weathergroup", "eff", "device",
@@ -1290,7 +1290,7 @@ def _build_oz_indexes_from_jsonl(
     total_blk_count: int | None = None,
     log_cb=None,
 ) -> tuple[int, int, int]:
-    """Parse lightweight AnimeStudio AS_DUMP_OZ_INDEX JSONL shard(s) -> OZ v4 indexes & Maps/ZZZ.bin."""
+    """Parse lightweight AnimeStudio AS_DUMP_OZ_INDEX JSONL shard(s) -> OZ v5 indexes & Maps/ZZZ.bin."""
     paths = [jsonl_paths] if isinstance(jsonl_paths, Path) else list(jsonl_paths)
     files_root = cfg.resolve_files_root(game_root)
     order_map = cfg.load_res_version_order(files_root)
@@ -1711,7 +1711,7 @@ def _build_oz_indexes_from_jsonl(
     )
 
     (map_dir / "oz_maps_index.json").write_text(
-        json.dumps({"version": 4, "maps": maps_dict}, indent=2),
+        json.dumps({"version": 5, "maps": maps_dict}, indent=2),
         encoding="utf-8",
     )
     (map_dir / "oz_characters_index.json").write_text(
@@ -1787,7 +1787,7 @@ def _build_oz_indexes_from_jsonl(
 
     _emit(
         log_cb,
-        f"Built OZ v4 indexes: {len(chars_dict)} characters, "
+        f"Built OZ v5 indexes: {len(chars_dict)} characters, "
         f"{len(entities_out['monsters'])} monsters, {len(entities_out['npcs'])} npcs, "
         f"{len(entities_out['weapons'])} weapons/acc, {len(entities_out['props'])} props, "
         f"{len(media_dict['spine'])} spine rigs, {len(maps_dict)} maps, {len(sorted_fonts)} font blocks",
@@ -2217,7 +2217,7 @@ def build_asset_map(
             or not oz_chars_file.is_file()
             or not oz_ents_file.is_file()
             or not oz_media_file.is_file()
-            or prev_ver < 4
+            or prev_ver < 5
             or need_cab
         )
     ):
@@ -2351,7 +2351,7 @@ def build_asset_map(
 
     manifest = {
         "files_root": str(files_root),
-        "oz_index_version": 4,
+        "oz_index_version": 5,
         "blk_count": len(blk_files),
         "pck_count": len(pck_files),
         "auto_characters": auto_chars,

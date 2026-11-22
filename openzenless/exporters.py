@@ -268,8 +268,42 @@ def _merge_glbs(chunk_paths: list[Path], out_path: Path, log_cb=None) -> int:
     img_sha_to_idx: dict[str, int] = {}
     sampler_to_idx: dict[str, int] = {}
     tex_to_idx: dict[tuple, int] = {}
+    seen_chunk_geo: set[tuple] = set()
     bin_parts: list[bytes] = []
     bin_len = 0
+
+    def _mat4_from_nd(nd: dict) -> list[list[float]]:
+        if "matrix" in nd:
+            m = nd["matrix"]
+            return [
+                [float(m[0]), float(m[4]), float(m[8]), float(m[12])],
+                [float(m[1]), float(m[5]), float(m[9]), float(m[13])],
+                [float(m[2]), float(m[6]), float(m[10]), float(m[14])],
+                [float(m[3]), float(m[7]), float(m[11]), float(m[15])],
+            ]
+        t = nd.get("translation") or (0.0, 0.0, 0.0)
+        q = nd.get("rotation") or (0.0, 0.0, 0.0, 1.0)
+        s = nd.get("scale") or (1.0, 1.0, 1.0)
+        x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        sx, sy, sz = float(s[0]), float(s[1]), float(s[2])
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        xw, yw, zw = x * w, y * w, z * w
+        return [
+            [(1.0 - 2.0 * (yy + zz)) * sx, (2.0 * (xy - zw)) * sy, (2.0 * (xz + yw)) * sz, float(t[0])],
+            [(2.0 * (xy + zw)) * sx, (1.0 - 2.0 * (xx + zz)) * sy, (2.0 * (yz - xw)) * sz, float(t[1])],
+            [(2.0 * (xz - yw)) * sx, (2.0 * (yz + xw)) * sy, (1.0 - 2.0 * (xx + yy)) * sz, float(t[2])],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+
+    def _mat4_mul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+        return [
+            [
+                a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] + a[r][3] * b[3][c]
+                for c in range(4)
+            ]
+            for r in range(4)
+        ]
 
     def _append_bin(raw_bytes: bytes) -> tuple[int, int]:
         nonlocal bin_len
@@ -414,13 +448,80 @@ def _merge_glbs(chunk_paths: list[Path], out_path: Path, log_cb=None) -> int:
         cam_base = len(cameras)
         cameras.extend(jdata.get("cameras", []))
 
+        c_scenes = jdata.get("scenes", [])
+        c_sidx = jdata.get("scene", 0)
+        c_nodes = jdata.get("nodes", [])
+        c_meshes = jdata.get("meshes", [])
+        c_accs = jdata.get("accessors", [])
+        skipped_mesh_nodes: set[int] = set()
+        if not jdata.get("animations") and c_scenes and c_sidx < len(c_scenes):
+            mesh_bounds: list[tuple[str, int, tuple[float, float, float] | None, tuple[float, float, float] | None]] = []
+            for cm in c_meshes:
+                bm = re.sub(r"(?:\.\d+|\s*\(\d+\))$", "", (cm.get("name") or "").lower()).strip()
+                mins_l: list[list[float]] = []
+                maxs_l: list[list[float]] = []
+                tris = 0
+                for pr in cm.get("primitives", []):
+                    pa_idx = (pr.get("attributes") or {}).get("POSITION")
+                    if pa_idx is not None and pa_idx < len(c_accs):
+                        pa = c_accs[pa_idx]
+                        if "min" in pa and "max" in pa:
+                            mins_l.append(pa["min"])
+                            maxs_l.append(pa["max"])
+                    if "indices" in pr and pr["indices"] < len(c_accs):
+                        tris += int(c_accs[pr["indices"]].get("count", 0)) // 3
+                if mins_l:
+                    lmin = (min(v[0] for v in mins_l), min(v[1] for v in mins_l), min(v[2] for v in mins_l))
+                    lmax = (max(v[0] for v in maxs_l), max(v[1] for v in maxs_l), max(v[2] for v in maxs_l))
+                else:
+                    lmin, lmax = None, None
+                mesh_bounds.append((bm, tris, lmin, lmax))
+
+            ident4 = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+            stack = [(rn, ident4) for rn in reversed(c_scenes[c_sidx].get("nodes", []))]
+            while stack:
+                ni, pm = stack.pop()
+                if ni < 0 or ni >= len(c_nodes):
+                    continue
+                cnd = c_nodes[ni]
+                wm = _mat4_mul(pm, _mat4_from_nd(cnd))
+                mi = cnd.get("mesh")
+                if mi is not None and mi < len(mesh_bounds):
+                    bm, tris, lmin, lmax = mesh_bounds[mi]
+                    if tris > 0 and lmin is not None and lmax is not None:
+                        xs = (lmin[0], lmax[0])
+                        ys = (lmin[1], lmax[1])
+                        zs = (lmin[2], lmax[2])
+                        wxs: list[float] = []
+                        wys: list[float] = []
+                        wzs: list[float] = []
+                        for cx in xs:
+                            for cy in ys:
+                                for cz in zs:
+                                    wxs.append(wm[0][0] * cx + wm[0][1] * cy + wm[0][2] * cz + wm[0][3])
+                                    wys.append(wm[1][0] * cx + wm[1][1] * cy + wm[1][2] * cz + wm[1][3])
+                                    wzs.append(wm[2][0] * cx + wm[2][1] * cy + wm[2][2] * cz + wm[2][3])
+                        gkey = (
+                            bm, tris,
+                            round(min(wxs), 4), round(min(wys), 4), round(min(wzs), 4),
+                            round(max(wxs), 4), round(max(wys), 4), round(max(wzs), 4),
+                        )
+                        if gkey in seen_chunk_geo:
+                            skipped_mesh_nodes.add(ni)
+                        else:
+                            seen_chunk_geo.add(gkey)
+                for ch in reversed(cnd.get("children", [])):
+                    stack.append((ch, wm))
+
         node_base = len(nodes)
         skin_base = len(skins)
-        for nd in jdata.get("nodes", []):
+        for ni, nd in enumerate(c_nodes):
             nc = dict(nd)
             if "children" in nc:
                 nc["children"] = [c + node_base for c in nc["children"]]
-            if "mesh" in nc:
+            if ni in skipped_mesh_nodes:
+                nc.pop("mesh", None)
+            elif "mesh" in nc:
                 nc["mesh"] += mesh_base
             if "skin" in nc:
                 nc["skin"] += skin_base
@@ -458,8 +559,6 @@ def _merge_glbs(chunk_paths: list[Path], out_path: Path, log_cb=None) -> int:
                 ac["channels"] = new_ch
             animations.append(ac)
 
-        c_scenes = jdata.get("scenes", [])
-        c_sidx = jdata.get("scene", 0)
         if c_scenes and c_sidx < len(c_scenes):
             merged["scenes"][0]["nodes"].extend(n + node_base for n in c_scenes[c_sidx].get("nodes", []))
 
@@ -574,25 +673,26 @@ def _blender_convert_chunk(
         f"fbxs = {fbx_list!r}\n"
         f"objs = {obj_list!r}\n"
         f"_is_char_dir = {char_name.startswith('Avatar_')!r}\n"
-        "def _import_fbx(fp):\n"
+        "_obj_import_rank = {}\n"
+        "def _import_fbx(fp, rank=0):\n"
         "    before = set(bpy.data.objects)\n"
         "    bpy.ops.import_scene.fbx(filepath=fp)\n"
-        "    if not _is_char_dir:\n"
-        "        return\n"
         "    new = [o for o in bpy.data.objects if o not in before]\n"
-        "    arms = [o for o in new if o.type == 'ARMATURE']\n"
-        "    if not arms:\n"
-        "        return\n"
-        "    ascale = min((max(abs(float(v)) for v in o.matrix_world.to_scale()) for o in arms), default=1.0)\n"
-        "    if not (0.0 < ascale < 0.1):\n"
-        "        return\n"
+        "    if _is_char_dir:\n"
+        "        arms = [o for o in new if o.type == 'ARMATURE']\n"
+        "        if arms:\n"
+        "            ascale = min((max(abs(float(v)) for v in o.matrix_world.to_scale()) for o in arms), default=1.0)\n"
+        "            if 0.0 < ascale < 0.1:\n"
+        "                for o in new:\n"
+        "                    bpy.data.objects.remove(o, do_unlink=True)\n"
+        "                bpy.ops.import_scene.fbx(filepath=fp, global_scale=1.0 / ascale)\n"
+        "                new = [o for o in bpy.data.objects if o not in before]\n"
+        "                print(f'Normalized FBX scale {ascale:.4f} -> 1.0: {fp}', flush=True)\n"
         "    for o in new:\n"
-        "        bpy.data.objects.remove(o, do_unlink=True)\n"
-        "    bpy.ops.import_scene.fbx(filepath=fp, global_scale=1.0 / ascale)\n"
-        "    print(f'Normalized FBX scale {ascale:.4f} -> 1.0: {fp}', flush=True)\n"
+        "        _obj_import_rank[o.as_pointer()] = rank\n"
         "for idx, fp in enumerate(fbxs, 1):\n"
         "    try:\n"
-        "        _import_fbx(fp)\n"
+        "        _import_fbx(fp, idx)\n"
         "        _stash()\n"
         "    except Exception as _e:\n"
         "        print(f'SKIP FBX {fp}: {_e}', flush=True)\n"
@@ -650,6 +750,29 @@ def _blender_convert_chunk(
         "    for o in _mesh_objs:\n"
         "        if o not in _non_proxy:\n"
         "            bpy.data.objects.remove(o, do_unlink=True)\n"
+        "if not _is_char_dir and _non_proxy:\n"
+        "    from mathutils import Vector as _Vec\n"
+        "    _seen_geo = set()\n"
+        "    _dup_removed = 0\n"
+        "    bpy.context.view_layer.update()\n"
+        "    for o in sorted(_non_proxy, key=lambda _o: _obj_import_rank.get(_o.as_pointer(), 999999)):\n"
+        "        if not o.data or len(o.data.vertices) == 0:\n"
+        "            continue\n"
+        "        _bm = _re.sub(r'(?:\\.[0-9]+|\\s*\\([0-9]+\\))$', '', o.data.name.lower()).strip()\n"
+        "        _mw = o.matrix_world\n"
+        "        _pts = [_mw @ _Vec(c) for c in o.bound_box]\n"
+        "        _gkey = (\n"
+        "            _bm, len(o.data.vertices), len(o.data.polygons),\n"
+        "            round(min(p.x for p in _pts), 4), round(min(p.y for p in _pts), 4), round(min(p.z for p in _pts), 4),\n"
+        "            round(max(p.x for p in _pts), 4), round(max(p.y for p in _pts), 4), round(max(p.z for p in _pts), 4),\n"
+        "        )\n"
+        "        if _gkey in _seen_geo:\n"
+        "            bpy.data.objects.remove(o, do_unlink=True)\n"
+        "            _dup_removed += 1\n"
+        "        else:\n"
+        "            _seen_geo.add(_gkey)\n"
+        "    if _dup_removed:\n"
+        "        print(f'Deduplicated {_dup_removed} exact co-planar duplicate mesh(es)', flush=True)\n"
         "def _has_base_tex(mat):\n"
         "    if not mat or not mat.use_nodes or not mat.node_tree:\n"
         "        return False\n"
@@ -663,10 +786,14 @@ def _blender_convert_chunk(
         "if _allow_fuzzy:\n"
         f"    pngs = [str(p) for p in sorted(__import__('pathlib').Path({str(char_dir)!r}).rglob('*.png'))]\n"
         f"    _mat_to_tex = {mat_to_tex!r}\n"
-        "    _png_by_stem = {os.path.splitext(os.path.basename(_p))[0].lower(): _p for _p in pngs}\n"
-        "    diffuse_pngs = []\n"
+        "    _png_by_stem = {}\n"
         "    for _p in pngs:\n"
         "        _st = os.path.splitext(os.path.basename(_p))[0].lower()\n"
+        "        _prev = _png_by_stem.get(_st)\n"
+        "        if _prev is None or os.path.getsize(_p) > os.path.getsize(_prev):\n"
+        "            _png_by_stem[_st] = _p\n"
+        "    diffuse_pngs = []\n"
+        "    for _st, _p in _png_by_stem.items():\n"
         "        if _st.endswith(('_n', '_m', '_a', '_e', '_h', '_b', '_ao', '_occ', '_rough', '_metal', '_spec', '_ramp', '_lightmap', '_lm', '_norm', '_normal', '_bump', '_mask', '_sdf', '_data', '_rm')):\n"
         "            continue\n"
         "        diffuse_pngs.append((_st, _p))\n"
@@ -857,6 +984,16 @@ def _convert_dir_to_glb(
         return out
     fbxs = _dedup_cab_models(_filter_models(fbxs))
     objs = _dedup_cab_models(_filter_models(objs))
+    def _fbx_priority(p: Path) -> tuple[int, str]:
+        parts_low = [pt.lower() for pt in p.parts]
+        if "streaming" in parts_low:
+            return (0, str(p))
+        if "basescene" in parts_low:
+            return (1, str(p))
+        if any(pt.startswith("extrascene") for pt in parts_low):
+            return (2, str(p))
+        return (1, str(p))
+    fbxs.sort(key=_fbx_priority)
     is_char = char_name.startswith("Avatar_")
     if is_char:
         fbxs = [p for p in fbxs if "Animations" not in p.parts and "AnimationClip" not in p.parts]
@@ -940,6 +1077,12 @@ def _organize_character_stage(stage_dir: Path, dest: Path) -> None:
         elif suf == ".anim":
             targets.append(dest / "AnimationClip" / p.name)
         for dst in targets:
+            if suf in tex_exts and dst.is_file():
+                try:
+                    if dst.stat().st_size > p.stat().st_size:
+                        continue
+                except OSError:
+                    pass
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, dst)
 

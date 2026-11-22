@@ -35,7 +35,7 @@
 
 ## ✨ What You Can Browse & Export
 
-Powered by the **OZ v4 Indexer** (`AnimeStudio.CLI` + `openzenless/catalog.py`), OpenZenless scans both **PC (Windows)** and **Android** (including split APK) Zenless Zone Zero builds and organizes assets into **9 browsable categories**:
+Powered by the **OZ v5 Indexer** (`AnimeStudio.CLI` + `openzenless/catalog.py`), OpenZenless scans both **PC (Windows)** and **Android** (including split APK) Zenless Zone Zero builds and organizes assets into **9 browsable categories**:
 
 | Category | What's Included | Export Formats & Highlights |
 | :--- | :--- | :--- |
@@ -65,7 +65,7 @@ Powered by the **OZ v4 Indexer** (`AnimeStudio.CLI` + `openzenless/catalog.py`),
 - Live **Build & Environment Check** pill displaying Unity `psoversioncode`, `base_revision`, `res_revision`, `data_revision`, `audio_revision`, `.blk`/`.pck` counts, and `AnimeStudio.CLI` + `Wine` status.
 
 ### 3. Native GPU 3D Viewer
-- Built natively on **`QOpenGLWidget` (OpenGL 4.6 CompatibilityProfile)** with `4x` MSAA, `8x` anisotropic filtering, and automatic discrete GPU PRIME offload (NVIDIA & AMD) — no embedded browser or WebEngine overhead.
+- Built natively on **`QOpenGLWidget` (OpenGL 4.6 CompatibilityProfile)** with `4x` MSAA, `16x` anisotropic filtering, and automatic discrete GPU PRIME offload (NVIDIA & AMD) — no embedded browser or WebEngine overhead.
 - **GPU Vertex-Shader Bone Skinning** (`GL_RGBA32F` bone palette) with real-time Unity `AnimationClip` playback, timeline scrubbing, and rest/animated pose switching.
 - **7 Game-Calibrated ZZZ Toon Shader Presets** sourced from in-game `WeatherConfig`, Ramp, LUT, and SkyLight assets (`assets/toon_presets/`):
   `Outdoors (Day)` • `Sunrise (Dawn)` • `Sunset (Dusk)` • `In-Building (Indoor)` • `Night (Neon City)` • `Overcast / Rainy` • `Studio (Agent UI)`
@@ -98,7 +98,7 @@ Powered by the **OZ v4 Indexer** (`AnimeStudio.CLI` + `openzenless/catalog.py`),
 
 ```mermaid
 flowchart LR
-    A["ZZZ Build Root<br/>(PC / Android: .blk, .pck, .bnk)"] --> B["OZ v4 Indexer & Catalog<br/>(indexer.py + catalog.py)"]
+    A["ZZZ Build Root<br/>(PC / Android: .blk, .pck, .bnk)"] --> B["OZ v5 Indexer & Catalog<br/>(indexer.py + catalog.py)"]
     B --> C["OpenZenless Core<br/>(PySide6 GUI + CLI)"]
     C --> D["Basic Mode<br/>9-Category Family Tree"]
     C --> E["Advanced Mode<br/>AKPK / BNK / JSON / Hex"]
@@ -140,7 +140,7 @@ pip install numpy PyOpenGL pygltflib
 ```
 
 ### External Toolchain
-OpenZenless can automatically clone and build **`AnimeStudio.CLI`** (with OpenZenless's OZ v4 index dumper & `AnimeStudio.ACL.ZZZV2.dll`) and **`AnimeWwise`** (`nap.map`) into `~/.local/share/openzenless/tools/` via **Batch Export → Setup / Build Tools**.
+OpenZenless can automatically clone and build **`AnimeStudio.CLI`** (with OpenZenless's OZ v5 index dumper & `AnimeStudio.ACL.ZZZV2.dll`) and **`AnimeWwise`** (`nap.map`) into `~/.local/share/openzenless/tools/` via **Batch Export → Setup / Build Tools**.
 
 | Tool | Required For |
 | :--- | :--- |
@@ -165,7 +165,7 @@ On first launch (or anytime via **Open Root...**), choose one of three sources:
 3. **PC (Windows) Installation**
    - Browse to `ZenlessZoneZero Game/`, `ZenlessZoneZero_Data/`, or `StreamingAssets/` — see the [PC Copy Guide](docs/PC_GUIDE.md).
 
-> Next, build the local **OZ v4 Asset Map** when prompted so all 9 Basic Mode categories, character family trees, and fast indexed exports populate automatically.
+> Next, build the local **OZ v5 Asset Map** when prompted so all 9 Basic Mode categories, character family trees, and fast indexed exports populate automatically.
 
 ---
 
@@ -205,7 +205,7 @@ On first launch (or anytime via **Open Root...**), choose one of three sources:
 | :--- | :--- | :--- |
 | `ZZZ_GAME_ROOT` | `~/.config/openzenless/config.json` (`$HOME` fallback) | Path to ZZZ Android or PC build root |
 | `ZZZ_FINAL_OUTPUT` | `~/OpenZenless_Output` *(or local `FinalOutput/`)* | Destination root for exports & viewer catalogs |
-| `ZZZ_BLK_EXPLORER_CACHE` | `~/.local/share/openzenless/cache` | Cache directory for OZ v4 asset maps, previews & `.blk` JSON dumps |
+| `ZZZ_BLK_EXPLORER_CACHE` | `~/.local/share/openzenless/cache` | Cache directory for OZ v5 asset maps, previews & `.blk` JSON dumps |
 | `ANIMESTUDIO_CLI` | Auto-detected in `~/.local/share/openzenless/tools/` | Explicit path override for `AnimeStudio.CLI.exe` |
 | `OPENZENLESS_GPU` | Auto discrete GPU PRIME offload (NVIDIA / AMD) | Set to `igpu`, `cpu`, `0`, or `off` to disable discrete GPU offload |
 

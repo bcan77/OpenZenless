@@ -1378,12 +1378,19 @@ def launch_gui(root_path: Path):
             self.setStatusBar(self.status)
 
         def _switch_mode(self, idx: int):
+            prev_idx = self.mode_stack.currentIndex()
+            if prev_idx == 2 and idx != 2 and hasattr(self, "viewer_widget"):
+                self.viewer_widget.unload_scene("left 3D Viewer")
             self.mode_stack.setCurrentIndex(idx)
             self.btn_mode_basic.setChecked(idx == 0)
             self.btn_mode_adv.setChecked(idx == 1)
             self.btn_mode_viewer.setChecked(idx == 2)
             if idx == 2:
                 self.viewer_widget.refresh_catalog()
+
+        def _release_viewer_before_heavy_task(self, reason: str = "starting task"):
+            if hasattr(self, "viewer_widget") and self.viewer_widget.has_loaded_scene():
+                self.viewer_widget.unload_scene(reason)
 
         def _build_viewer_page(self) -> QWidget:
             self.viewer_widget = NativeViewerWidget(choose_output_cb=self._choose_output_root)
@@ -2177,6 +2184,7 @@ def launch_gui(root_path: Path):
                     self.open_directory(self.files_root / "Blocks")
 
         def _run_basic_export(self, title: str, fn):
+            self._release_viewer_before_heavy_task("starting export")
             dlg = QDialog(self)
             dlg.setWindowTitle(title)
             dlg.resize(760, 440)
@@ -2442,6 +2450,7 @@ def launch_gui(root_path: Path):
             self._refresh_version_badge()
 
         def rebuild_asset_map(self):
+            self._release_viewer_before_heavy_task("rebuilding asset map")
             map_dir = cfg.CACHE_DIR / "asset_map"
             for fname in (
                 "manifest.json",
@@ -2851,8 +2860,14 @@ def launch_gui(root_path: Path):
                     self.status.showMessage(f"Copied {p.name} to {dest_root}")
 
         def open_batch_export_dialog(self):
+            self._release_viewer_before_heavy_task("starting export")
             dlg = ExportDialog(self)
             dlg.exec()
+
+        def closeEvent(self, event):
+            if hasattr(self, "viewer_widget"):
+                self.viewer_widget.shutdown()
+            super().closeEvent(event)
 
         def _on_worker_error(self, msg: str):
             self.progress.setVisible(False)

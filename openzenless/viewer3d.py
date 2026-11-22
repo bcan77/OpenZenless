@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import gc
 import io
 import json
 import math
@@ -39,6 +40,17 @@ from PySide6.QtWidgets import (
 from OpenGL import GL as gl
 
 from . import config as cfg
+
+
+def _release_os_memory() -> None:
+    """Run Python GC and return freed heap arenas to the OS on Linux glibc."""
+    gc.collect()
+    if os.name == "posix":
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
 
 _COMP_DTYPES = {
     5120: np.int8,
@@ -412,7 +424,8 @@ def _decode_gltf_texture(
     tex_idx: int,
     base_dir: Path,
     cache: dict[int, tuple[bytes, int, int, int, float] | None],
-    max_dim: int = 1024,
+    max_dim: int = 2048,
+    img_cache: dict[int, tuple[bytes, int, int, int, float] | None] | None = None,
 ) -> tuple[bytes, int, int, int, float] | None:
     if tex_idx in cache:
         return cache[tex_idx]
@@ -425,6 +438,10 @@ def _decode_gltf_texture(
         if src is None:
             cache[tex_idx] = None
             return None
+        if img_cache is not None and src in img_cache:
+            res = img_cache[src]
+            cache[tex_idx] = res
+            return res
         img_obj = imgs[src]
         bv_idx = img_obj.get("bufferView") if isinstance(img_obj, dict) else img_obj.bufferView
         uri = img_obj.get("uri") if isinstance(img_obj, dict) else img_obj.uri
@@ -439,17 +456,20 @@ def _decode_gltf_texture(
             if p.is_file():
                 raw_bytes = p.read_bytes()
         if not raw_bytes:
+            if img_cache is not None:
+                img_cache[src] = None
             cache[tex_idx] = None
             return None
         im = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
         if max(im.size) > max_dim:
-            resample = Image.Resampling.BILINEAR if max_dim <= 512 else Image.Resampling.LANCZOS
-            im.thumbnail((max_dim, max_dim), resample)
+            im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         rgba = im.tobytes()
         a_ch = np.frombuffer(rgba, dtype=np.uint8)[3::4]
         a_min = int(a_ch.min()) if len(a_ch) else 255
         a_mean = float(a_ch.mean()) if len(a_ch) else 255.0
         res = (rgba, im.width, im.height, a_min, a_mean)
+        if img_cache is not None:
+            img_cache[src] = res
         cache[tex_idx] = res
         return res
     except Exception:
@@ -460,7 +480,7 @@ def _decode_gltf_texture(
 def _load_disk_texture(
     png_path: Path,
     cache: dict[str, tuple[bytes, int, int, int, float] | None],
-    max_dim: int = 1024,
+    max_dim: int = 2048,
 ) -> tuple[bytes, int, int, int, float] | None:
     ckey = str(png_path)
     if ckey in cache:
@@ -468,8 +488,7 @@ def _load_disk_texture(
     try:
         im = Image.open(png_path).convert("RGBA")
         if max(im.size) > max_dim:
-            resample = Image.Resampling.BILINEAR if max_dim <= 512 else Image.Resampling.LANCZOS
-            im.thumbnail((max_dim, max_dim), resample)
+            im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         rgba = im.tobytes()
         a_ch = np.frombuffer(rgba, dtype=np.uint8)[3::4]
         a_min = int(a_ch.min()) if len(a_ch) else 255
@@ -527,12 +546,15 @@ def _load_game_materials(model_dir: Path) -> dict[str, dict]:
 
     for key, d in parsed:
         try:
+            shader = str((d.get("m_Shader") or {}).get("Name") or (d.get("m_Shader") or {}).get("m_Name") or "")
+            sh_low = shader.lower()
             sp = d.get("m_SavedProperties") or {}
             fl = sp.get("m_Floats") or {}
             cl = sp.get("m_Colors") or {}
             te = sp.get("m_TexEnvs") or {}
-            col_d = cl.get("_Color") or cl.get("_BaseColor")
+            col_d = cl.get("_BaseColor") or cl.get("_Color")
             shallow_d = cl.get("_ShallowColor")
+            deep_d = cl.get("_DeepColor")
             shadow_d = cl.get("_ShadowColor")
             spec_d = cl.get("_SpecularColor")
             rim_d = cl.get("_RimGlowLightColor")
@@ -548,28 +570,76 @@ def _load_game_materials(model_dir: Path) -> dict[str, dict]:
             else:
                 rim_col = (1.0, 1.0, 1.0)
             main_tex: str | None = None
-            for slot in ("_MainTex", "_BaseMap", "_DiffuseTex", "_Diffuse"):
+            fallback_non_diff: str | None = None
+            for slot in ("_BaseMap", "_BaseColorMap", "_ColorIDMap", "_MainTex", "_DiffuseTex", "_Diffuse"):
                 sv = te.get(slot)
                 tx = sv.get("m_Texture") if isinstance(sv, dict) else None
                 if isinstance(tx, dict):
                     nm = tx.get("m_Name") or tx.get("Name")
+                    cand: str | None = None
                     if isinstance(nm, str) and nm.strip():
-                        main_tex = Path(nm.strip()).stem.lower()
+                        cand = Path(nm.strip()).stem.lower()
+                    else:
+                        pid = tx.get("m_PathID")
+                        if isinstance(pid, int) and not isinstance(pid, bool) and pid != 0 and pid in pid_to_tex:
+                            cand = pid_to_tex[pid]
+                    if cand:
+                        if cand.endswith(("_n", "_m")):
+                            if fallback_non_diff is None:
+                                fallback_non_diff = cand
+                            continue
+                        main_tex = cand
                         break
-                    pid = tx.get("m_PathID")
-                    if isinstance(pid, int) and not isinstance(pid, bool) and pid != 0 and pid in pid_to_tex:
-                        main_tex = pid_to_tex[pid]
-                        break
-            out[key] = {
-                "color": (
+            if main_tex is None and fallback_non_diff is not None:
+                main_tex = fallback_non_diff
+            is_water = ("water" in sh_low) or (
+                main_tex is None and "_water_" in key and isinstance(shallow_d, dict)
+            )
+            if isinstance(col_d, dict):
+                mat_color: tuple[float, float, float, float] | None = (
                     float(col_d.get("r", 1.0)),
                     float(col_d.get("g", 1.0)),
                     float(col_d.get("b", 1.0)),
                     float(col_d.get("a", 1.0)),
-                ) if isinstance(col_d, dict) else None,
-                "alpha_clip": float(fl.get("_AlphaClip", 0.0)) >= 0.5,
-                "cutoff": float(fl.get("_Cutoff", 0.5)),
-                "blend": float(fl.get("_Blend", 0.0)) >= 0.5,
+                )
+            else:
+                mat_color = None
+            if is_water and main_tex is None:
+                if isinstance(shallow_d, dict) and isinstance(deep_d, dict):
+                    mat_color = (
+                        float(shallow_d.get("r", 0.14)) * 0.65 + float(deep_d.get("r", 0.0)) * 0.35,
+                        float(shallow_d.get("g", 0.38)) * 0.65 + float(deep_d.get("g", 0.71)) * 0.35,
+                        float(shallow_d.get("b", 0.48)) * 0.65 + float(deep_d.get("b", 1.0)) * 0.35,
+                        0.78,
+                    )
+                elif isinstance(shallow_d, dict):
+                    mat_color = (
+                        float(shallow_d.get("r", 0.14)),
+                        float(shallow_d.get("g", 0.38)),
+                        float(shallow_d.get("b", 0.48)),
+                        0.78,
+                    )
+                else:
+                    mat_color = (0.14, 0.42, 0.56, 0.78)
+            is_transparent_sh = "transparent" in sh_low
+            is_decal = (not shader and "_BaseColorMap" in te) or ("_decal_" in key)
+            raw_alpha_clip = float(fl.get("_AlphaClip", 0.0)) >= 0.5
+            cutoff = float(fl.get("_Cutoff", 0.5))
+            raw_blend = float(fl.get("_Blend", 0.0)) >= 0.5
+            if is_transparent_sh and raw_alpha_clip and cutoff >= 0.95:
+                alpha_clip = False
+                blend = True
+            else:
+                alpha_clip = raw_alpha_clip
+                blend = raw_blend or is_transparent_sh or is_water
+            out[key] = {
+                "shader": shader,
+                "is_decal": is_decal,
+                "is_water": is_water,
+                "color": mat_color,
+                "alpha_clip": alpha_clip,
+                "cutoff": cutoff,
+                "blend": blend,
                 "double_sided": float(fl.get("_Cull", 2.0)) < 0.5,
                 "smoothness": max(0.025, min(0.14, float(fl.get("_AlbedoSmoothness", 0.05)))),
                 "specular": max(
@@ -749,27 +819,43 @@ def load_glb_scene(path: Path) -> GLScene:
             mats[k] = _world_of(int(j)) @ ibm[k]
         return mats
 
-    max_tex_dim = 512 if len(images) > 120 else 1024
+    max_tex_dim = 4096 if len(images) <= 80 else (2048 if len(images) <= 500 else 1024)
+    textures = _g(gltf, "textures") or []
     tex_cache: dict[int, tuple[bytes, int, int, int, float] | None] = {}
-    needed_tex_idxs: list[int] = []
-    seen_tidx: set[int] = set()
+    img_cache: dict[int, tuple[bytes, int, int, int, float] | None] = {}
+    tex_to_src: dict[int, int] = {}
+    rep_tex_by_src: list[tuple[int, int]] = []
+    seen_src: set[int] = set()
     for mat in materials:
         pbr = _g(mat, "pbrMetallicRoughness")
         bct = _g(pbr, "baseColorTexture") if pbr is not None else None
         if bct is not None:
             ti = _g(bct, "index")
-            if ti is not None and ti not in seen_tidx:
-                seen_tidx.add(ti)
-                needed_tex_idxs.append(int(ti))
-    if len(needed_tex_idxs) > 4:
+            if ti is not None:
+                ti = int(ti)
+                if ti not in tex_to_src and 0 <= ti < len(textures):
+                    src = _g(textures[ti], "source")
+                    if src is not None:
+                        src = int(src)
+                        tex_to_src[ti] = src
+                        if src not in seen_src:
+                            seen_src.add(src)
+                            rep_tex_by_src.append((src, ti))
+    if len(rep_tex_by_src) > 4:
         tex_lock = threading.Lock()
-        def _predecode_tex(ti: int):
+
+        def _predecode_src(pair: tuple[int, int]):
+            src_i, rep_ti = pair
             local_c: dict[int, tuple[bytes, int, int, int, float] | None] = {}
-            res = _decode_gltf_texture(gltf, blob, ti, path.parent, local_c, max_dim=max_tex_dim)
+            res = _decode_gltf_texture(gltf, blob, rep_ti, path.parent, local_c, max_dim=max_tex_dim)
             with tex_lock:
-                tex_cache[ti] = res
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count() or 4)) as pool:
-            list(pool.map(_predecode_tex, needed_tex_idxs))
+                img_cache[src_i] = res
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as pool:
+            list(pool.map(_predecode_src, rep_tex_by_src))
+        for ti, src_i in tex_to_src.items():
+            if src_i in img_cache:
+                tex_cache[ti] = img_cache[src_i]
     disk_tex_cache: dict[str, tuple[bytes, int, int, int, float] | None] = {}
     disk_png_map: dict[str, Path] | None = None
 
@@ -777,11 +863,15 @@ def load_glb_scene(path: Path) -> GLScene:
         nonlocal disk_png_map
         if disk_png_map is not None:
             return disk_png_map
-        ranked: dict[str, tuple[int, Path]] = {}
+        ranked: dict[str, tuple[tuple[int, int], Path]] = {}
         if path.parent.is_dir():
             for p_png in sorted(path.parent.rglob("*.png")):
                 rel_parts = p_png.relative_to(path.parent).parts
-                prio = 0 if "Texture2D" in rel_parts else (1 if "Animator" in rel_parts else 2)
+                try:
+                    fsize = p_png.stat().st_size
+                except OSError:
+                    fsize = 0
+                prio = (0 if "Texture2D" in rel_parts else (1 if "Animator" in rel_parts else 2), -fsize)
                 st = p_png.stem.lower()
                 if st not in ranked or prio < ranked[st][0]:
                     ranked[st] = (prio, p_png)
@@ -1001,7 +1091,7 @@ def load_glb_scene(path: Path) -> GLScene:
                             bct_idx = _g(bct, "index")
                             if bct_idx is not None:
                                 tex_data = _decode_gltf_texture(
-                                    gltf, blob, bct_idx, path.parent, tex_cache, max_dim=max_tex_dim
+                                    gltf, blob, bct_idx, path.parent, tex_cache, max_dim=max_tex_dim, img_cache=img_cache
                                 )
 
                 hint = f"{n_name} {m_name} {mat_name}".lower()
@@ -1009,11 +1099,12 @@ def load_glb_scene(path: Path) -> GLScene:
                     continue
                 is_weapon = "weapon" in hint
                 is_sky = bool(re.search(r"(?:^|[_\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\s.0-9])", hint))
-                is_foliage_decal = any(t in hint for t in ("leaf", "tree", "plant", "shrub", "bush", "grass", "foliage", "decal"))
+                is_foliage = any(t in hint for t in ("leaf", "tree", "plant", "shrub", "bush", "grass", "foliage"))
                 is_hair = any(t in hint for t in ("hair", "lash"))
                 is_face = bool(re.search(r"(?:^|[_\s.])face(?:$|[_\s.0-9])", hint))
 
                 gm = _match_game_material(game_mats, mat_name, m_name, n_name) if game_mats else None
+                is_decal = ("decal" in hint) or bool(gm and gm.get("is_decal"))
 
                 # Disk texture fallback for untextured legacy meshes (e.g. SilverAnby_Face -> Anbi_Face_D.png)
                 if tex_data is None and uvs is not None and gm is not None and gm.get("main_tex"):
@@ -1053,10 +1144,15 @@ def load_glb_scene(path: Path) -> GLScene:
                     double_sided = True
                     if alpha_mode == "OPAQUE" and tex_data is not None:
                         alpha_mode = "BLEND"
-                elif alpha_mode in ("OPAQUE", "BLEND") and tex_data is not None and is_foliage_decal:
+                elif is_decal and tex_data is not None and not (gm and gm["alpha_clip"]):
                     if tex_data[3] < 250:
-                        alpha_mode = "MASK"
+                        alpha_mode = "BLEND"
                     elif alpha_mode == "BLEND":
+                        alpha_mode = "OPAQUE"
+                elif is_foliage and alpha_mode in ("OPAQUE", "BLEND") and tex_data is not None:
+                    if tex_data[3] < 32 and (gm is None or gm["alpha_clip"]):
+                        alpha_mode = "MASK"
+                    elif alpha_mode == "BLEND" and tex_data[3] >= 250:
                         alpha_mode = "OPAQUE"
                 elif gm is None and alpha_mode in ("OPAQUE", "BLEND") and tex_data is not None and is_hair:
                     if tex_data[3] < 64 and tex_data[4] < 245:
@@ -1089,14 +1185,23 @@ def load_glb_scene(path: Path) -> GLScene:
                     shadow_tint = gm["shadow_tint"]
                     spec_color = gm["spec_color"]
 
-                if alpha_mode == "BLEND" and tex_data is not None and not is_sky and not any(t in hint for t in ("glass", "window", "water", "eff", "fx", "decal", "trans")):
+                keep_blend = bool(
+                    gm and ("transparent" in (gm.get("shader") or "").lower() or gm.get("is_decal") or gm.get("is_water"))
+                )
+                if (
+                    alpha_mode == "BLEND"
+                    and tex_data is not None
+                    and not is_sky
+                    and not keep_blend
+                    and not any(t in hint for t in ("glass", "window", "water", "eff", "fx", "decal", "trans"))
+                ):
                     if tex_data[4] < 5.0:
                         alpha_mode = "OPAQUE"
                 elif alpha_mode == "MASK" and tex_data is not None:
-                    if tex_data[4] < 8.0 and tex_data[3] >= 0:
+                    if (alpha_cutoff >= 0.90 or tex_data[4] < 16.0) and tex_data[3] >= 0:
                         a_arr = np.frombuffer(tex_data[0], dtype=np.uint8)[3::4]
-                        if float((a_arr >= int(alpha_cutoff * 255)).mean()) < 0.03:
-                            alpha_mode = "OPAQUE"
+                        if float((a_arr >= int(min(1.0, alpha_cutoff) * 255)).mean()) < 0.03:
+                            alpha_mode = "BLEND" if (gm and gm.get("blend")) else "OPAQUE"
 
                 if len(pos_w) > 0:
                     pmin = pos_w.min(axis=0)
@@ -1151,6 +1256,32 @@ def load_glb_scene(path: Path) -> GLScene:
     for rn in root_nodes:
         _visit(rn, ident)
 
+    # Deduplicate exact co-planar duplicate static map submeshes (e.g. ExtraScene vs Streaming overlaps)
+    if len(submeshes) > 200 and not any("bip" in b.name.lower() for b in bones[:50]):
+        seen_geo: set[tuple] = set()
+        dedup_sms: list[GLSubMesh] = []
+        for sm in submeshes:
+            if len(sm.positions) == 0 or len(sm.indices) == 0:
+                continue
+            pmin_s = sm.positions.min(axis=0)
+            pmax_s = sm.positions.max(axis=0)
+            base_mat = re.sub(r"\.\d+$", "", (sm.mat_name or "").lower())
+            gkey = (
+                base_mat,
+                len(sm.positions),
+                len(sm.indices),
+                round(float(pmin_s[0]), 4), round(float(pmin_s[1]), 4), round(float(pmin_s[2]), 4),
+                round(float(pmax_s[0]), 4), round(float(pmax_s[1]), 4), round(float(pmax_s[2]), 4),
+            )
+            if gkey in seen_geo:
+                continue
+            seen_geo.add(gkey)
+            dedup_sms.append(sm)
+        if len(dedup_sms) < len(submeshes):
+            submeshes = dedup_sms
+            total_verts = sum(len(sm.positions) for sm in submeshes)
+            total_tris = sum(len(sm.indices) // 3 for sm in submeshes)
+
     # Align legacy 180°-Y OBJ character meshes to match forward-facing (+Z) skeleton
     if (
         bones
@@ -1201,6 +1332,14 @@ def load_glb_scene(path: Path) -> GLScene:
         center = ((bmin + bmax) * 0.5).astype(np.float32)
         radius = max(0.05, float(0.5 * np.linalg.norm(bmax - bmin)))
         bmin_y = float(bmin[1])
+
+    tex_cache.clear()
+    img_cache.clear()
+    world_cache.clear()
+    disk_tex_cache.clear()
+    blob = b""
+    gltf = None
+    _release_os_memory()
 
     return GLScene(
         source_path=path,
@@ -1811,7 +1950,7 @@ class GLBViewport(QOpenGLWidget):
         self._cull_valid: np.ndarray = np.zeros((0,), dtype=bool)
         self._ref_distance: float = 3.0
         self.culling_enabled = True
-        self.zoom_lod_enabled = True
+        self.zoom_lod_enabled = False
         self.last_render_stats: dict = {"drawn": 0, "total": 0, "culled": 0, "tex_lod": 0}
         self._stats_cb = None
         self.wireframe = False
@@ -1878,11 +2017,8 @@ class GLBViewport(QOpenGLWidget):
             self.toon_preset = name
             self.update()
 
-    def set_scene(self, scene: GLScene):
-        self.makeCurrent()
-        self._free_vbos()
-        self._free_textures()
-        self.scene = scene
+    def _reset_scene_state(self):
+        self.scene = None
         self.anim_clip = None
         self.anim_time = 0.0
         self._bone_keys = []
@@ -1904,12 +2040,69 @@ class GLBViewport(QOpenGLWidget):
         self._anim_bip_xz_offset = (0.0, 0.0)
         self._anim_bip_lock_xz = False
         self._last_anim_worlds = []
-        self._upload_textures()
-        self._build_static_vbos()
+
+    def set_scene(self, scene: GLScene):
+        gl_ok = self.isValid()
+        if gl_ok:
+            self.makeCurrent()
+            self._free_vbos()
+            self._free_textures()
+        else:
+            self._free_skin_vbos(delete_gl=False)
+            self._vbo_chunks.clear()
+            self._sm_vbo_idx.clear()
+            self._sm_idx_bytes.clear()
+            self._sm_idx_counts.clear()
+            self.tex_ids.clear()
+            self._tex_max_mip.clear()
+            self._active_tex_lod = -1
+        self._reset_scene_state()
+        self.scene = scene
+        if gl_ok:
+            self._upload_textures()
+            self._build_static_vbos()
         self._build_cull_arrays()
         self.reset_camera()
-        self.doneCurrent()
+        if gl_ok:
+            self.doneCurrent()
+        _release_os_memory()
         self.update()
+
+    def clear_scene(self) -> bool:
+        """Unload active 3D scene and release all CPU arrays and GPU buffers/textures."""
+        had = bool(
+            self.scene is not None
+            or self._vbo_chunks
+            or self._skin_vbo_chunks
+            or self.tex_ids
+            or self._bone_tex_id
+        )
+        self._nav_timer.stop()
+        self._keys_held.clear()
+        if self.isValid():
+            self.makeCurrent()
+            self._free_vbos()
+            self._free_textures()
+            try:
+                gl.glFlush()
+                gl.glFinish()
+            except Exception:
+                pass
+            self.doneCurrent()
+        else:
+            self._free_skin_vbos(delete_gl=False)
+            self._vbo_chunks.clear()
+            self._sm_vbo_idx.clear()
+            self._sm_idx_bytes.clear()
+            self._sm_idx_counts.clear()
+            self.tex_ids.clear()
+            self._tex_max_mip.clear()
+            self._active_tex_lod = -1
+        self._reset_scene_state()
+        self._build_cull_arrays()
+        self.last_render_stats = {"drawn": 0, "total": 0, "culled": 0, "tex_lod": 0}
+        self.update()
+        return had
 
     def set_animation(self, clip: UnityAnimClip | None):
         self.anim_clip = clip
@@ -1987,24 +2180,26 @@ class GLBViewport(QOpenGLWidget):
         self.pitch = 20.0
         self.update()
 
-    def _free_skin_vbos(self):
+    def _free_skin_vbos(self, delete_gl: bool = True):
         if self._skin_vbo_chunks:
-            try:
-                ids = [bid for pair in self._skin_vbo_chunks for bid in pair if bid]
-                if ids:
-                    gl.glDeleteBuffers(len(ids), ids)
-            except Exception:
-                pass
+            if delete_gl:
+                try:
+                    ids = [bid for pair in self._skin_vbo_chunks for bid in pair if bid]
+                    if ids:
+                        gl.glDeleteBuffers(len(ids), ids)
+                except Exception:
+                    pass
             self._skin_vbo_chunks.clear()
         self._skin_sm_vbo_idx.clear()
         self._skin_sm_idx_bytes.clear()
         self._skin_sm_idx_counts.clear()
         self._skin_palette_offsets.clear()
         if self._bone_tex_id:
-            try:
-                gl.glDeleteTextures([self._bone_tex_id])
-            except Exception:
-                pass
+            if delete_gl:
+                try:
+                    gl.glDeleteTextures([self._bone_tex_id])
+                except Exception:
+                    pass
             self._bone_tex_id = 0
         self._bone_tex_h = 1
         self._bone_palette = None
@@ -2285,25 +2480,26 @@ class GLBViewport(QOpenGLWidget):
             else:
                 self.tex_ids.append(0)
         gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        if uploaded:
+            for sm in self.scene.submeshes:
+                sm.tex_rgba = None
         self._active_tex_lod = 0
 
     def _update_tex_lod(self):
         if not self._tex_max_mip:
             self._active_tex_lod = 0
             return
-        if not self.zoom_lod_enabled:
+        if not self.zoom_lod_enabled or self.fly_mode:
             target_lvl = 0
         else:
             ref = max(0.05, self._ref_distance)
             zr = self.distance / ref
-            if zr < 0.35:
+            if zr < 1.8:
                 target_lvl = 0
-            elif zr < 0.85:
+            elif zr < 3.2:
                 target_lvl = 1
-            elif zr < 1.65:
-                target_lvl = 2
             else:
-                target_lvl = 3
+                target_lvl = 2
         if target_lvl == self._active_tex_lod:
             return
         try:
@@ -2437,7 +2633,7 @@ class GLBViewport(QOpenGLWidget):
         except Exception:
             self._gpu_skin_supported = False
         try:
-            self._max_aniso = min(8.0, float(gl.glGetFloatv(0x84FF)))
+            self._max_aniso = min(16.0, float(gl.glGetFloatv(0x84FF)))
         except Exception:
             self._max_aniso = 1.0
 
@@ -2650,7 +2846,7 @@ class GLBViewport(QOpenGLWidget):
             vis &= ~self._cull_is_sky
 
         d2: np.ndarray | None = None
-        if n_total > 64:
+        if n_total > 64 and self.anim_clip is None:
             planes = self._extract_frustum_planes(proj_m @ mv_m)
             signed = self._cull_centers @ planes[:, :3].T + planes[:, 3]
             vis &= np.all(signed >= -self._cull_radii[:, None], axis=1)
@@ -2660,11 +2856,11 @@ class GLBViewport(QOpenGLWidget):
             d2 = np.einsum("ij,ij->i", diff, diff)
             px_scale = float(h) / math.tan(math.radians(45.0) * 0.5)
             proj_px = (self._cull_radii / np.sqrt(np.maximum(d2, 1e-6))) * px_scale
-            zr = self.distance / max(0.05, self._ref_distance)
-            if n_total > 1000:
-                min_px = 1.0 if zr < 0.4 else (2.5 if zr < 1.0 else (5.0 if zr < 1.65 else 8.0))
+            if self.fly_mode:
+                min_px = 1.0
             else:
-                min_px = 0.8 if zr < 0.4 else (1.6 if zr < 1.0 else 2.6)
+                zr = self.distance / max(0.05, self._ref_distance)
+                min_px = 0.8 if zr < 1.0 else (1.4 if zr < 2.0 else 2.2)
             vis &= (self._cull_is_sky | (proj_px >= min_px))
 
         opaque_idx = np.flatnonzero(vis & ~self._cull_is_blend)
@@ -2933,8 +3129,11 @@ class GLBViewport(QOpenGLWidget):
                 gl.glEnable(gl.GL_BLEND)
                 gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
                 gl.glDepthMask(gl.GL_FALSE)
+                gl.glEnable(gl.GL_POLYGON_OFFSET_FILL)
+                gl.glPolygonOffset(-1.0, -1.0)
                 for i in blend_list:
                     _draw_sm(i)
+                gl.glDisable(gl.GL_POLYGON_OFFSET_FILL)
                 gl.glDepthMask(gl.GL_TRUE)
                 gl.glDisable(gl.GL_BLEND)
         finally:
@@ -3704,6 +3903,8 @@ class NativeViewerWidget(QWidget):
         super().__init__(parent)
         self._choose_output_cb = choose_output_cb
         self._workers: list[QThread] = []
+        self._load_generation: int = 0
+        self._last_model_path: Path | None = None
         self._anim_clip: UnityAnimClip | None = None
         self._anim_playing = False
         self._anim_last_wall: float = 0.0
@@ -3734,6 +3935,10 @@ class NativeViewerWidget(QWidget):
         btn_refresh.clicked.connect(self.refresh_catalog)
         btn_reset = QPushButton("Reset Camera")
         btn_reset.clicked.connect(lambda: self.viewport.reset_camera())
+        self.btn_unload = QPushButton("Unload")
+        self.btn_unload.setEnabled(False)
+        self.btn_unload.setToolTip("Unload current 3D scene to free RAM and GPU VRAM")
+        self.btn_unload.clicked.connect(lambda: self.unload_scene("manual"))
         self.btn_wire = QPushButton("Wireframe")
         self.btn_wire.setCheckable(True)
         self.btn_wire.toggled.connect(self._toggle_wire)
@@ -3762,13 +3967,15 @@ class NativeViewerWidget(QWidget):
         self.btn_cull = QPushButton("Culling")
         self.btn_cull.setCheckable(True)
         self.btn_cull.setChecked(True)
+        self.btn_cull.setToolTip("Cull sub-pixel distant objects (<1-2 px) for faster map navigation")
         self.btn_cull.toggled.connect(self._toggle_cull)
         self.btn_lod = QPushButton("Zoom LOD")
         self.btn_lod.setCheckable(True)
-        self.btn_lod.setChecked(True)
+        self.btn_lod.setChecked(False)
+        self.btn_lod.setToolTip("Optional low-VRAM mipmap reduction when zoomed far out in Orbit mode (OFF = full native texture resolution with GPU mipmaps)")
         self.btn_lod.toggled.connect(self._toggle_zoom_lod)
 
-        for b in (btn_open, btn_refresh, btn_reset):
+        for b in (btn_open, btn_refresh, btn_reset, self.btn_unload):
             bar.addWidget(b)
         root.addLayout(bar)
 
@@ -4062,12 +4269,60 @@ class NativeViewerWidget(QWidget):
             self.load_model(Path(p))
 
     def load_model(self, path: Path):
+        if self.viewport.scene is not None:
+            self._stop_animation()
+            self._anim_clip = None
+            if self.viewport.clear_scene():
+                _release_os_memory()
+        self.btn_unload.setEnabled(False)
+        self._load_generation += 1
+        gen = self._load_generation
         self.status_lbl.setText(f"Loading {path.name}...")
         w = _SceneLoadWorker(path)
-        w.loaded.connect(self._on_scene_loaded)
-        w.failed.connect(lambda err: self.status_lbl.setText(f"Failed to load {path.name}: {err}"))
+        w.loaded.connect(lambda sc, g=gen: self._on_scene_loaded(sc, g))
+        w.failed.connect(lambda err, g=gen, p=path: self._on_scene_failed(p, err, g))
+        w.finished.connect(lambda w_ref=w: (self._workers.remove(w_ref) if w_ref in self._workers else None, w_ref.deleteLater()))
         self._workers.append(w)
         w.start()
+
+    def _on_scene_failed(self, path: Path, err: str, gen: int | None = None):
+        if gen is not None and gen != self._load_generation:
+            return
+        self.status_lbl.setText(f"Failed to load {path.name}: {err}")
+
+    def has_loaded_scene(self) -> bool:
+        return bool(self.viewport.scene is not None or any(w.isRunning() for w in self._workers))
+
+    def unload_scene(self, reason: str = "") -> bool:
+        """Unload active 3D scene and cancel any pending load so RAM/VRAM is freed."""
+        self._load_generation += 1
+        worker_running = any(w.isRunning() for w in self._workers)
+        self._stop_animation()
+        self._anim_clip = None
+        self.anim_combo.blockSignals(True)
+        self.anim_combo.clear()
+        self.anim_combo.addItem("(None — Rest Pose)", None)
+        self.anim_combo.blockSignals(False)
+        self.btn_anim_play.setEnabled(False)
+        self.anim_slider.setEnabled(False)
+        self.anim_slider.setValue(0)
+        self.anim_time_lbl.setText("0.00 / 0.00s")
+        self.btn_weapons.setEnabled(True)
+        self.btn_unload.setEnabled(False)
+        had = self.viewport.clear_scene()
+        if had or worker_running:
+            _release_os_memory()
+        if had:
+            name = self._last_model_path.name if self._last_model_path is not None else "3D scene"
+            self.status_lbl.setText(f"Unloaded {name} (freed RAM/VRAM) — select a model to view")
+        return had
+
+    def shutdown(self):
+        """Release all viewer resources and wait briefly for background loader threads."""
+        self.unload_scene("closing")
+        for w in list(self._workers):
+            if w.isRunning():
+                w.wait(3000)
 
     def _toggle_skeleton(self, checked: bool):
         self.viewport.show_skeleton = checked
@@ -4188,7 +4443,12 @@ class NativeViewerWidget(QWidget):
         self.viewport.set_anim_time(t)
         self.anim_time_lbl.setText(f"{t:.2f} / {self._anim_clip.duration:.2f}s")
 
-    def _on_scene_loaded(self, scene: GLScene):
+    def _on_scene_loaded(self, scene: GLScene, gen: int | None = None):
+        if gen is not None and gen != self._load_generation:
+            del scene
+            _release_os_memory()
+            return
+        self._last_model_path = scene.source_path
         self._stop_animation()
         self._anim_clip = None
         self.btn_anim_play.setEnabled(False)
@@ -4205,6 +4465,7 @@ class NativeViewerWidget(QWidget):
         self.btn_fly.setChecked(is_map)
         self.btn_fly.blockSignals(False)
         self.viewport.set_scene(scene)
+        self.btn_unload.setEnabled(True)
         self.viewport.setFocus()
         has_wpn = any(sm.is_weapon for sm in scene.submeshes)
         has_body = any(not sm.is_weapon for sm in scene.submeshes)
