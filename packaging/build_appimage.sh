@@ -2,15 +2,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-0.2.0}"
-ARCH="x86_64"
+VERSION="${1:-0.3.0}"
+ARCH="${ARCH:-$(uname -m)}"
 APPDIR="$ROOT/dist/OpenZenless.AppDir"
 OUT_APPIMAGE="$ROOT/dist/OpenZenless-${VERSION}-${ARCH}.AppImage"
-APPIMAGETOOL="${APPIMAGETOOL:-/tmp/appimagetool}"
+APPIMAGETOOL="${APPIMAGETOOL:-/tmp/appimagetool-${ARCH}}"
 
 if [ ! -x "$APPIMAGETOOL" ]; then
-  echo "Downloading appimagetool..."
-  curl -fsSL -L https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -o "$APPIMAGETOOL"
+  echo "Downloading appimagetool ($ARCH)..."
+  curl -fsSL -L "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage" -o "$APPIMAGETOOL"
   chmod +x "$APPIMAGETOOL"
 fi
 
@@ -18,6 +18,8 @@ rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/share/openzenless" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
 cp "$ROOT/openzenless.py" "$ROOT/README.md" "$ROOT/requirements.txt" "$ROOT/texture_sections_index.json" "$APPDIR/usr/share/openzenless/"
+cp "$ROOT/packaging/bootstrap_env.sh" "$APPDIR/usr/share/openzenless/bootstrap_env.sh"
+chmod +x "$APPDIR/usr/share/openzenless/bootstrap_env.sh"
 cp -r "$ROOT/openzenless" "$ROOT/assets" "$ROOT/docs" "$APPDIR/usr/share/openzenless/"
 find "$APPDIR/usr/share/openzenless" -name "__pycache__" -type d -exec rm -rf {} +
 find "$APPDIR/usr/share/openzenless" -name "*.py[cod]" -delete
@@ -52,22 +54,21 @@ Categories=Utility;Development;
 Terminal=false
 DESK
 cp "$APPDIR/OpenZenless.desktop" "$APPDIR/usr/share/applications/OpenZenless.desktop"
-desktop-file-validate "$APPDIR/OpenZenless.desktop"
+if command -v desktop-file-validate >/dev/null 2>&1; then
+  desktop-file-validate "$APPDIR/OpenZenless.desktop"
+fi
 
 cat > "$APPDIR/AppRun" <<'RUN'
 #!/usr/bin/env bash
 set -euo pipefail
 APPDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_MAIN="$APPDIR/usr/share/openzenless/openzenless.py"
-if [ -e /dev/nvidia0 ] && [[ "${OPENZENLESS_GPU:-}" != "igpu" && "${OPENZENLESS_GPU:-}" != "cpu" && "${OPENZENLESS_GPU:-}" != "0" && "${OPENZENLESS_GPU:-}" != "off" ]]; then
-  export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
-  export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
-  export __VK_LAYER_NV_optimus="${__VK_LAYER_NV_optimus:-NVIDIA_only}"
-fi
+REQ_FILE="$APPDIR/usr/share/openzenless/requirements.txt"
+BOOT="$APPDIR/usr/share/openzenless/bootstrap_env.sh"
 if [ "$#" -eq 0 ]; then
-  exec python3 "$APP_MAIN" gui
+  exec bash "$BOOT" "$APP_MAIN" "$REQ_FILE" gui
 else
-  exec python3 "$APP_MAIN" "$@"
+  exec bash "$BOOT" "$APP_MAIN" "$REQ_FILE" "$@"
 fi
 RUN
 chmod +x "$APPDIR/AppRun"

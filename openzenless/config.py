@@ -4,12 +4,63 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+def is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _resolve_config_dir() -> Path:
+    legacy = Path.home() / ".config" / "openzenless"
+    if is_windows():
+        if legacy.exists():
+            return legacy
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "OpenZenless"
+        return Path.home() / "AppData" / "Roaming" / "OpenZenless"
+    if is_macos():
+        if legacy.exists():
+            return legacy
+        return Path.home() / "Library" / "Application Support" / "OpenZenless"
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg_cfg) / "openzenless") if xdg_cfg else legacy
+
+
+def _resolve_data_dir() -> Path:
+    legacy = Path.home() / ".local" / "share" / "openzenless"
+    if is_windows():
+        if legacy.exists():
+            return legacy
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            return Path(local) / "OpenZenless"
+        return Path.home() / "AppData" / "Local" / "OpenZenless"
+    if is_macos():
+        if legacy.exists():
+            return legacy
+        return Path.home() / "Library" / "Application Support" / "OpenZenless"
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    return (Path(xdg_data) / "openzenless") if xdg_data else legacy
+
+
 APP_DIR = Path(__file__).resolve().parent.parent
-TOOLS_DIR = Path.home() / ".local" / "share" / "openzenless" / "tools"
-CONFIG_FILE = Path.home() / ".config" / "openzenless" / "config.json"
+CONFIG_DIR = _resolve_config_dir()
+DATA_DIR = _resolve_data_dir()
+TOOLS_DIR = DATA_DIR / "tools"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
 def load_user_config() -> dict:
@@ -81,7 +132,7 @@ CLI_DIR = EXTRACTOR_ROOT / "tools" / "AnimeStudioUltimate" / "AnimeStudio.CLI" /
 CLI_EXE = CLI_DIR / "AnimeStudio.CLI.exe"
 CACHE_DIR = Path(
     os.environ.get("ZZZ_BLK_EXPLORER_CACHE")
-    or (Path.home() / ".local" / "share" / "openzenless" / "cache")
+    or (DATA_DIR / "cache")
 )
 _LEGACY_TMP_CACHE = Path(tempfile.gettempdir()) / "zzz_blk_explorer"
 if not (CACHE_DIR / "asset_map").exists() and (_LEGACY_TMP_CACHE / "asset_map").exists():
@@ -97,8 +148,110 @@ LOGO_ICON = ASSETS_DIR / "OpenZenless_WhiteText.png"
 SECTIONS_INDEX_FILE = APP_DIR / "texture_sections_index.json"
 ANIMEWWISE_DIR = EXTRACTOR_ROOT / "tools" / "AnimeWwise"
 NAP_MAP_FILE = ANIMEWWISE_DIR / "maps" / "nap.map"
-VGMSTREAM_CLI = EXTRACTOR_ROOT / "tools" / "vgmstream" / "build" / "cli" / "vgmstream-cli"
+VGMSTREAM_CLI = TOOLS_DIR / "vgmstream" / ("vgmstream-cli.exe" if is_windows() else "vgmstream-cli")
 DOC_FILE = APP_DIR / "README.md"
+
+
+def _first_existing_exe(
+    env_var: str | None,
+    direct_cands: list[Path],
+    which_names: tuple[str, ...] = (),
+) -> str | None:
+    if env_var:
+        ev = os.environ.get(env_var, "").strip()
+        if ev and Path(ev).is_file():
+            return str(Path(ev))
+    for cand in direct_cands:
+        if cand.is_file():
+            return str(cand)
+    for wname in which_names:
+        found = shutil.which(wname)
+        if found:
+            return found
+    return None
+
+
+def find_wine() -> str | None:
+    """Return path to Wine executable on POSIX, or None on Windows/if missing."""
+    if is_windows():
+        return None
+    cands = [
+        TOOLS_DIR / "wine" / "bin" / "wine",
+        TOOLS_DIR / "wine" / "bin" / "wine64",
+        Path("/opt/wine-staging/bin/wine"),
+        Path("/opt/homebrew/bin/wine64"),
+        Path("/usr/local/bin/wine64"),
+    ]
+    return _first_existing_exe("OPENZENLESS_WINE", cands, ("wine", "wine64"))
+
+
+def find_adb() -> str | None:
+    """Return path to `adb` / `adb.exe` across portable tools, PATH, and Android SDK dirs."""
+    exe = "adb.exe" if is_windows() else "adb"
+    cands = [TOOLS_DIR / "platform-tools" / exe]
+    for sdk_var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        val = os.environ.get(sdk_var, "").strip()
+        if val:
+            cands.append(Path(val) / "platform-tools" / exe)
+    cands.append(Path.home() / "Android" / "Sdk" / "platform-tools" / exe)
+    if is_windows():
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            cands.append(Path(local_app) / "Android" / "Sdk" / "platform-tools" / exe)
+    elif is_macos():
+        cands.append(Path.home() / "Library" / "Android" / "sdk" / "platform-tools" / exe)
+    return _first_existing_exe("OPENZENLESS_ADB", cands, (exe, "adb"))
+
+
+def find_dotnet() -> str | None:
+    """Return path to `dotnet` / `dotnet.exe`."""
+    exe = "dotnet.exe" if is_windows() else "dotnet"
+    cands = [
+        TOOLS_DIR / "dotnet" / exe,
+        Path.home() / ".dotnet" / exe,
+        Path("/usr/share/dotnet") / exe,
+    ]
+    if is_windows():
+        for pf_var in ("ProgramFiles", "ProgramFiles(x86)"):
+            pf = os.environ.get(pf_var, "").strip()
+            if pf:
+                cands.append(Path(pf) / "dotnet" / exe)
+    elif is_macos():
+        cands.extend([Path("/usr/local/share/dotnet") / exe, Path("/opt/homebrew/opt/dotnet/bin") / exe])
+    return _first_existing_exe("OPENZENLESS_DOTNET", cands, (exe, "dotnet"))
+
+
+def find_blender() -> str | None:
+    """Return path to `blender` across env override, portable dir, PATH, and OS install dirs."""
+    exe = "blender.exe" if is_windows() else "blender"
+    cands = [TOOLS_DIR / "blender" / exe]
+    if (TOOLS_DIR / "blender").is_dir():
+        cands.extend(sorted((TOOLS_DIR / "blender").glob(f"*/{exe}")))
+    if is_windows():
+        for pf_var in ("ProgramFiles",):
+            pf = os.environ.get(pf_var, r"C:\Program Files")
+            bf_root = Path(pf) / "Blender Foundation"
+            if bf_root.is_dir():
+                cands.extend(sorted(bf_root.glob(f"Blender*/{exe}"), reverse=True))
+    elif is_macos():
+        cands.append(Path("/Applications/Blender.app/Contents/MacOS/Blender"))
+    else:
+        cands.extend([Path("/snap/bin/blender"), Path.home() / ".local" / "bin" / "blender"])
+    return _first_existing_exe("BLENDER_BIN", cands, (exe, "blender"))
+
+
+def find_vgmstream() -> Path | None:
+    """Return path to `vgmstream-cli` / `vgmstream-cli.exe` if installed."""
+    exe = "vgmstream-cli.exe" if is_windows() else "vgmstream-cli"
+    cands = [
+        TOOLS_DIR / "vgmstream" / exe,
+        TOOLS_DIR / "vgmstream" / "build" / "cli" / exe,
+        EXTRACTOR_ROOT / "tools" / "vgmstream" / exe,
+        EXTRACTOR_ROOT / "tools" / "vgmstream" / "build" / "cli" / exe,
+        APP_DIR / "tools" / "vgmstream" / exe,
+    ]
+    found = _first_existing_exe(None, cands, (exe, "vgmstream-cli"))
+    return Path(found) if found else None
 
 
 def _resolve_tool_paths():
@@ -107,6 +260,7 @@ def _resolve_tool_paths():
     if os.environ.get("ANIMESTUDIO_CLI"):
         cli_cands.append(Path(os.environ["ANIMESTUDIO_CLI"]))
     cli_cands.extend([
+        TOOLS_DIR / "AnimeStudio" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0-windows" / "publish" / "AnimeStudio.CLI.exe",
         TOOLS_DIR / "AnimeStudio" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0-windows" / "AnimeStudio.CLI.exe",
         TOOLS_DIR / "AnimeStudio" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0" / "AnimeStudio.CLI.exe",
         EXTRACTOR_ROOT / "tools" / "AnimeStudioUltimate" / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0" / "AnimeStudio.CLI.exe",
@@ -128,18 +282,66 @@ def _resolve_tool_paths():
     ANIMEWWISE_DIR = next((p for p in ww_cands if (p / "maps" / "nap.map").is_file()), ww_cands[0])
     NAP_MAP_FILE = ANIMEWWISE_DIR / "maps" / "nap.map"
 
-    vgm_cands = [
-        TOOLS_DIR / "vgmstream" / "build" / "cli" / "vgmstream-cli",
-        EXTRACTOR_ROOT / "tools" / "vgmstream" / "build" / "cli" / "vgmstream-cli",
-        APP_DIR / "tools" / "vgmstream" / "build" / "cli" / "vgmstream-cli",
-    ]
-    which_vgm = shutil.which("vgmstream-cli")
-    if which_vgm:
-        vgm_cands.append(Path(which_vgm))
-    VGMSTREAM_CLI = next((p for p in vgm_cands if p.is_file()), vgm_cands[0])
+    vgm_exe = "vgmstream-cli.exe" if is_windows() else "vgmstream-cli"
+    VGMSTREAM_CLI = find_vgmstream() or (TOOLS_DIR / "vgmstream" / vgm_exe)
 
 
 _resolve_tool_paths()
+
+
+def can_run_cli() -> bool:
+    """Return True if AnimeStudio.CLI.exe exists and can run natively (Windows) or via Wine."""
+    return CLI_EXE.is_file() and (is_windows() or find_wine() is not None)
+
+
+def to_cli_path(p: Path | str) -> str:
+    """Convert a host filesystem path to a native Windows path or Wine Z: path."""
+    resolved = str(Path(p).resolve())
+    if is_windows():
+        return resolved
+    return ("Z:" + resolved).replace("/", "\\")
+
+
+def build_cli_cmd(args: list[str]) -> list[str]:
+    """Build an AnimeStudio.CLI invocation command for Windows native or POSIX Wine."""
+    if is_windows():
+        return [str(CLI_EXE), *args]
+    wine = find_wine()
+    if not wine:
+        raise FileNotFoundError(
+            "wine executable not found (install Wine via Tools & Dependencies or `openzenless setup-tools --wine`)."
+        )
+    return [wine, str(CLI_EXE), *args]
+
+
+def build_cli_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build subprocess environment with WINEDEBUG suppression and portable tool PATH entries."""
+    env = os.environ.copy()
+    if not is_windows():
+        env.setdefault("WINEDEBUG", "-all")
+    prepend: list[str] = []
+    for d in (
+        TOOLS_DIR / "wine" / "bin",
+        TOOLS_DIR / "dotnet",
+        TOOLS_DIR / "platform-tools",
+        TOOLS_DIR / "vgmstream",
+        TOOLS_DIR / "blender",
+    ):
+        if d.is_dir():
+            prepend.append(str(d))
+    if prepend:
+        cur = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(prepend + ([cur] if cur else []))
+    if extra:
+        env.update(extra)
+    return env
+
+
+def subprocess_no_window_kwargs() -> dict:
+    """Return subprocess keyword args to suppress console popups on Windows."""
+    if is_windows() and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
 
 
 def set_final_root(new_root: Path):
@@ -158,9 +360,11 @@ def set_final_root(new_root: Path):
 def resolve_files_root(game_root: Path) -> Path:
     for cand in (
         game_root / "com.HoYoverse.Nap" / "files",
+        game_root / "com.miHoYo.Nap" / "files",
         game_root / "files",
         game_root / "ZenlessZoneZero_Data" / "StreamingAssets",
         game_root / "ZenlessZoneZero Game" / "ZenlessZoneZero_Data" / "StreamingAssets",
+        game_root / "ZenlessZoneZero" / "ZenlessZoneZero_Data" / "StreamingAssets",
         game_root / "StreamingAssets",
     ):
         if cand.exists():
@@ -305,6 +509,7 @@ def detect_build_platform(game_root: Path, files_root: Path) -> str:
     if (
         (files_root / "Audio" / "Android").exists()
         or "com.HoYoverse.Nap" in s
+        or "com.miHoYo.Nap" in s
         or (files_root / "il2cpp").exists()
         or (files_root / "hib").exists()
     ):
@@ -341,6 +546,14 @@ def collect_game_version(game_root: Path) -> dict:
             audio_lang = ", ".join(sorted(p.name for p in lang_cand.iterdir() if p.is_dir())) or "present"
             break
 
+    wine_path = find_wine()
+    wine_ok = True if is_windows() else (wine_path is not None)
+    runtime_label = (
+        "Native (Windows)"
+        if is_windows()
+        else ("Wine OK" if wine_path else "Wine MISSING")
+    )
+
     return {
         "platform": detect_build_platform(game_root, files_root),
         "game_root": str(game_root),
@@ -357,35 +570,108 @@ def collect_game_version(game_root: Path) -> dict:
         "blk_count": blk_count,
         "pck_count": pck_count,
         "cli_exists": CLI_EXE.is_file(),
-        "wine_exists": shutil.which("wine") is not None,
+        "cli_ready": can_run_cli(),
+        "wine_exists": wine_ok,
+        "runtime_label": runtime_label,
+        "adb_exists": find_adb() is not None,
+        "vgmstream_exists": VGMSTREAM_CLI.is_file(),
+        "blender_exists": find_blender() is not None,
     }
 
 
 def configure_gpu_env(apply: bool = True) -> dict[str, str]:
-    """Return (and optionally apply) discrete GPU PRIME offload environment variables."""
-    if os.environ.get("OPENZENLESS_GPU", "").strip().lower() in ("igpu", "cpu", "0", "off"):
-        return {}
+    """Return (and optionally apply) discrete GPU PRIME offload & Wayland compatibility env vars."""
     env_vars: dict[str, str] = {}
-    if os.name == "posix":
-        has_nvidia = os.path.exists("/dev/nvidia0") or os.path.exists("/proc/driver/nvidia/version")
-        if has_nvidia:
-            env_vars = {
-                "__NV_PRIME_RENDER_OFFLOAD": "1",
-                "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
-                "__VK_LAYER_NV_optimus": "NVIDIA_only",
-            }
-        else:
-            try:
-                v0 = Path("/sys/class/drm/card0/device/vendor").read_text().strip().lower()
-                v1 = Path("/sys/class/drm/card1/device/vendor").read_text().strip().lower()
-                if v0 == "0x8086" and v1 == "0x1002":
-                    env_vars = {"DRI_PRIME": "1"}
-            except Exception:
-                pass
+    gpu_pref = os.environ.get("OPENZENLESS_GPU", "").strip().lower()
+    if is_linux():
+        if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
+            if os.environ.get("OPENZENLESS_WAYLAND", "").strip().lower() not in ("1", "true", "yes"):
+                env_vars["QT_QPA_PLATFORM"] = "xcb"
+
+        if gpu_pref not in ("igpu", "cpu", "0", "off"):
+            # Only apply NVIDIA PRIME offload when the proprietary NVIDIA module is active (avoid breaking Nouveau).
+            if os.path.exists("/proc/driver/nvidia/version"):
+                env_vars.update({
+                    "__NV_PRIME_RENDER_OFFLOAD": "1",
+                    "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
+                    "__VK_LAYER_NV_optimus": "NVIDIA_only",
+                })
+            else:
+                try:
+                    cards: list[tuple[str, str]] = []
+                    for dev_dir in sorted(Path("/sys/class/drm").glob("card[0-9]*/device")):
+                        vf = dev_dir / "vendor"
+                        bf = dev_dir / "boot_vga"
+                        if vf.is_file():
+                            vend = vf.read_text(encoding="utf-8", errors="ignore").strip().lower()
+                            boot = bf.read_text(encoding="utf-8", errors="ignore").strip() if bf.is_file() else ""
+                            cards.append((vend, boot))
+                    if len(cards) >= 2:
+                        has_boot = any(b == "1" for _, b in cards)
+                        has_discrete = any(b == "0" and v in ("0x1002", "0x8086") for v, b in cards)
+                        if (has_boot and has_discrete) or any(
+                            cards[0][0] == "0x8086" and v == "0x1002" for v, _ in cards[1:]
+                        ):
+                            env_vars["DRI_PRIME"] = "1"
+                except Exception:
+                    pass
     if apply:
         for k, v in env_vars.items():
             os.environ.setdefault(k, v)
     return env_vars
+
+
+def scan_existing_game_installs() -> list[Path]:
+    """Probe common OS locations for existing ZZZ PC or Android builds."""
+    home = Path.home()
+    cands: list[Path] = [
+        home / "OpenZenless_ZZZ_PC",
+        home / "OpenZenless_ZZZ_Android",
+        home / "ZZZ_Android",
+        home / "ZZZ_PC",
+        home / "ZenlessZoneZero Game",
+        home / "Downloads" / "ZenlessZoneZero Game",
+    ]
+    if is_windows():
+        for drv in ("C:", "D:", "E:", "F:", "G:"):
+            base = Path(f"{drv}/")
+            if not base.exists():
+                continue
+            cands.extend([
+                base / "HoYoPlay" / "games" / "ZenlessZoneZero Game",
+                base / "Program Files" / "HoYoPlay" / "games" / "ZenlessZoneZero Game",
+                base / "Program Files" / "ZenlessZoneZero Game",
+                base / "Games" / "ZenlessZoneZero Game",
+                base / "ZenlessZoneZero Game",
+            ])
+    elif is_macos():
+        cands.extend([
+            home / "Games" / "ZenlessZoneZero Game",
+            home / "Applications" / "ZenlessZoneZero Game",
+        ])
+    else:
+        cands.extend([
+            home / "Games" / "zenless-zone-zero",
+            home / "Games" / "ZenlessZoneZero Game",
+            home / "Games" / "sleepy-launcher",
+            home / ".local" / "share" / "sleepy-launcher" / "game",
+            home / "Games" / "Heroic" / "ZenlessZoneZero Game",
+            home / ".wine" / "drive_c" / "Program Files" / "HoYoPlay" / "games" / "ZenlessZoneZero Game",
+        ])
+
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for p in cands:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        if rp in seen:
+            continue
+        if is_valid_game_root(p):
+            seen.add(rp)
+            found.append(p)
+    return found
 
 
 def default_worker_count(max_workers: int = 4) -> int:

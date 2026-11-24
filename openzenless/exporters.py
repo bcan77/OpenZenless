@@ -45,6 +45,7 @@ def run_streaming_cmd(cmd: list[str], cwd: Path | None = None, env: dict | None 
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        **cfg.subprocess_no_window_kwargs(),
     )
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -83,34 +84,33 @@ def export_blk_asset_types(
         return 0
     if not cfg.CLI_EXE.exists():
         raise FileNotFoundError(f"AnimeStudio.CLI.exe not found at {cfg.CLI_EXE}")
-    if shutil.which("wine") is None:
-        raise FileNotFoundError("wine executable not found in PATH")
+    if not cfg.can_run_cli():
+        raise FileNotFoundError("wine executable not found (install Wine via Tools & Dependencies or `openzenless setup-tools --wine`)")
     out_dir.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    env["WINEDEBUG"] = "-all"
+    extra_env: dict[str, str] = {}
     if diffuse_only:
-        env["AS_DIFFUSE_ONLY"] = "1"
+        extra_env["AS_DIFFUSE_ONLY"] = "1"
     if skip_proxies:
-        env["AS_SKIP_PROXIES"] = "1"
+        extra_env["AS_SKIP_PROXIES"] = "1"
     if stage_tokens:
-        env["AS_STAGE_TOKENS"] = stage_tokens
+        extra_env["AS_STAGE_TOKENS"] = stage_tokens
     if container_hash_file is not None:
-        env["AS_CONTAINER_HASH_FILE"] = ("Z:" + str(container_hash_file.resolve())).replace("/", "\\")
+        extra_env["AS_CONTAINER_HASH_FILE"] = cfg.to_cli_path(container_hash_file)
     if cab_filter:
-        env["AS_CAB_FILTER"] = cab_filter
+        extra_env["AS_CAB_FILTER"] = cab_filter
     if extra_cabs:
-        env["AS_EXTRA_CABS"] = extra_cabs
+        extra_env["AS_EXTRA_CABS"] = extra_cabs
     if skip_animations:
-        env["AS_SKIP_ANIMATIONS"] = "1"
-    cmd = [
-        "wine", str(cfg.CLI_EXE),
-        "Z:" + str(source_path).replace("/", "\\"),
-        "Z:" + str(out_dir).replace("/", "\\"),
+        extra_env["AS_SKIP_ANIMATIONS"] = "1"
+    env = cfg.build_cli_env(extra_env)
+    cmd = cfg.build_cli_cmd([
+        cfg.to_cli_path(source_path),
+        cfg.to_cli_path(out_dir),
         "--game", "ZZZ",
         "--types", *types,
         "--group_assets", group_assets or "ByType",
         "--export_type", export_mode,
-    ]
+    ])
     if map_op and map_name:
         cmd.extend(["--map_op", map_op, "--map_name", map_name])
     if name_filter.strip():
@@ -194,7 +194,7 @@ def export_blks_batch(
     if cab_active:
         with tempfile.NamedTemporaryFile("w", suffix=".blklist", delete=False, encoding="utf-8") as tf:
             for blk in blk_paths:
-                tf.write("Z:" + str(blk).replace("/", "\\") + "\n")
+                tf.write(cfg.to_cli_path(blk) + "\n")
             list_path = Path(tf.name)
         try:
             return export_blk_asset_types(
@@ -212,7 +212,13 @@ def export_blks_batch(
         for blk in blk_paths:
             link = stage_dir / blk.name
             if not link.exists():
-                os.symlink(blk, link)
+                try:
+                    os.symlink(blk, link)
+                except OSError:
+                    try:
+                        os.link(blk, link)
+                    except OSError:
+                        shutil.copy2(blk, link)
         return export_blk_asset_types(
             stage_dir, out_dir, types=types, export_mode=export_mode,
             name_filter=name_filter, log_cb=log_cb, diffuse_only=diffuse_only, skip_proxies=skip_proxies,
@@ -961,7 +967,7 @@ def _convert_dir_to_glb(
     log_cb=None,
     out_glb: Path | None = None,
 ) -> int:
-    blender = shutil.which("blender")
+    blender = cfg.find_blender()
     if not blender:
         _emit(log_cb, "WARNING: blender not found in PATH; skipping GLB conversion.")
         return 0
@@ -1302,7 +1308,7 @@ def export_character_full(
             matched_name = char_name if char_name in oz_chars else next(
                 (k for k in oz_chars if k.lower() == char_name.lower()), None
             )
-        if matched_name and cfg.CLI_EXE.is_file() and shutil.which("wine") is not None:
+        if matched_name and cfg.can_run_cli():
             return _export_oz_entry(
                 matched_name,
                 oz_chars[matched_name],
@@ -1317,7 +1323,7 @@ def export_character_full(
 
         chars = load_character_index()
         blocks = chars.get(char_name)
-        if blocks and cfg.CLI_EXE.is_file() and shutil.which("wine") is not None:
+        if blocks and cfg.can_run_cli():
             files_root = cfg.resolve_files_root(game_root or cfg.GAME_ROOT)
             blocks_dir = files_root / "Blocks"
             resolved = [blocks_dir / f"{os.path.basename(b)}" for b in blocks if (blocks_dir / f"{os.path.basename(b)}").is_file()]
@@ -1360,7 +1366,7 @@ def export_character_full(
     if rc != 0:
         return rc
     if convert_glb:
-        blender = shutil.which("blender")
+        blender = cfg.find_blender()
         if not blender:
             _emit(log_cb, "WARNING: blender not found in PATH; skipping GLB conversion.")
         else:
@@ -1581,7 +1587,7 @@ def export_scene_map(
     script = cfg.EXTRACTOR_ROOT / "lib" / "export_maps_pipeline.py"
     if not script.exists():
         oz_maps = load_oz_map_index()
-        if oz_maps and _zzz_cab_map_exists() and cfg.CLI_EXE.is_file() and shutil.which("wine") is not None:
+        if oz_maps and _zzz_cab_map_exists() and cfg.can_run_cli():
             oz_targets: list[tuple[str, dict]] = []
             if not stage_name or stage_name.lower() == "all":
                 oz_targets = list(oz_maps.items())
@@ -1745,7 +1751,7 @@ def export_scene_map(
                 return last_rc
 
         stages = load_curated_map_index()
-        if cfg.CLI_EXE.is_file() and shutil.which("wine") is not None and stages:
+        if cfg.can_run_cli() and stages:
             files_root = cfg.resolve_files_root(game_root or cfg.GAME_ROOT)
             blocks_dir = files_root / "Blocks"
             targets = (
@@ -2034,6 +2040,7 @@ def _decode_wav_jobs(wav_jobs: list[tuple[Path, Path]]) -> None:
         proc = subprocess.run(
             [str(cfg.VGMSTREAM_CLI), "-o", str(w_dst), str(w_src)],
             capture_output=True, text=True,
+            **cfg.subprocess_no_window_kwargs(),
         )
         if proc.returncode == 0 and w_dst.is_file():
             w_src.unlink(missing_ok=True)
@@ -2289,7 +2296,7 @@ def export_full_game(
     if not audio_dir.exists() and files_root.exists() and any(files_root.rglob("*.pck")):
         audio_dir = files_root
     has_pcks = audio_dir.exists() and any(audio_dir.rglob("*.pck"))
-    has_cli = cfg.CLI_EXE.is_file() and shutil.which("wine") is not None
+    has_cli = cfg.can_run_cli()
 
     chars_ready = include_chars and bool(chars) and (char_script.is_file() or (has_cli and blocks_dir.exists()))
     scenes_ready = include_scenes and (map_script.is_file() or (has_cli and blocks_dir.exists() and bool(maps)))
@@ -2304,7 +2311,7 @@ def export_full_game(
     char_reason = (
         f"missing {char_script.name}" if chars else "character_index_lean.json not found in Extractor/data/asset_map"
     )
-    font_reason = "missing Blocks/" if not blocks_dir.exists() else "missing AnimeStudio.CLI.exe or wine"
+    font_reason = "missing Blocks/" if not blocks_dir.exists() else "missing AnimeStudio.CLI.exe or runtime"
 
     _emit(log_cb, "=== OpenZenless Full Export Plan ===")
     _emit(log_cb, f"Game Root   : {files_root} ({'OK' if files_root.exists() else 'MISSING'})")

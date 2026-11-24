@@ -179,29 +179,31 @@ def extract_bnk_wems(data: Path | bytes | bytearray | memoryview) -> list[tuple[
 def scan_blk_json(blk_path: Path, out_dir: Path | None = None, types: list[str] | None = None) -> tuple[Path, list[dict], str]:
     if not cfg.CLI_EXE.exists():
         raise FileNotFoundError(f"AnimeStudio.CLI.exe not found at {cfg.CLI_EXE}")
-    if shutil.which("wine") is None:
-        raise FileNotFoundError("wine executable not found in PATH")
+    if not cfg.can_run_cli():
+        raise FileNotFoundError("wine executable not found (install Wine via Tools & Dependencies or `openzenless setup-tools --wine`)")
     target_dir = out_dir or (cfg.CACHE_DIR / "blk_json" / blk_path.stem)
     target_dir.mkdir(parents=True, exist_ok=True)
     existing = list(target_dir.rglob("*.json"))
     log_text = "(cached)"
     if not existing:
-        env = os.environ.copy()
-        env["WINEDEBUG"] = "-all"
+        env = cfg.build_cli_env()
         use_types = types or [
             "Texture2D", "Material", "Shader", "Mesh",
             "GameObject", "TextAsset", "MonoBehaviour", "Sprite", "AudioClip",
         ]
-        cmd = [
-            "wine", str(cfg.CLI_EXE),
-            "Z:" + str(blk_path).replace("/", "\\"),
-            "Z:" + str(target_dir).replace("/", "\\"),
+        cmd = cfg.build_cli_cmd([
+            cfg.to_cli_path(blk_path),
+            cfg.to_cli_path(target_dir),
             "--game", "ZZZ",
             "--types", *use_types,
             "--group_assets", "ByType",
             "--export_type", "JSON",
-        ]
-        proc = subprocess.run(cmd, cwd=cfg.CLI_DIR, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        ])
+        proc = subprocess.run(
+            cmd, cwd=cfg.CLI_DIR, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=300,
+            **cfg.subprocess_no_window_kwargs(),
+        )
         log_text = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         existing = list(target_dir.rglob("*.json"))
         if proc.returncode != 0 and not existing:

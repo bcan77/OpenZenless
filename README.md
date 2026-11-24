@@ -112,57 +112,64 @@ flowchart LR
 
 ## 🚀 Quick Start
 
-### Option A — Linux AppImage (Fastest)
+### Option A — Linux AppImage (Self-Bootstrapping, Zero Root)
 Download the latest `OpenZenless-*-x86_64.AppImage` from [**GitHub Releases**](https://github.com/bcan77/OpenZenless/releases):
 
 ```bash
 chmod +x OpenZenless-*-x86_64.AppImage
 
-# Launch the GUI
+# Launch the GUI (auto-bootstraps Python deps into ~/.local/share/openzenless/venv on first run)
 ./OpenZenless-*-x86_64.AppImage
 
 # Or invoke any CLI command directly
+./OpenZenless-*-x86_64.AppImage setup-tools --check
 ./OpenZenless-*-x86_64.AppImage version
 ```
 
-### Option B — Run from Source
-Requires **Python 3.10+**.
+> Works across **Ubuntu / Debian** (even without `python3-venv` or `pip`), **Fedora**, **Arch / CachyOS**, **SteamOS / Steam Deck**, and **Wayland / X11** (automatically selects XWayland for reliable OpenGL CompatibilityProfile shaders unless `OPENZENLESS_WAYLAND=1` is set).
+
+### Option B — Run from Source (Linux, Windows, macOS)
+On **Linux / macOS** (`./run.sh`) and **Windows** (`run.bat`), OpenZenless automatically creates a user-space virtual environment and installs `requirements.txt` (core GUI, 3D Viewer, and `zstandard`) on first launch if needed:
 
 ```bash
-# Install core GUI dependencies
-pip install -r requirements.txt
-
-# Install Native 3D Viewer dependencies (OpenGL + GLB loader)
-pip install numpy PyOpenGL pygltflib
-
-# Launch the desktop GUI (opens Initial Setup on first run)
+# Linux / macOS
 ./run.sh
+
+# Windows (runs AnimeStudio.CLI.exe natively without Wine)
+run.bat
 ```
 
-### External Toolchain
-OpenZenless can automatically clone and build **`AnimeStudio.CLI`** (with OpenZenless's OZ v5 index dumper & `AnimeStudio.ACL.ZZZV2.dll`) and **`AnimeWwise`** (`nap.map`) into `~/.local/share/openzenless/tools/` via **Batch Export → Setup / Build Tools**.
+### Portable Toolchain & One-Click Auto-Installers
+Open the **Tools & Dependencies** dialog from the header status pill (`AnimeStudio.CLI / Wine / Tools`) or run `./run.sh setup-tools` to inspect your environment and automatically install zero-root portable binaries into `~/.local/share/openzenless/tools/` (`%LOCALAPPDATA%\OpenZenless\tools` on Windows):
 
-| Tool | Required For |
-| :--- | :--- |
-| `wine` + `.NET 9 SDK` (`dotnet`) + `git` | Building & running `AnimeStudio.CLI.exe` on Linux (`.blk` indexing, meshes, textures, animations) |
-| `x86_64-w64-mingw32-g++` *(optional)* | Compiling native `AnimeStudio.ACL.ZZZV2.dll` for ZZZ ACL animation decompression |
-| `blender` *(optional)* | Converting exported `.fbx` rigs/maps to `.glb` + facial morphs (with Cycles OPTIX/CUDA acceleration) |
-| `vgmstream-cli` *(optional)* | Parallel `.wem → .wav` audio decoding |
-| `adb` *(optional)* | Pulling game files and split APKs directly from an Android device |
+| Tool | Auto-Installable? | Required For |
+| :--- | :--- | :--- |
+| `AnimeStudio.CLI.exe` | Yes *(self-contained `win-x64`, zero `git` needed)* | `.blk` indexing, meshes, textures, animations & shaders |
+| `Wine WoW64` / Native | Yes *(Linux x86_64)* / Native on Windows | Running `AnimeStudio.CLI.exe` cleanly on Linux |
+| `.NET 9 SDK` (`dotnet`) | Yes *(official `dotnet-install`)* | Building & patching `AnimeStudio.CLI` from source |
+| `AnimeWwise` (`nap.map`) | Yes *(GitHub archive fallback)* | Auto-naming & organizing extracted Wwise audio |
+| `vgmstream-cli` | Yes *(official GitHub release)* | Parallel `.wem → .wav` audio decoding |
+| `adb` (Platform-Tools) | Yes *(official Google zip)* | Pulling ZZZ builds over USB or Wireless ADB |
+| `blender` *(optional)* | Yes *(portable Blender 4.2 LTS on x64)* | Converting `.fbx` rigs/maps to `.glb` + facial morphs |
+| `x86_64-w64-mingw32-g++` *(optional)* | System package | Compiling native `AnimeStudio.ACL.ZZZV2.dll` for ZZZ ACL animation decompression |
 
 ---
 
 ## 📂 Loading Your ZZZ Build
 
-On first launch (or anytime via **Open Root...**), choose one of three sources:
+On first launch (or anytime via **Open Root...**), OpenZenless auto-scans common PC/Android paths and lets you choose any of four sources:
 
-1. **Load from Android Phone (ADB)** *(recommended for Android players)*
-   - Enable **USB Debugging**, connect your device, and click **Load from Phone (ADB)...** (or run `./run.sh pull-phone --dest ~/OpenZenless_ZZZ_Android`).
+1. **Load from Android Phone (USB or Wireless ADB)**
+   - Enable **USB Debugging** (or **Wireless Debugging**), connect your device, and click **Load from Phone (ADB)...** (or run `./run.sh pull-phone --dest ~/OpenZenless_ZZZ_Android`).
+   - If `adb` isn't installed yet, click **Auto-Install ADB** directly inside the dialog (or `pull-phone` installs it automatically).
    - Streams live transfer progress via POSIX PTY with remote size probing, timestamped logs, and a determinate progress bar; automatically detects `com.HoYoverse.Nap` / `com.miHoYo.Nap`, pulls assets (`Blocks/`, `Audio/`, `il2cpp/`, revisions), pulls split APKs, and extracts base `.blk` files from `split_UnityDataAssetPack.apk`.
    - *(On Android 13–15, if Scoped Storage restricts `/sdcard/Android/data/`, stage `files/` with Shizuku into `/sdcard/Download/com.HoYoverse.Nap/files/` first — see the [Mobile Extraction Guide](docs/MOBILE_EXTRACTION.md).)*
-2. **Existing Android Build Folder**
+2. **Download PC Build Directly from HoYoverse CDN (Zero Phone/PC Install Needed)**
+   - Click **Download PC Build (CDN)...** in Initial Setup or **No Phone? Download PC Build (CDN)...** in the ADB dialog (or run `./run.sh download-pc`).
+   - Fetches official Global (`nap_global`) or CN (`nap_cn`) **Sophon** manifests directly from HoYoverse CDN with selectable profiles (`assets`, `blocks`, `full`), optional voice packs (`en-us`, `ja-jp`, `zh-cn`, `ko-kr`), per-chunk MD5 verification, disk-space checks, and resume checkpoints.
+3. **Existing Android Build Folder**
    - Browse to any pre-copied Android dump folder containing `com.HoYoverse.Nap/files/` or `files/`.
-3. **PC (Windows) Installation**
+4. **PC (Windows) Installation**
    - Browse to `ZenlessZoneZero Game/`, `ZenlessZoneZero_Data/`, or `StreamingAssets/` — see the [PC Copy Guide](docs/PC_GUIDE.md).
 
 > Next, build the local **OZ v5 Asset Map** when prompted so all 9 Basic Mode categories, character family trees, and fast indexed exports populate automatically.
@@ -172,11 +179,19 @@ On first launch (or anytime via **Open Root...**), choose one of three sources:
 ## ⌨️ CLI Examples
 
 ```bash
+# Inspect OS, display backend, Python deps & external tools, or auto-install everything
+./run.sh setup-tools --check
+./run.sh setup-tools --all
+
 # Check build revisions, container counts & tool health
 ./run.sh version
 
-# Pull Android build & split APKs over ADB
+# Pull Android build & split APKs over ADB (auto-installs ADB if missing)
 ./run.sh pull-phone --dest ~/OpenZenless_ZZZ_Android
+
+# Query live HoYoverse PC CDN sizes or download official PC assets directly (resumable)
+./run.sh download-pc --info
+./run.sh download-pc --profile assets --langs en-us --dest ~/OpenZenless_ZZZ_PC
 
 # Export a character (FBX + textures + optional Blender GLB) or animations only
 ./run.sh export character --name Avatar_Female_Size02_Anby --glb --out-dir ./Exports
@@ -203,11 +218,13 @@ On first launch (or anytime via **Open Root...**), choose one of three sources:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `ZZZ_GAME_ROOT` | `~/.config/openzenless/config.json` (`$HOME` fallback) | Path to ZZZ Android or PC build root |
+| `ZZZ_GAME_ROOT` | `~/.config/openzenless/config.json` (`%APPDATA%\OpenZenless` on Win) | Path to ZZZ Android or PC build root |
 | `ZZZ_FINAL_OUTPUT` | `~/OpenZenless_Output` *(or local `FinalOutput/`)* | Destination root for exports & viewer catalogs |
 | `ZZZ_BLK_EXPLORER_CACHE` | `~/.local/share/openzenless/cache` | Cache directory for OZ v5 asset maps, previews & `.blk` JSON dumps |
 | `ANIMESTUDIO_CLI` | Auto-detected in `~/.local/share/openzenless/tools/` | Explicit path override for `AnimeStudio.CLI.exe` |
-| `OPENZENLESS_GPU` | Auto discrete GPU PRIME offload (NVIDIA / AMD) | Set to `igpu`, `cpu`, `0`, or `off` to disable discrete GPU offload |
+| `OPENZENLESS_GPU` | Auto discrete GPU PRIME offload (NVIDIA / AMD / Intel) | Set to `igpu`, `cpu`, `0`, or `off` to disable discrete GPU offload |
+| `OPENZENLESS_WAYLAND` | Auto XWayland (`QT_QPA_PLATFORM=xcb`) when X11 is present | Set to `1` to force native Wayland Qt backend |
+| `OPENZENLESS_NO_AUTO_INSTALL` | `0` | Set to `1` to disable automatic AppImage/`run.sh` venv dependency installation |
 
 ---
 

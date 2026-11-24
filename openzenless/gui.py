@@ -11,13 +11,21 @@ from pathlib import Path
 
 from . import config as cfg
 from .adb_import import (
+    adb_connect_wireless,
     detect_remote_files_dir,
     detect_zzz_package,
+    ensure_adb_available,
     find_adb,
     list_adb_devices,
     pull_from_phone,
 )
 from . import catalog
+from . import cdn_downloader
+from .cdn_downloader import (
+    DOWNLOAD_PROFILES,
+    REGIONS,
+    VOICE_LANGS,
+)
 from .containers import detect_magic, extract_bnk_wems, format_hex_dump, human_size, parse_akpk, parse_bnk, scan_blk_json
 from .exporters import (
     export_audio_entries,
@@ -50,13 +58,24 @@ from .indexer import (
     load_stage_index,
     load_texture_sections,
 )
-from .tools import ensure_extractor_tools
-from .viewer3d import NativeViewerWidget
+from .tools import (
+    ensure_adb,
+    ensure_blender,
+    ensure_extractor_tools,
+    ensure_vgmstream,
+    get_environment_status,
+)
+try:
+    from .viewer3d import NativeViewerWidget
+    _VIEWER_IMPORT_ERR = ""
+except Exception as _viewer_exc:
+    NativeViewerWidget = None  # type: ignore
+    _VIEWER_IMPORT_ERR = str(_viewer_exc)
 
 
 def launch_gui(root_path: Path):
     from PySide6.QtCore import Qt, QThread, Signal, QSize
-    from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap, QShortcut
+    from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QKeySequence, QPixmap, QShortcut
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
         QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -65,6 +84,30 @@ def launch_gui(root_path: Path):
         QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser,
         QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
     )
+
+    def _fit_to_screen(widget, pref_w: int, pref_h: int):
+        scr = QGuiApplication.primaryScreen()
+        if scr is not None:
+            avail = scr.availableGeometry()
+            w = min(pref_w, max(480, int(avail.width() * 0.94)))
+            h = min(pref_h, max(400, int(avail.height() * 0.92)))
+        else:
+            w, h = pref_w, pref_h
+        widget.resize(w, h)
+
+    _detached_threads: list[QThread] = []
+
+    def _retire_thread(th: QThread | None, wait_ms: int = 5000):
+        if th is None or not th.isRunning():
+            return
+        th.wait(wait_ms)
+        if th.isRunning():
+            try:
+                th.setParent(None)
+            except Exception:
+                pass
+            _detached_threads.append(th)
+            th.finished.connect(lambda t=th: _detached_threads.remove(t) if t in _detached_threads else None)
 
     DARK_QSS = """
     QMainWindow, QWidget, QDialog {
@@ -183,8 +226,8 @@ def launch_gui(root_path: Path):
 
         def run(self):
             try:
-                if not cfg.CLI_EXE.exists() or shutil.which("wine") is None:
-                    self.failed.emit("AnimeStudio.CLI.exe or wine is not available.")
+                if not cfg.can_run_cli():
+                    self.failed.emit("AnimeStudio.CLI.exe or Wine runtime is not available.")
                     return
                 out_dir = cfg.CACHE_DIR / "blk_convert" / self.blk_path.stem / self.asset_type
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -193,19 +236,21 @@ def launch_gui(root_path: Path):
                     if cand:
                         self.finished_ok.emit(str(cand[0]), "cached")
                         return
-                env = os.environ.copy()
-                env["WINEDEBUG"] = "-all"
-                cmd = [
-                    "wine", str(cfg.CLI_EXE),
-                    "Z:" + str(self.blk_path).replace("/", "\\"),
-                    "Z:" + str(out_dir).replace("/", "\\"),
+                env = cfg.build_cli_env()
+                cmd = cfg.build_cli_cmd([
+                    cfg.to_cli_path(self.blk_path),
+                    cfg.to_cli_path(out_dir),
                     "--game", "ZZZ",
                     "--types", self.asset_type,
                     "--names", self.asset_name,
                     "--group_assets", "ByType",
                     "--export_type", "Convert",
-                ]
-                proc = subprocess.run(cmd, cwd=cfg.CLI_DIR, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+                ])
+                proc = subprocess.run(
+                    cmd, cwd=cfg.CLI_DIR, env=env, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=180,
+                    **cfg.subprocess_no_window_kwargs(),
+                )
                 files = [p for p in out_dir.rglob("*") if p.is_file() and self.asset_name.lower() in p.stem.lower()]
                 if not files:
                     files = [p for p in out_dir.rglob("*") if p.is_file()]
@@ -265,7 +310,7 @@ def launch_gui(root_path: Path):
             super().__init__(parent)
             self.game_root = game_root
             self.setWindowTitle("OpenZenless — Building Asset Map")
-            self.resize(680, 420)
+            _fit_to_screen(self, 680, 420)
             lay = QVBoxLayout(self)
             lay.setSpacing(10)
 
@@ -327,14 +372,13 @@ def launch_gui(root_path: Path):
         def reject(self):
             if self.worker.isRunning():
                 self.worker.cancel_event.set()
-                self.worker.wait(3000)
+                _retire_thread(self.worker, 5000)
             super().reject()
 
         def closeEvent(self, event):
             if self.worker.isRunning():
                 self.worker.cancel_event.set()
-                self.worker.wait(3000)
-            super().closeEvent(event)
+                _retire_thread(self.worker, 5000)
             super().closeEvent(event)
 
     class ExportDialog(QDialog):
@@ -360,14 +404,14 @@ def launch_gui(root_path: Path):
             self.parent_win = parent
             self.worker: BatchExportWorker | None = None
             self.setWindowTitle("OpenZenless — Batch & Pipeline Export")
-            self.resize(900, 680)
+            _fit_to_screen(self, 900, 680)
             lay = QVBoxLayout(self)
 
             tool_bar = QHBoxLayout()
             self.tool_status_lbl = QLabel()
             self.tool_status_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
-            self.btn_setup_tools = QPushButton("Setup / Build Tools")
-            self.btn_setup_tools.setToolTip("Automatically clone & build AnimeStudio.CLI and AnimeWwise into ~/.local/share/openzenless/tools")
+            self.btn_setup_tools = QPushButton("Tools & Auto-Install...")
+            self.btn_setup_tools.setToolTip("Inspect and auto-install AnimeStudio.CLI, Wine, .NET 9, ADB, vgmstream & Blender")
             self.btn_setup_tools.clicked.connect(self._setup_tools)
             self.btn_locate_ext = QPushButton("Locate Output/Extractor...")
             self.btn_locate_ext.clicked.connect(self._locate_extractor)
@@ -496,42 +540,25 @@ def launch_gui(root_path: Path):
 
         def _refresh_tool_status(self):
             cli_ok = cfg.CLI_EXE.is_file()
-            wine_ok = shutil.which("wine") is not None
-            ext_ok = (cfg.EXTRACTOR_ROOT / "lib" / "extract_character_v2.py").is_file()
+            rt_lbl = "Native" if cfg.is_windows() else ("OK" if cfg.find_wine() else "MISSING")
             vgm_ok = cfg.VGMSTREAM_CLI.is_file()
+            adb_ok = find_adb() is not None
+            bl_ok = cfg.find_blender() is not None
             self.tool_status_lbl.setText(
                 f"Tools — CLI: {'OK' if cli_ok else 'MISSING'} | "
-                f"Wine: {'OK' if wine_ok else 'MISSING'} | "
-                f"Extractor Scripts: {'OK' if ext_ok else 'MISSING'} | "
+                f"Runtime: {rt_lbl} | "
                 f"vgmstream: {'OK' if vgm_ok else 'MISSING'} | "
-                f"Audio AKPK: Ready"
+                f"ADB: {'OK' if adb_ok else 'Missing'} | "
+                f"Blender: {'OK' if bl_ok else 'No'}"
             )
 
         def _setup_tools(self):
             if self.worker is not None and self.worker.isRunning():
                 return
-            self.log_box.clear()
-            self.btn_run.setEnabled(False)
-            self.btn_setup_tools.setEnabled(False)
-
-            def task(cb):
-                res = ensure_extractor_tools(log_cb=cb)
-                cb(f"Tools ready: {res}")
-                return 0 if res.get("cli_exists") else 1
-
-            self.worker = BatchExportWorker(task)
-            self.worker.log_line.connect(self.log_box.appendPlainText)
-            self.worker.finished_rc.connect(lambda rc: (
-                self.btn_setup_tools.setEnabled(True),
-                self._refresh_tool_status(),
-                self.parent_win._refresh_version_badge(),
-                self._on_done(rc),
-            ))
-            self.worker.failed.connect(lambda err: (
-                self.btn_setup_tools.setEnabled(True),
-                self._on_err(err),
-            ))
-            self.worker.start()
+            dlg = ToolsManagerDialog(self.parent_win.game_root, self)
+            dlg.exec()
+            self._refresh_tool_status()
+            self.parent_win._refresh_version_badge()
 
         def _locate_extractor(self):
             d = QFileDialog.getExistingDirectory(
@@ -789,13 +816,553 @@ def launch_gui(root_path: Path):
             except Exception as ex:
                 self.failed.emit(str(ex))
 
+    class ToolsInstallWorker(QThread):
+        log_line = Signal(str)
+        progress_changed = Signal(int, str)
+        finished_ok = Signal()
+        failed = Signal(str)
+
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+            self.cancel_event = threading.Event()
+
+        def cancel(self):
+            self.cancel_event.set()
+
+        def run(self):
+            try:
+                self.fn(self.log_line.emit, self.progress_changed.emit, self.cancel_event)
+                self.finished_ok.emit()
+            except Exception as ex:
+                self.failed.emit(str(ex))
+
+    class ToolsManagerDialog(QDialog):
+        def __init__(self, game_root: Path, parent=None):
+            super().__init__(parent)
+            self.game_root = game_root
+            self._worker: ToolsInstallWorker | None = None
+            self.setWindowTitle("OpenZenless — Environment & Tool Dependencies")
+            _fit_to_screen(self, 860, 620)
+
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(16, 14, 16, 14)
+            lay.setSpacing(10)
+
+            title = QLabel("Cross-Device Compatibility, Build Info & Auto-Installers")
+            title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f59e0b;")
+            lay.addWidget(title)
+
+            self.env_summary = QLabel("")
+            self.env_summary.setWordWrap(True)
+            self.env_summary.setStyleSheet("color: #cbd5e1;")
+            lay.addWidget(self.env_summary)
+
+            self.build_summary = QLabel("")
+            self.build_summary.setWordWrap(True)
+            self.build_summary.setStyleSheet("color: #94a3b8; font-size: 11px;")
+            lay.addWidget(self.build_summary)
+
+            self.tools_table = QTableWidget(0, 3)
+            self.tools_table.setHorizontalHeaderLabels(["Component", "Status", "Location / Notes"])
+            self.tools_table.setAlternatingRowColors(True)
+            self.tools_table.setSelectionMode(QAbstractItemView.NoSelection)
+            self.tools_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.tools_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self.tools_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            self.tools_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+            self.tools_table.verticalHeader().setVisible(False)
+            self.tools_table.setMinimumHeight(210)
+            lay.addWidget(self.tools_table)
+
+            act_row = QHBoxLayout()
+            self.btn_install_core = QPushButton("Auto-Install Core Tools")
+            self.btn_install_core.setObjectName("primaryBtn")
+            self.btn_install_core.setToolTip("Install AnimeStudio.CLI, Wine (Linux x64), .NET 9, AnimeWwise, vgmstream & ADB into user tools folder")
+            self.btn_install_core.clicked.connect(lambda: self._run_task(
+                "Installing Core Tools...",
+                lambda lcb, pcb, ce: ensure_extractor_tools(
+                    log_cb=lcb, progress_cb=pcb, install_adb=True,
+                    install_wine=True, install_vgmstream=True, cancel_event=ce,
+                ),
+            ))
+            self.btn_install_adb = QPushButton("Install ADB")
+            self.btn_install_adb.clicked.connect(lambda: self._run_task(
+                "Installing Google Android Platform-Tools (ADB)...",
+                lambda lcb, pcb, ce: ensure_adb(log_cb=lcb, progress_cb=pcb, cancel_event=ce),
+            ))
+            self.btn_install_vgm = QPushButton("Install vgmstream")
+            self.btn_install_vgm.clicked.connect(lambda: self._run_task(
+                "Installing vgmstream-cli...",
+                lambda lcb, pcb, ce: ensure_vgmstream(log_cb=lcb, progress_cb=pcb, cancel_event=ce),
+            ))
+            self.btn_install_blender = QPushButton("Install Blender 4.2")
+            self.btn_install_blender.clicked.connect(lambda: self._run_task(
+                "Installing portable Blender 4.2 LTS...",
+                lambda lcb, pcb, ce: ensure_blender(log_cb=lcb, progress_cb=pcb, cancel_event=ce),
+            ))
+            self.btn_refresh = QPushButton("Refresh")
+            self.btn_refresh.clicked.connect(self._refresh)
+            for b in (
+                self.btn_install_core, self.btn_install_adb,
+                self.btn_install_vgm, self.btn_install_blender, self.btn_refresh,
+            ):
+                act_row.addWidget(b)
+            act_row.addStretch()
+            lay.addLayout(act_row)
+
+            self.prog_lbl = QLabel("")
+            self.prog_lbl.setStyleSheet("color: #93c5fd; font-weight: 600;")
+            self.prog_lbl.setMinimumWidth(0)
+            self.prog_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self.prog_lbl.setVisible(False)
+            lay.addWidget(self.prog_lbl)
+
+            self.pbar = QProgressBar()
+            self.pbar.setVisible(False)
+            lay.addWidget(self.pbar)
+
+            self.log_box = QPlainTextEdit()
+            self.log_box.setReadOnly(True)
+            self.log_box.setFont(QFont("JetBrains Mono, Consolas, monospace", 9))
+            self.log_box.setPlaceholderText("Installer logs appear here...")
+            lay.addWidget(self.log_box, 1)
+
+            foot = QHBoxLayout()
+            foot.addStretch()
+            self.btn_cancel = QPushButton("Cancel")
+            self.btn_cancel.setEnabled(False)
+            self.btn_cancel.clicked.connect(self._cancel)
+            self.btn_close = QPushButton("Close")
+            self.btn_close.clicked.connect(self._safe_close)
+            foot.addWidget(self.btn_cancel)
+            foot.addWidget(self.btn_close)
+            lay.addLayout(foot)
+
+            self._refresh()
+
+        def _refresh(self):
+            st = get_environment_status()
+            py_mods = ", ".join(f"{k}:{'OK' if ok else 'NO'}" for k, ok in st["python_modules"].items())
+            self.env_summary.setText(
+                f"<b>Host:</b> {st['os_detail']} ({st['arch']}, {st['display']}) &nbsp;|&nbsp; "
+                f"<b>Python {st['python']}:</b> {py_mods}<br>"
+                f"<b>Portable Tools Dir:</b> {st['tools_dir']}"
+            )
+            gv = cfg.collect_game_version(self.game_root)
+            if gv["exists"]:
+                self.build_summary.setText(
+                    f"ZZZ Build: {gv['platform']} | Unity {gv['unity_version']} | res {gv['res_revision']} | "
+                    f"{gv['blk_count']:,} .blk | {gv['pck_count']:,} .pck | Audio: {gv['audio_lang']}"
+                )
+            else:
+                self.build_summary.setText(f"ZZZ Build: No build loaded ({gv['game_root']})")
+
+            rows = st["tools"]
+            self.tools_table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                it0 = QTableWidgetItem(r["name"])
+                it0.setToolTip(r["required_for"])
+                it1 = QTableWidgetItem(r["status"])
+                it1.setForeground(QColor("#4ade80" if r["ok"] else "#fbbf24"))
+                it2 = QTableWidgetItem(r["path"] or r["hint"])
+                self.tools_table.setItem(i, 0, it0)
+                self.tools_table.setItem(i, 1, it1)
+                self.tools_table.setItem(i, 2, it2)
+
+        def _set_busy(self, busy: bool):
+            for b in (
+                self.btn_install_core, self.btn_install_adb,
+                self.btn_install_vgm, self.btn_install_blender, self.btn_refresh, self.btn_close,
+            ):
+                b.setEnabled(not busy)
+            self.btn_cancel.setEnabled(busy)
+            self.pbar.setVisible(busy)
+            self.prog_lbl.setVisible(busy)
+
+        def _run_task(self, title: str, fn):
+            if self._worker is not None and self._worker.isRunning():
+                return
+            self.log_box.clear()
+            self.log_box.appendPlainText(title)
+            self.prog_lbl.setText(title)
+            self.pbar.setRange(0, 0)
+            self._set_busy(True)
+            self._worker = ToolsInstallWorker(fn)
+            self._worker.log_line.connect(self.log_box.appendPlainText)
+            self._worker.progress_changed.connect(self._on_prog)
+            self._worker.finished_ok.connect(self._on_done)
+            self._worker.failed.connect(self._on_fail)
+            self._worker.start()
+
+        def _on_prog(self, pct: int, msg: str):
+            self.prog_lbl.setText(msg)
+            if pct < 0:
+                self.pbar.setRange(0, 0)
+            else:
+                self.pbar.setRange(0, 100)
+                self.pbar.setValue(max(0, min(100, pct)))
+
+        def _on_done(self):
+            self._set_busy(False)
+            self.log_box.appendPlainText("Done!")
+            self._refresh()
+
+        def _on_fail(self, msg: str):
+            self._set_busy(False)
+            self.log_box.appendPlainText(f"[ERROR] {msg}")
+            self._refresh()
+            QMessageBox.warning(self, "Tool Installation Warning", msg)
+
+        def _cancel(self):
+            if self._worker and self._worker.isRunning():
+                self._worker.cancel()
+                self.btn_cancel.setEnabled(False)
+                self.prog_lbl.setText("Cancelling...")
+
+        def _safe_close(self):
+            if self._worker and self._worker.isRunning():
+                return
+            self.accept()
+
+        def reject(self):
+            if self._worker and self._worker.isRunning():
+                self._worker.cancel()
+                self._worker.wait(3000)
+            super().reject()
+
+        def closeEvent(self, event):
+            if self._worker and self._worker.isRunning():
+                self._worker.cancel()
+                self._worker.wait(3000)
+            super().closeEvent(event)
+
+    class CdnInfoWorker(QThread):
+        ready = Signal(dict)
+        failed = Signal(str)
+
+        def __init__(self, region: str):
+            super().__init__()
+            self.region = region
+
+        def run(self):
+            try:
+                self.ready.emit(cdn_downloader.fetch_zzz_cdn_info(region=self.region, parse_game_manifest=True))
+            except Exception as ex:
+                self.failed.emit(str(ex))
+
+    class CdnDownloadWorker(QThread):
+        log_line = Signal(str)
+        progress_changed = Signal(int, str)
+        finished_ok = Signal(str)
+        failed = Signal(str)
+
+        def __init__(self, dest_root: Path, region: str, profile: str, voice_langs: list[str], workers: int, ignore_space: bool):
+            super().__init__()
+            self.dest_root = dest_root
+            self.region = region
+            self.profile = profile
+            self.voice_langs = voice_langs
+            self.workers = workers
+            self.ignore_space = ignore_space
+            self._cancel_event = threading.Event()
+
+        def cancel(self):
+            self._cancel_event.set()
+
+        def run(self):
+            try:
+                out = cdn_downloader.download_pc_build(
+                    dest_root=self.dest_root,
+                    region=self.region,
+                    profile=self.profile,
+                    voice_langs=self.voice_langs,
+                    workers=self.workers,
+                    log_cb=self.log_line.emit,
+                    progress_cb=self.progress_changed.emit,
+                    cancel_event=self._cancel_event,
+                    ignore_space_check=self.ignore_space,
+                )
+                self.finished_ok.emit(str(out))
+            except Exception as ex:
+                self.failed.emit(str(ex))
+
+    class CdnDownloadDialog(QDialog):
+        def __init__(self, parent=None, default_dest: Path | None = None):
+            super().__init__(parent)
+            self.setWindowTitle("Download ZZZ PC Build from Official HoYoverse CDN")
+            _fit_to_screen(self, 740, 560)
+            self.dest_root: Path = default_dest or (Path.home() / "OpenZenless_ZZZ_PC")
+            self._info: dict | None = None
+            self._info_worker: CdnInfoWorker | None = None
+            self._dl_worker: CdnDownloadWorker | None = None
+
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(18, 16, 18, 16)
+            lay.setSpacing(10)
+
+            title = QLabel("Download Official Zenless Zone Zero PC Files (HoYoverse CDN)")
+            title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f59e0b;")
+            lay.addWidget(title)
+
+            desc = QLabel(
+                "Downloads verified PC game assets directly from HoYoverse's official Sophon CDN. "
+                "Supports resume across restarts and verifies MD5 checksums on every chunk."
+            )
+            desc.setWordWrap(True)
+            desc.setStyleSheet("color: #94a3b8;")
+            lay.addWidget(desc)
+
+            form = QFormLayout()
+            form.setSpacing(8)
+
+            reg_row = QHBoxLayout()
+            self.region_combo = QComboBox()
+            for rkey, rmeta in REGIONS.items():
+                self.region_combo.addItem(rmeta["label"], rkey)
+            self.region_combo.currentIndexChanged.connect(self._probe_cdn)
+            self.btn_refresh_info = QPushButton("Check Latest Build")
+            self.btn_refresh_info.clicked.connect(self._probe_cdn)
+            reg_row.addWidget(self.region_combo, 1)
+            reg_row.addWidget(self.btn_refresh_info)
+            form.addRow("Server Region:", reg_row)
+
+            self.build_lbl = QLabel("Querying HoYoverse CDN...")
+            self.build_lbl.setWordWrap(True)
+            form.addRow("Live Build:", self.build_lbl)
+
+            self.profile_combo = QComboBox()
+            for pkey, plabel in DOWNLOAD_PROFILES.items():
+                self.profile_combo.addItem(plabel, pkey)
+            self.profile_combo.currentIndexChanged.connect(self._update_size_estimate)
+            form.addRow("Download Scope:", self.profile_combo)
+
+            voice_row = QHBoxLayout()
+            self.voice_checks: dict[str, QCheckBox] = {}
+            for code, label in VOICE_LANGS:
+                chk = QCheckBox(label)
+                chk.stateChanged.connect(self._update_size_estimate)
+                self.voice_checks[code] = chk
+                voice_row.addWidget(chk)
+            voice_row.addStretch()
+            form.addRow("Extra Voice Packs:", voice_row)
+
+            w_row = QHBoxLayout()
+            self.workers_spin = QSpinBox()
+            self.workers_spin.setRange(1, 8)
+            self.workers_spin.setValue(4)
+            self.chk_skip_space = QCheckBox("Skip free disk space check")
+            w_row.addWidget(self.workers_spin)
+            w_row.addSpacing(12)
+            w_row.addWidget(self.chk_skip_space)
+            w_row.addStretch()
+            form.addRow("Parallel Workers:", w_row)
+
+            dest_row = QHBoxLayout()
+            self.dest_edit = QLineEdit(str(self.dest_root))
+            self.dest_edit.textChanged.connect(self._update_size_estimate)
+            btn_dest = QPushButton("Browse...")
+            btn_dest.clicked.connect(self._browse_dest)
+            dest_row.addWidget(self.dest_edit, 1)
+            dest_row.addWidget(btn_dest)
+            form.addRow("Save To Folder:", dest_row)
+
+            lay.addLayout(form)
+
+            self.space_lbl = QLabel("")
+            self.space_lbl.setWordWrap(True)
+            lay.addWidget(self.space_lbl)
+
+            self.status_lbl = QLabel("")
+            self.status_lbl.setStyleSheet("color: #93c5fd; font-weight: 600;")
+            self.status_lbl.setMinimumWidth(0)
+            self.status_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self.status_lbl.setVisible(False)
+            lay.addWidget(self.status_lbl)
+
+            self.pbar = QProgressBar()
+            self.pbar.setVisible(False)
+            lay.addWidget(self.pbar)
+
+            self.log_box = QPlainTextEdit()
+            self.log_box.setReadOnly(True)
+            self.log_box.setMaximumBlockCount(3000)
+            self.log_box.setFont(QFont("JetBrains Mono, Consolas, monospace", 9))
+            self.log_box.setPlaceholderText("CDN manifest and download logs appear here...")
+            lay.addWidget(self.log_box, 1)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            self.btn_cancel = QPushButton("Pause / Cancel")
+            self.btn_cancel.setEnabled(False)
+            self.btn_cancel.clicked.connect(self._cancel_dl)
+            self.btn_close = QPushButton("Close")
+            self.btn_close.clicked.connect(self.reject)
+            self.btn_start = QPushButton("Start Download")
+            self.btn_start.setObjectName("primaryBtn")
+            self.btn_start.clicked.connect(self._start_dl)
+            btn_row.addWidget(self.btn_cancel)
+            btn_row.addWidget(self.btn_close)
+            btn_row.addWidget(self.btn_start)
+            lay.addLayout(btn_row)
+
+            self._probe_cdn()
+
+        def _browse_dest(self):
+            start = self.dest_edit.text().strip() or str(Path.home())
+            d = QFileDialog.getExistingDirectory(self, "Select Destination Folder", start)
+            if d:
+                self.dest_edit.setText(d)
+
+        def _probe_cdn(self):
+            if self._dl_worker and self._dl_worker.isRunning():
+                return
+            if self._info_worker and self._info_worker.isRunning():
+                self._info_worker.wait(1500)
+            reg = self.region_combo.currentData() or "global"
+            self.build_lbl.setText(f"Querying HoYoverse CDN ({reg})...")
+            self.build_lbl.setStyleSheet("color: #93c5fd;")
+            self._info_worker = CdnInfoWorker(reg)
+            self._info_worker.ready.connect(self._on_info_ready)
+            self._info_worker.failed.connect(self._on_info_failed)
+            self._info_worker.start()
+
+        def _on_info_ready(self, info: dict):
+            self._info = info
+            self.build_lbl.setText(f"ZZZ PC v{info['version']} (build {info['build_id']})")
+            self.build_lbl.setStyleSheet("color: #4ade80; font-weight: 600;")
+            for idx in range(self.profile_combo.count()):
+                pk = self.profile_combo.itemData(idx)
+                st = info["profiles"].get(pk)
+                if st:
+                    gb = st["size"] / (1024 ** 3)
+                    self.profile_combo.setItemText(idx, f"{DOWNLOAD_PROFILES[pk]} — {st['file_count']:,} files ({gb:.2f} GB)")
+            for code, label in VOICE_LANGS:
+                v = info["voices"].get(code)
+                if v:
+                    self.voice_checks[code].setText(f"{label} ({v['size'] / (1024 ** 3):.2f} GB)")
+            self._update_size_estimate()
+
+        def _on_info_failed(self, msg: str):
+            self.build_lbl.setText(f"Could not query CDN: {msg}")
+            self.build_lbl.setStyleSheet("color: #f87171;")
+
+        def _update_size_estimate(self):
+            dest = Path(self.dest_edit.text().strip() or str(Path.home() / "OpenZenless_ZZZ_PC")).expanduser()
+            probe = dest
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            try:
+                free_gb = shutil.disk_usage(probe).free / (1024 ** 3)
+            except OSError:
+                free_gb = 0.0
+            if not self._info:
+                self.space_lbl.setText(f"Free disk space at destination: {free_gb:.1f} GB")
+                self.space_lbl.setStyleSheet("color: #94a3b8;")
+                return
+            pk = self.profile_combo.currentData() or "assets"
+            st = self._info["profiles"].get(pk) or {}
+            need_bytes = int(st.get("size") or 0)
+            n_files = int(st.get("file_count") or 0)
+            for code, chk in self.voice_checks.items():
+                if chk.isChecked() and code in self._info["voices"]:
+                    need_bytes += int(self._info["voices"][code]["size"])
+                    n_files += int(self._info["voices"][code]["file_count"])
+            need_gb = need_bytes / (1024 ** 3)
+            self.space_lbl.setText(
+                f"Estimated download: {need_gb:.2f} GB ({n_files:,} files)  •  Free disk space: {free_gb:.1f} GB"
+            )
+            if free_gb > 0 and free_gb < need_gb * 1.03:
+                self.space_lbl.setStyleSheet("color: #f87171;")
+            else:
+                self.space_lbl.setStyleSheet("color: #4ade80;")
+
+        def _start_dl(self):
+            if self._dl_worker and self._dl_worker.isRunning():
+                return
+            dest = Path(self.dest_edit.text().strip() or str(Path.home() / "OpenZenless_ZZZ_PC")).expanduser()
+            reg = self.region_combo.currentData() or "global"
+            prof = self.profile_combo.currentData() or "assets"
+            langs = [c for c, chk in self.voice_checks.items() if chk.isChecked()]
+            workers = self.workers_spin.value()
+
+            self.log_box.clear()
+            self.status_lbl.setText("Starting HoYoverse CDN download...")
+            self.status_lbl.setStyleSheet("color: #93c5fd; font-weight: 600;")
+            self.status_lbl.setVisible(True)
+            self.pbar.setRange(0, 0)
+            self.pbar.setVisible(True)
+            self.btn_start.setEnabled(False)
+            self.btn_refresh_info.setEnabled(False)
+            self.btn_close.setEnabled(False)
+            self.btn_cancel.setEnabled(True)
+
+            self._dl_worker = CdnDownloadWorker(
+                dest_root=dest,
+                region=reg,
+                profile=prof,
+                voice_langs=langs,
+                workers=workers,
+                ignore_space=self.chk_skip_space.isChecked(),
+            )
+            self._dl_worker.log_line.connect(self.log_box.appendPlainText)
+            self._dl_worker.progress_changed.connect(self._on_prog)
+            self._dl_worker.finished_ok.connect(self._on_dl_ok)
+            self._dl_worker.failed.connect(self._on_dl_fail)
+            self._dl_worker.start()
+
+        def _on_prog(self, pct: int, msg: str):
+            self.status_lbl.setText(msg)
+            self.status_lbl.setVisible(bool(msg))
+            if pct < 0:
+                self.pbar.setRange(0, 0)
+            else:
+                self.pbar.setRange(0, 100)
+                self.pbar.setValue(max(0, min(100, pct)))
+
+        def _cancel_dl(self):
+            if self._dl_worker:
+                self.status_lbl.setText("Pausing / cancelling download (progress saved)...")
+                self.status_lbl.setStyleSheet("color: #fbbf24; font-weight: 600;")
+                self._dl_worker.cancel()
+                self.btn_cancel.setEnabled(False)
+
+        def _reset_btns(self):
+            self.pbar.setVisible(False)
+            self.btn_start.setEnabled(True)
+            self.btn_refresh_info.setEnabled(True)
+            self.btn_close.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+
+        def _on_dl_ok(self, out_path: str):
+            self._reset_btns()
+            self.status_lbl.setStyleSheet("color: #4ade80; font-weight: 600;")
+            self.dest_root = Path(out_path)
+            self.accept()
+
+        def _on_dl_fail(self, msg: str):
+            self._reset_btns()
+            self.status_lbl.setText(f"Stopped: {msg}")
+            self.status_lbl.setStyleSheet("color: #f87171; font-weight: 600;")
+            self.log_box.appendPlainText(f"ERROR: {msg}")
+            QMessageBox.warning(self, "HoYoverse CDN Download", msg)
+
+        def reject(self):
+            if self._dl_worker and self._dl_worker.isRunning():
+                self._dl_worker.cancel()
+                _retire_thread(self._dl_worker, 5000)
+            if self._info_worker and self._info_worker.isRunning():
+                _retire_thread(self._info_worker, 2000)
+            super().reject()
+
     class PhoneImportDialog(QDialog):
         def __init__(self, parent=None, default_dest: Path | None = None):
             super().__init__(parent)
             self.setWindowTitle("Load Zenless Zone Zero from Phone (ADB)")
-            self.resize(680, 470)
+            _fit_to_screen(self, 700, 520)
             self.dest_root: Path = default_dest or (Path.home() / "OpenZenless_ZZZ_Android")
             self._worker: PhoneImportWorker | None = None
+            self._adb_worker: ToolsInstallWorker | None = None
             self._detected_pkg: str = "com.HoYoverse.Nap"
             self._devices: list[dict] = []
 
@@ -812,10 +1379,25 @@ def launch_gui(root_path: Path):
             self.dev_combo = QComboBox()
             self.dev_combo.currentIndexChanged.connect(self._on_device_changed)
             dev_row.addWidget(self.dev_combo, 1)
+            self.btn_install_adb = QPushButton("Auto-Install ADB")
+            self.btn_install_adb.setObjectName("primaryBtn")
+            self.btn_install_adb.setToolTip("Download & install portable Google Android Platform-Tools (`adb`) automatically")
+            self.btn_install_adb.clicked.connect(self._auto_install_adb)
+            dev_row.addWidget(self.btn_install_adb)
             self.btn_refresh = QPushButton("Refresh Devices")
             self.btn_refresh.clicked.connect(self._refresh_devices)
             dev_row.addWidget(self.btn_refresh)
             lay.addLayout(dev_row)
+
+            wifi_row = QHBoxLayout()
+            wifi_row.addWidget(QLabel("Wireless ADB:"))
+            self.wifi_edit = QLineEdit()
+            self.wifi_edit.setPlaceholderText("Optional phone IP:Port (e.g. 192.168.1.50:5555)")
+            self.btn_wifi_connect = QPushButton("Connect")
+            self.btn_wifi_connect.clicked.connect(self._connect_wireless)
+            wifi_row.addWidget(self.wifi_edit, 1)
+            wifi_row.addWidget(self.btn_wifi_connect)
+            lay.addLayout(wifi_row)
 
             self.dev_status = QLabel("")
             self.dev_status.setWordWrap(True)
@@ -862,6 +1444,10 @@ def launch_gui(root_path: Path):
             lay.addWidget(self.log_box, 1)
 
             btn_row = QHBoxLayout()
+            self.btn_fallback_cdn = QPushButton("No Phone? Download PC Build (CDN)...")
+            self.btn_fallback_cdn.setToolTip("Download official ZZZ PC build directly from HoYoverse CDN instead")
+            self.btn_fallback_cdn.clicked.connect(self._fallback_to_cdn)
+            btn_row.addWidget(self.btn_fallback_cdn)
             btn_row.addStretch()
             self.btn_cancel = QPushButton("Cancel")
             self.btn_cancel.setEnabled(False)
@@ -878,6 +1464,59 @@ def launch_gui(root_path: Path):
 
             self._refresh_devices()
 
+        def _auto_install_adb(self):
+            if self._adb_worker and self._adb_worker.isRunning():
+                return
+            self.log_box.clear()
+            self.transfer_status.setText("Installing Google Android Platform-Tools (ADB)...")
+            self.transfer_status.setStyleSheet("color: #93c5fd; font-weight: 600;")
+            self.transfer_status.setVisible(True)
+            self.progress.setRange(0, 0)
+            self.progress.setVisible(True)
+            self.btn_install_adb.setEnabled(False)
+            self.btn_refresh.setEnabled(False)
+
+            self._adb_worker = ToolsInstallWorker(
+                lambda lcb, pcb, ce: ensure_adb(log_cb=lcb, progress_cb=pcb, cancel_event=ce)
+            )
+            self._adb_worker.log_line.connect(self.log_box.appendPlainText)
+            self._adb_worker.progress_changed.connect(self._on_progress)
+            self._adb_worker.finished_ok.connect(self._on_adb_installed)
+            self._adb_worker.failed.connect(self._on_adb_failed)
+            self._adb_worker.start()
+
+        def _on_adb_installed(self):
+            self.progress.setVisible(False)
+            self.btn_install_adb.setEnabled(True)
+            self.btn_refresh.setEnabled(True)
+            self.transfer_status.setStyleSheet("color: #4ade80; font-weight: 600;")
+            self._refresh_devices()
+
+        def _on_adb_failed(self, msg: str):
+            self.progress.setVisible(False)
+            self.btn_install_adb.setEnabled(True)
+            self.btn_refresh.setEnabled(True)
+            self.transfer_status.setText(f"ADB install failed: {msg}")
+            self.transfer_status.setStyleSheet("color: #f87171; font-weight: 600;")
+            QMessageBox.warning(self, "ADB Install Failed", msg)
+
+        def _connect_wireless(self):
+            if not find_adb():
+                QMessageBox.information(self, "ADB Required", "Click 'Auto-Install ADB' first before connecting wirelessly.")
+                return
+            target = self.wifi_edit.text().strip()
+            ok, msg = adb_connect_wireless(target)
+            self.log_box.appendPlainText(msg)
+            if not ok:
+                QMessageBox.warning(self, "Wireless ADB", msg)
+            self._refresh_devices()
+
+        def _fallback_to_cdn(self):
+            dlg = CdnDownloadDialog(self)
+            if dlg.exec() == QDialog.Accepted:
+                self.dest_root = dlg.dest_root
+                self.accept()
+
         def _browse_dest(self):
             start = self.dest_edit.text().strip() or str(Path.home())
             d = QFileDialog.getExistingDirectory(self, "Select Destination Folder", start)
@@ -888,16 +1527,20 @@ def launch_gui(root_path: Path):
             self.dev_combo.blockSignals(True)
             self.dev_combo.clear()
             self._devices = []
-            if not find_adb():
+            adb_exe = find_adb()
+            self.btn_install_adb.setVisible(not bool(adb_exe))
+            self.btn_wifi_connect.setEnabled(bool(adb_exe))
+            if not adb_exe:
                 self.dev_status.setText(
-                    "ADB (`adb`) was not found on PATH. Install Android Platform Tools (e.g. `sudo apt install adb`) and click Refresh Devices."
+                    "ADB (`adb`) was not found. Click 'Auto-Install ADB' above to download portable Google Platform-Tools, "
+                    "or use 'No Phone? Download PC Build (CDN)...' below."
                 )
                 self.dev_status.setStyleSheet("color: #f87171;")
                 self.btn_start.setEnabled(False)
                 self.dev_combo.blockSignals(False)
                 return
             try:
-                self._devices = list_adb_devices()
+                self._devices = list_adb_devices(adb=adb_exe)
             except Exception as ex:
                 self.dev_status.setText(f"Failed to query ADB: {ex}")
                 self.dev_status.setStyleSheet("color: #f87171;")
@@ -911,7 +1554,8 @@ def launch_gui(root_path: Path):
 
             if not self._devices:
                 self.dev_status.setText(
-                    "No ADB devices detected. Enable Developer Options & USB Debugging on your phone, connect via USB, and click Refresh Devices."
+                    "No ADB devices detected. Enable USB Debugging on your phone (or connect Wireless ADB), "
+                    "or download the PC build directly via HoYoverse CDN below."
                 )
                 self.dev_status.setStyleSheet("color: #fbbf24;")
                 self.btn_start.setEnabled(False)
@@ -925,6 +1569,14 @@ def launch_gui(root_path: Path):
             dev = self._devices[idx]
             serial = dev["serial"]
             state = dev["state"]
+            if state == "no_permissions":
+                self.dev_status.setText(
+                    f"Device {serial} has insufficient USB permissions (`no permissions`). "
+                    "Add udev rules (e.g. install `android-udev`) or add your user to `plugdev`, replug USB, or connect via Wireless ADB."
+                )
+                self.dev_status.setStyleSheet("color: #f87171;")
+                self.btn_start.setEnabled(False)
+                return
             if state == "unauthorized":
                 self.dev_status.setText(
                     f"Device {serial} is unauthorized. Unlock your phone and accept the 'Allow USB debugging?' prompt, then click Refresh Devices."
@@ -980,6 +1632,7 @@ def launch_gui(root_path: Path):
             self.btn_start.setEnabled(False)
             self.btn_refresh.setEnabled(False)
             self.btn_close.setEnabled(False)
+            self.btn_fallback_cdn.setEnabled(False)
             self.btn_cancel.setEnabled(True)
             self.log_box.appendPlainText(
                 f"Device: {serial} | Package: {self._detected_pkg} | Destination: {dest}"
@@ -1021,6 +1674,7 @@ def launch_gui(root_path: Path):
             self.btn_start.setEnabled(True)
             self.btn_refresh.setEnabled(True)
             self.btn_close.setEnabled(True)
+            self.btn_fallback_cdn.setEnabled(True)
             self.btn_cancel.setEnabled(False)
 
         def _on_pull_ok(self, out_path: str):
@@ -1036,11 +1690,18 @@ def launch_gui(root_path: Path):
             self.log_box.appendPlainText(f"ERROR: {msg}")
             QMessageBox.warning(self, "ADB Import Failed", msg)
 
+        def reject(self):
+            for th in (self._worker, self._adb_worker):
+                if th is not None and th.isRunning():
+                    th.cancel()
+                    th.wait(3000)
+            super().reject()
+
     class GameRootDialog(QDialog):
         def __init__(self, initial_root: Path, parent=None):
             super().__init__(parent)
             self.setWindowTitle("OpenZenless — Select ZZZ Game Installation")
-            self.resize(680, 260)
+            _fit_to_screen(self, 740, 320)
             self.selected_root = initial_root
 
             lay = QVBoxLayout(self)
@@ -1052,24 +1713,45 @@ def launch_gui(root_path: Path):
             lay.addWidget(title)
 
             desc = QLabel(
-                "Choose your ZZZ PC install folder (ZenlessZoneZero Game), an existing Android dump folder "
-                "(com.HoYoverse.Nap or its files/ folder), or pull directly from a connected Android phone via ADB."
+                "Select an existing ZZZ PC or Android build, pull from your Android phone via ADB, "
+                "or download the official PC files directly from HoYoverse's CDN."
             )
             desc.setWordWrap(True)
             desc.setStyleSheet("color: #94a3b8;")
             lay.addWidget(desc)
 
+            detected = cfg.scan_existing_game_installs()
+            if detected:
+                det_row = QHBoxLayout()
+                det_row.addWidget(QLabel("Detected Builds:"))
+                self.detected_combo = QComboBox()
+                self.detected_combo.addItem(f"Found {len(detected)} ZZZ install(s) — select to fill...", "")
+                for dp in detected:
+                    fr = cfg.resolve_files_root(dp)
+                    plat = cfg.detect_build_platform(dp, fr)
+                    self.detected_combo.addItem(f"[{plat}] {dp}", str(dp))
+                self.detected_combo.currentIndexChanged.connect(self._pick_detected)
+                det_row.addWidget(self.detected_combo, 1)
+                lay.addLayout(det_row)
+            else:
+                self.detected_combo = None
+
+            start_val = str(initial_root) if cfg.is_valid_game_root(initial_root) else (str(detected[0]) if detected else "")
             row = QHBoxLayout()
-            self.path_edit = QLineEdit(str(initial_root) if cfg.is_valid_game_root(initial_root) else "")
+            self.path_edit = QLineEdit(start_val)
             self.path_edit.setPlaceholderText("Select ZZZ game root folder...")
             self.path_edit.textChanged.connect(self._validate_path)
             btn_browse = QPushButton("Browse...")
             btn_browse.clicked.connect(self._browse)
             btn_phone = QPushButton("Load from Phone (ADB)...")
             btn_phone.clicked.connect(self._load_from_phone)
+            self.btn_cdn = QPushButton("Download PC Build (CDN)...")
+            self.btn_cdn.setToolTip("Download official Zenless Zone Zero PC files directly from HoYoverse CDN")
+            self.btn_cdn.clicked.connect(self._download_from_cdn)
             row.addWidget(self.path_edit, 1)
             row.addWidget(btn_browse)
             row.addWidget(btn_phone)
+            row.addWidget(self.btn_cdn)
             lay.addLayout(row)
 
             self.status_lbl = QLabel("")
@@ -1077,6 +1759,10 @@ def launch_gui(root_path: Path):
             lay.addWidget(self.status_lbl)
 
             btn_row = QHBoxLayout()
+            btn_tools = QPushButton("Tools & Dependencies...")
+            btn_tools.setToolTip("Inspect and auto-install AnimeStudio.CLI, Wine, .NET 9, ADB, vgmstream & Blender")
+            btn_tools.clicked.connect(self._open_tools)
+            btn_row.addWidget(btn_tools)
             btn_row.addStretch()
             self.btn_skip = QPushButton("Skip for now")
             self.btn_skip.clicked.connect(self.reject)
@@ -1088,6 +1774,12 @@ def launch_gui(root_path: Path):
             lay.addLayout(btn_row)
 
             self._validate_path(self.path_edit.text())
+
+        def _pick_detected(self, idx: int):
+            if self.detected_combo and idx > 0:
+                p = self.detected_combo.itemData(idx)
+                if p:
+                    self.path_edit.setText(p)
 
         def _browse(self):
             start = self.path_edit.text().strip() or str(Path.home())
@@ -1103,6 +1795,18 @@ def launch_gui(root_path: Path):
                 self.path_edit.setText(str(dlg.dest_root))
                 self._validate_path(str(dlg.dest_root))
 
+        def _download_from_cdn(self):
+            cur = self.path_edit.text().strip()
+            default_dest = Path(cur) if cur else (Path.home() / "OpenZenless_ZZZ_PC")
+            dlg = CdnDownloadDialog(self, default_dest=default_dest)
+            if dlg.exec() == QDialog.Accepted:
+                self.path_edit.setText(str(dlg.dest_root))
+                self._validate_path(str(dlg.dest_root))
+
+        def _open_tools(self):
+            cur = Path(self.path_edit.text().strip() or str(self.selected_root))
+            ToolsManagerDialog(cur, self).exec()
+
         def _validate_path(self, text: str):
             p = Path(text.strip()) if text.strip() else None
             if p and cfg.is_valid_game_root(p):
@@ -1112,7 +1816,9 @@ def launch_gui(root_path: Path):
                 self.status_lbl.setStyleSheet("color: #4ade80;")
                 self.btn_continue.setEnabled(True)
             else:
-                self.status_lbl.setText("No ZZZ Blocks/ or .blk/.pck files detected in this folder yet.")
+                self.status_lbl.setText(
+                    "No ZZZ Blocks/ or .blk/.pck files detected yet. Choose a folder, pull via Phone ADB, or download via HoYoverse CDN."
+                )
                 self.status_lbl.setStyleSheet("color: #fbbf24;")
                 self.btn_continue.setEnabled(False)
 
@@ -1129,7 +1835,7 @@ def launch_gui(root_path: Path):
             self.setWindowTitle("OpenZenless — ZZZ Proprietary File Explorer")
             if cfg.LOGO_ICON.is_file():
                 self.setWindowIcon(QIcon(str(cfg.LOGO_ICON)))
-            self.resize(1500, 920)
+            _fit_to_screen(self, 1500, 920)
             self.game_root = initial_root
             self.files_root = cfg.resolve_files_root(initial_root)
             self.current_dir: Path | None = None
@@ -1393,7 +2099,88 @@ def launch_gui(root_path: Path):
                 self.viewer_widget.unload_scene(reason)
 
         def _build_viewer_page(self) -> QWidget:
-            self.viewer_widget = NativeViewerWidget(choose_output_cb=self._choose_output_root)
+            if NativeViewerWidget is not None:
+                self.viewer_widget = NativeViewerWidget(choose_output_cb=self._choose_output_root)
+                return self.viewer_widget
+
+            class _FallbackViewerWidget(QWidget):
+                def __init__(self, parent=None):
+                    super().__init__(parent)
+                    self._worker: BatchExportWorker | None = None
+                    lay = QVBoxLayout(self)
+                    lay.setContentsMargins(28, 28, 28, 28)
+                    lay.setSpacing(12)
+                    title = QLabel("3D Viewer Dependencies Required")
+                    title.setStyleSheet("font-size: 16px; font-weight: 700; color: #f59e0b;")
+                    lay.addWidget(title)
+                    msg = QLabel(
+                        "The native OpenGL 3D Viewer requires `numpy`, `PyOpenGL`, and `pygltflib` "
+                        "(plus system OpenGL drivers).\n\n"
+                        f"Import error: {_VIEWER_IMPORT_ERR}"
+                    )
+                    msg.setWordWrap(True)
+                    msg.setStyleSheet("color: #cbd5e1;")
+                    lay.addWidget(msg)
+                    self.btn_install = QPushButton("Install 3D Viewer Dependencies (numpy, PyOpenGL, pygltflib)")
+                    self.btn_install.setObjectName("primaryBtn")
+                    self.btn_install.clicked.connect(self._install_deps)
+                    lay.addWidget(self.btn_install, alignment=Qt.AlignLeft)
+                    self.log_box = QPlainTextEdit()
+                    self.log_box.setReadOnly(True)
+                    self.log_box.setVisible(False)
+                    lay.addWidget(self.log_box, 1)
+                    lay.addStretch()
+
+                def _install_deps(self):
+                    if self._worker and self._worker.isRunning():
+                        return
+                    self.btn_install.setEnabled(False)
+                    self.log_box.setVisible(True)
+                    self.log_box.clear()
+
+                    def _task(cb):
+                        cmd = [sys.executable, "-m", "pip", "install", "numpy", "PyOpenGL", "pygltflib"]
+                        cb("$ " + " ".join(cmd))
+                        proc = subprocess.Popen(
+                            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace", bufsize=1,
+                            **cfg.subprocess_no_window_kwargs(),
+                        )
+                        assert proc.stdout is not None
+                        for ln in proc.stdout:
+                            cb(ln.rstrip("\n"))
+                        return proc.wait()
+
+                    self._worker = BatchExportWorker(_task)
+                    self._worker.log_line.connect(self.log_box.appendPlainText)
+                    self._worker.finished_rc.connect(lambda rc: (
+                        self.btn_install.setEnabled(True),
+                        QMessageBox.information(
+                            self, "3D Viewer Dependencies",
+                            "Installed! Restart OpenZenless to enable the Native 3D Viewer."
+                            if rc == 0 else f"pip exited with code {rc}; see log.",
+                        ),
+                    ))
+                    self._worker.failed.connect(lambda err: (
+                        self.btn_install.setEnabled(True),
+                        self.log_box.appendPlainText(f"[ERROR] {err}"),
+                    ))
+                    self._worker.start()
+
+                def unload_scene(self, _reason: str = ""):
+                    pass
+
+                def has_loaded_scene(self) -> bool:
+                    return False
+
+                def refresh_catalog(self):
+                    pass
+
+                def shutdown(self):
+                    if self._worker and self._worker.isRunning():
+                        self._worker.wait(2000)
+
+            self.viewer_widget = _FallbackViewerWidget(self)
             return self.viewer_widget
 
         def _choose_output_root(self):
@@ -2327,35 +3114,23 @@ def launch_gui(root_path: Path):
 
         def _refresh_version_badge(self):
             v = cfg.collect_game_version(self.game_root)
-            cli_tag = "CLI+Wine OK" if (v["cli_exists"] and v["wine_exists"]) else "CLI/Wine Missing"
+            if v["cli_ready"]:
+                cli_tag = "CLI Ready" if cfg.is_windows() else "CLI+Wine OK"
+            elif not v["cli_exists"]:
+                cli_tag = "CLI Missing (Click to Setup)"
+            else:
+                cli_tag = "Wine Missing (Click to Setup)"
             txt = f"{v['platform']} | Unity {v['unity_version']} | res {v['res_revision']} | {v['blk_count']} .blk | {cli_tag}"
             self.header_version_pill.setText(txt)
 
         def show_version_dialog(self):
-            v = cfg.collect_game_version(self.game_root)
-            lines = [
-                f"Platform:         {v['platform']}",
-                f"Game Root:        {v['game_root']}",
-                f"Files Root:       {v['files_root']} ({'OK' if v['exists'] else 'MISSING'})",
-                f"Unity Version:    {v['unity_version']}",
-                f"Base Revision:    {v['base_revision']}",
-                f"Res Revision:     {v['res_revision']}",
-                f"Data Revision:    {v['data_revision']}",
-                f"Audio Revision:   {v['audio_revision']}",
-                f"Silence Revision: {v['silence_revision']}",
-                f"OP Version:       {v['op_version']}",
-                f"Audio Lang:       {v['audio_lang']}",
-                f".blk Containers:  {v['blk_count']:,}",
-                f".pck Archives:    {v['pck_count']:,}",
-                f"AnimeStudio CLI:  {cfg.CLI_EXE} ({'OK' if v['cli_exists'] else 'MISSING'})",
-                f"Wine Runtime:     {'OK' if v['wine_exists'] else 'MISSING'}",
-            ]
-            QMessageBox.information(self, "ZZZ Build & Environment Check", "\n".join(lines))
+            ToolsManagerDialog(self.game_root, self).exec()
+            self._refresh_version_badge()
 
         def show_docs_dialog(self):
             dlg = QDialog(self)
-            dlg.setWindowTitle("ZZZ BlkExplorer — CLI & GUI Documentation")
-            dlg.resize(820, 620)
+            dlg.setWindowTitle("OpenZenless — CLI & GUI Documentation")
+            _fit_to_screen(dlg, 820, 620)
             lay = QVBoxLayout(dlg)
             view = QTextBrowser()
             if cfg.DOC_FILE.exists():
@@ -2609,8 +3384,7 @@ def launch_gui(root_path: Path):
             is_blk_tex = (
                 self.current_mode == "blk"
                 and r["type"] in ("Texture2D", "Sprite")
-                and cfg.CLI_EXE.exists()
-                and shutil.which("wine") is not None
+                and cfg.can_run_cli()
             )
             self.btn_preview_tex.setVisible(is_blk_tex)
             self.btn_preview_tex.setEnabled(is_blk_tex)
@@ -2901,5 +3675,9 @@ def launch_gui(root_path: Path):
     win.show()
     win.raise_()
     win.activateWindow()
-    sys.exit(app.exec())
+    rc = app.exec()
+    for th in list(_detached_threads):
+        if th.isRunning():
+            th.wait(5000)
+    sys.exit(rc)
 

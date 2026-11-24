@@ -10,6 +10,7 @@ import math
 import os
 import re
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -45,7 +46,7 @@ from . import config as cfg
 def _release_os_memory() -> None:
     """Run Python GC and return freed heap arenas to the OS on Linux glibc."""
     gc.collect()
-    if os.name == "posix":
+    if sys.platform.startswith("linux"):
         try:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:

@@ -20,6 +20,8 @@ try:
 except ImportError:
     pty = None
 
+from . import config as cfg
+
 ZZZ_PACKAGES = ("com.HoYoverse.Nap", "com.miHoYo.Nap")
 
 _ADB_PCT_RE = re.compile(r"^\[\s*(\d+)%\]\s*(.+)$")
@@ -49,19 +51,32 @@ def _ts(msg: str) -> str:
 
 
 def find_adb() -> str | None:
-    """Return path to the `adb` executable if installed on PATH."""
-    return shutil.which("adb")
+    """Return path to the `adb` executable across portable tools, SDK dirs, and PATH."""
+    return cfg.find_adb()
+
+
+def ensure_adb_available(
+    log_cb: Callable[[str], None] | None = None,
+    progress_cb: Callable[[int, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str | None:
+    """Return existing `adb` or auto-install Google Android Platform-Tools into TOOLS_DIR."""
+    from .tools import ensure_adb
+    return ensure_adb(log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event)
 
 
 def _run_adb(args: list[str], serial: str | None = None, adb: str | None = None, timeout: int = 15) -> subprocess.CompletedProcess:
     exe = adb or find_adb()
     if not exe:
-        raise FileNotFoundError("adb executable not found in PATH")
+        raise FileNotFoundError("adb executable not found (click Auto-Install ADB or run `openzenless setup-tools --adb`).")
     cmd = [exe]
     if serial:
         cmd.extend(["-s", serial])
     cmd.extend(args)
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout,
+        **cfg.subprocess_no_window_kwargs(),
+    )
 
 
 def parse_adb_devices_output(output: str) -> list[dict]:
@@ -75,9 +90,14 @@ def parse_adb_devices_output(output: str) -> list[dict]:
         if len(parts) < 2:
             continue
         serial = parts[0]
-        state = parts[1]
+        if len(parts) >= 3 and parts[1] == "no" and parts[2].startswith("permissions"):
+            state = "no_permissions"
+            tok_start = 3
+        else:
+            state = parts[1]
+            tok_start = 2
         meta: dict[str, str] = {}
-        for tok in parts[2:]:
+        for tok in parts[tok_start:]:
             if ":" in tok:
                 k, v = tok.split(":", 1)
                 meta[k] = v
@@ -101,6 +121,32 @@ def list_adb_devices(adb: str | None = None) -> list[dict]:
     """Return connected ADB devices and their authorization states."""
     res = _run_adb(["devices", "-l"], adb=adb, timeout=10)
     return parse_adb_devices_output(res.stdout or "")
+
+
+def adb_connect_wireless(host_port: str, adb: str | None = None) -> tuple[bool, str]:
+    """Connect to a device over Wireless Debugging (`ip:port`)."""
+    target = host_port.strip()
+    if not target:
+        return False, "Enter a host:port (for example 192.168.1.50:5555)."
+    if ":" not in target:
+        target = f"{target}:5555"
+    res = _run_adb(["connect", target], adb=adb, timeout=15)
+    msg = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+    low = msg.lower()
+    ok = res.returncode == 0 and ("connected to" in low or "already connected" in low)
+    return ok, msg or f"adb connect exited with code {res.returncode}"
+
+
+def adb_pair_wireless(host_port: str, pairing_code: str, adb: str | None = None) -> tuple[bool, str]:
+    """Pair with an Android 11+ Wireless Debugging endpoint (`ip:port` + 6-digit code)."""
+    target = host_port.strip()
+    code = pairing_code.strip()
+    if not target or not code:
+        return False, "Both pairing host:port and 6-digit pairing code are required."
+    res = _run_adb(["pair", target, code], adb=adb, timeout=20)
+    msg = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+    ok = res.returncode == 0 and "successfully paired" in msg.lower()
+    return ok, msg or f"adb pair exited with code {res.returncode}"
 
 
 def _get_pkg_apk_paths(serial: str, pkg: str, adb: str | None = None) -> list[str]:
@@ -451,6 +497,7 @@ def _stream_adb_cmd(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        **cfg.subprocess_no_window_kwargs(),
     )
     assert proc.stdout is not None
     try:

@@ -1769,7 +1769,7 @@ def _build_oz_indexes_from_jsonl(
     if write_cab_map and cab_entries and common_base is not None:
         cab_bin = cfg.CLI_DIR / "Maps" / "ZZZ.bin"
         cab_meta = cfg.CLI_DIR / "Maps" / "ZZZ.ozmeta.json"
-        base_win = ("Z:" + str(common_base.resolve())).replace("/", "\\")
+        base_win = cfg.to_cli_path(common_base)
         _write_cab_map_bin(cab_entries, base_win, cab_bin)
         try:
             cab_meta.write_text(
@@ -2209,9 +2209,9 @@ def build_asset_map(
 
     if (
         use_cli_assetmap
+        and (cancel_event is None or not cancel_event.is_set())
         and blk_files
-        and cfg.CLI_EXE.is_file()
-        and shutil.which("wine") is not None
+        and cfg.can_run_cli()
         and (
             not oz_maps_file.is_file()
             or not oz_chars_file.is_file()
@@ -2230,7 +2230,7 @@ def build_asset_map(
             sl = map_dir / f"_oz_shard_{wi}.blklist"
             sj = map_dir / f"_oz_shard_{wi}.jsonl"
             sl.write_text(
-                "\n".join(("Z:" + str(p.resolve())).replace("/", "\\") for p in sblks) + "\n",
+                "\n".join(cfg.to_cli_path(p) for p in sblks) + "\n",
                 encoding="utf-8",
             )
             shard_lists.append(sl)
@@ -2242,19 +2242,19 @@ def build_asset_map(
         procs: list[subprocess.Popen] = []
 
         def _run_shard(wi: int):
-            env = os.environ.copy()
-            env["WINEDEBUG"] = "-all"
-            env["AS_DUMP_OZ_INDEX"] = ("Z:" + str(shard_jsonls[wi].resolve())).replace("/", "\\")
-            env["AS_OZ_INDEX_BASE_DIR"] = ("Z:" + str(common_base.resolve())).replace("/", "\\")
-            cmd = [
-                "wine", str(cfg.CLI_EXE),
-                ("Z:" + str(shard_lists[wi].resolve())).replace("/", "\\"),
-                ("Z:" + str(map_dir.resolve())).replace("/", "\\"),
+            env = cfg.build_cli_env({
+                "AS_DUMP_OZ_INDEX": cfg.to_cli_path(shard_jsonls[wi]),
+                "AS_OZ_INDEX_BASE_DIR": cfg.to_cli_path(common_base),
+            })
+            cmd = cfg.build_cli_cmd([
+                cfg.to_cli_path(shard_lists[wi]),
+                cfg.to_cli_path(map_dir),
                 "--game", "ZZZ",
-            ]
+            ])
             proc = subprocess.Popen(
                 cmd, cwd=str(cfg.CLI_DIR), env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                **cfg.subprocess_no_window_kwargs(),
             )
             with done_lock:
                 procs.append(proc)

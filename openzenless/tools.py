@@ -1,10 +1,21 @@
-"""Automatic tool bootstrapper for AnimeStudio.CLI and AnimeWwise."""
+"""Automatic tool bootstrapper and cross-platform portable installers for OpenZenless."""
 from __future__ import annotations
 
+import json
+import os
+import platform
 import re
 import shutil
+import stat
 import subprocess
-from pathlib import Path
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.request
+import zipfile
+from pathlib import Path, PurePosixPath
 
 from . import config as cfg
 
@@ -16,21 +27,175 @@ def _emit(log_cb, msg: str):
         print(msg, flush=True)
 
 
-def _stream_cmd(cmd: list[str], log_cb=None) -> int:
+def _stream_cmd(
+    cmd: list[str],
+    log_cb=None,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+) -> int:
     _emit(log_cb, f"$ {' '.join(cmd)}")
     proc = subprocess.Popen(
         cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env or cfg.build_cli_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        **cfg.subprocess_no_window_kwargs(),
     )
     assert proc.stdout is not None
     for line in proc.stdout:
         _emit(log_cb, line.rstrip("\n"))
     return proc.wait()
+
+
+def _download_url(
+    url: str,
+    dest: Path,
+    log_cb=None,
+    progress_cb=None,
+    cancel_event: threading.Event | None = None,
+    label: str = "",
+    timeout: int = 30,
+) -> Path:
+    """Download `url` to `dest` via a `.part` temp file with throttled progress and cancel support."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    tag = label or dest.name
+    _emit(log_cb, f"Downloading {tag}: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "OpenZenless/0.3"})
+    start_t = time.monotonic()
+    last_cb_t = 0.0
+    last_log_pct = -10
+    done = 0
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, part.open("wb") as out:
+            cl = resp.headers.get("Content-Length")
+            total = int(cl) if cl and cl.isdigit() else 0
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError(f"Cancelled download: {tag}")
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                now = time.monotonic()
+                pct = int(done * 100 / total) if total > 0 else -1
+                if now - last_cb_t >= 0.25 or (total > 0 and done >= total):
+                    last_cb_t = now
+                    mb_done = done / (1024 * 1024)
+                    rate = mb_done / max(0.2, now - start_t)
+                    if total > 0:
+                        mb_tot = total / (1024 * 1024)
+                        msg = f"{tag}: {mb_done:.1f} / {mb_tot:.1f} MB ({rate:.1f} MB/s)"
+                    else:
+                        msg = f"{tag}: {mb_done:.1f} MB ({rate:.1f} MB/s)"
+                    if progress_cb is not None:
+                        progress_cb(pct, msg)
+                    if log_cb is not None and pct >= 0 and pct - last_log_pct >= 20:
+                        last_log_pct = pct
+                        _emit(log_cb, f"  {msg} ({pct}%)")
+        part.replace(dest)
+        _emit(log_cb, f"Downloaded {tag} ({done / (1024 * 1024):.1f} MB)")
+        return dest
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+
+
+def _safe_dest_path(dest_dir: Path, raw_name: str, strip_top_dir: bool) -> Path | None:
+    norm = raw_name.replace("\\", "/").lstrip("/")
+    if not norm:
+        return None
+    posix = PurePosixPath(norm)
+    parts = [p for p in posix.parts if p not in ("", ".")]
+    if strip_top_dir:
+        parts = parts[1:]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    dest_resolved = dest_dir.resolve()
+    target = (dest_resolved.joinpath(*parts)).resolve()
+    if dest_resolved not in target.parents and target != dest_resolved:
+        return None
+    return target
+
+
+def _safe_extract_zip(zip_path: Path, dest_dir: Path, strip_top_dir: bool = False) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                target = _safe_dest_path(dest_dir, info.filename, strip_top_dir)
+                if target is not None:
+                    target.mkdir(parents=True, exist_ok=True)
+                continue
+            target = _safe_dest_path(dest_dir, info.filename, strip_top_dir)
+            if target is None:
+                continue
+            # Skip symlink entries in untrusted zips unless normal files
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode == stat.S_IFLNK:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info, "r") as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            perm = (info.external_attr >> 16) & 0o777
+            if os.name == "posix" and (perm & 0o111):
+                try:
+                    os.chmod(target, perm | 0o755)
+                except OSError:
+                    pass
+
+
+def _safe_extract_tar(tar_path: Path, dest_dir: Path, strip_top_dir: bool = False) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_resolved = dest_dir.resolve()
+    symlinks: list[tuple[Path, str]] = []
+    with tarfile.open(tar_path, "r:*") as tf:
+        for member in tf.getmembers():
+            target = _safe_dest_path(dest_dir, member.name, strip_top_dir)
+            if target is None:
+                continue
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.issym():
+                symlinks.append((target, member.linkname))
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                src = tf.extractfile(member)
+                if src is not None:
+                    with src, target.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                if os.name == "posix" and (member.mode & 0o111):
+                    try:
+                        os.chmod(target, (member.mode & 0o777) | 0o755)
+                    except OSError:
+                        pass
+        for link_target, linkname in symlinks:
+            link_path = Path(linkname)
+            if link_path.is_absolute():
+                continue
+            resolved_link = (link_target.parent / link_path).resolve()
+            if dest_resolved not in resolved_link.parents and resolved_link != dest_resolved:
+                continue
+            try:
+                link_target.parent.mkdir(parents=True, exist_ok=True)
+                link_target.unlink(missing_ok=True)
+                os.symlink(linkname, link_target)
+            except OSError:
+                pass
+
+
+def _chmod_exec(path: Path) -> None:
+    if os.name == "posix" and path.is_file():
+        try:
+            os.chmod(path, path.stat().st_mode | 0o755)
+        except OSError:
+            pass
 
 
 _OZ_DUMP_CS = (
@@ -2672,8 +2837,380 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
     return changed
 
 
-def ensure_extractor_tools(log_cb=None, progress_cb=None) -> dict:
-    """Install/build AnimeStudio.CLI and AnimeWwise into TOOLS_DIR if missing."""
+def ensure_adb(log_cb=None, progress_cb=None, cancel_event: threading.Event | None = None) -> str | None:
+    """Install portable Google Android Platform-Tools (`adb`) into TOOLS_DIR if missing."""
+    existing = cfg.find_adb()
+    if existing:
+        return existing
+
+    if cfg.is_windows():
+        url = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+        exe_name = "adb.exe"
+    elif cfg.is_macos():
+        url = "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip"
+        exe_name = "adb"
+    else:
+        url = "https://dl.google.com/android/repository/platform-tools-latest-linux.zip"
+        exe_name = "adb"
+
+    cfg.TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_zip = cfg.TOOLS_DIR / "_platform_tools_tmp.zip"
+    try:
+        _download_url(
+            url, tmp_zip, log_cb=log_cb, progress_cb=progress_cb,
+            cancel_event=cancel_event, label="Android Platform-Tools (ADB)",
+        )
+        _emit(log_cb, f"Extracting ADB to {cfg.TOOLS_DIR / 'platform-tools'}...")
+        _safe_extract_zip(tmp_zip, cfg.TOOLS_DIR, strip_top_dir=False)
+        adb_bin = cfg.TOOLS_DIR / "platform-tools" / exe_name
+        _chmod_exec(adb_bin)
+        _chmod_exec(cfg.TOOLS_DIR / "platform-tools" / "fastboot")
+        if adb_bin.is_file():
+            try:
+                res = subprocess.run(
+                    [str(adb_bin), "version"], capture_output=True, text=True,
+                    timeout=10, **cfg.subprocess_no_window_kwargs(),
+                )
+                first_ln = (res.stdout or "").strip().splitlines()[0] if res.stdout else ""
+                _emit(log_cb, f"ADB ready: {adb_bin} ({first_ln})")
+            except Exception as exc:
+                _emit(log_cb, f"ADB installed at {adb_bin} (version check note: {exc})")
+            return str(adb_bin)
+        _emit(log_cb, "[WARN] ADB archive extracted, but adb executable was not found.")
+        return cfg.find_adb()
+    finally:
+        tmp_zip.unlink(missing_ok=True)
+
+
+def ensure_vgmstream(log_cb=None, progress_cb=None, cancel_event: threading.Event | None = None) -> Path | None:
+    """Install portable vgmstream-cli release binary into TOOLS_DIR/vgmstream if missing."""
+    existing = cfg.find_vgmstream()
+    if existing and existing.is_file():
+        return existing
+
+    if cfg.is_windows():
+        url = "https://github.com/vgmstream/vgmstream/releases/latest/download/vgmstream-win64.zip"
+        exe_name = "vgmstream-cli.exe"
+    elif cfg.is_macos():
+        url = "https://github.com/vgmstream/vgmstream/releases/latest/download/vgmstream-mac.zip"
+        exe_name = "vgmstream-cli"
+    else:
+        url = "https://github.com/vgmstream/vgmstream/releases/latest/download/vgmstream-linux.zip"
+        exe_name = "vgmstream-cli"
+
+    dest_dir = cfg.TOOLS_DIR / "vgmstream"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    tmp_zip = cfg.TOOLS_DIR / "_vgmstream_tmp.zip"
+    try:
+        _download_url(
+            url, tmp_zip, log_cb=log_cb, progress_cb=progress_cb,
+            cancel_event=cancel_event, label="vgmstream-cli",
+        )
+        _emit(log_cb, f"Extracting vgmstream-cli to {dest_dir}...")
+        _safe_extract_zip(tmp_zip, dest_dir, strip_top_dir=False)
+        exe_path = dest_dir / exe_name
+        _chmod_exec(exe_path)
+        cfg._resolve_tool_paths()
+        if exe_path.is_file():
+            _emit(log_cb, f"vgmstream-cli ready: {exe_path}")
+            return exe_path
+        found = cfg.find_vgmstream()
+        if found:
+            _chmod_exec(found)
+        return found
+    finally:
+        tmp_zip.unlink(missing_ok=True)
+
+
+def _has_dotnet9_sdk(dotnet_bin: str) -> bool:
+    try:
+        res = subprocess.run(
+            [dotnet_bin, "--list-sdks"], capture_output=True, text=True,
+            timeout=15, **cfg.subprocess_no_window_kwargs(),
+        )
+        return any(line.strip().startswith("9.") for line in (res.stdout or "").splitlines())
+    except Exception:
+        return False
+
+
+def ensure_dotnet(log_cb=None, progress_cb=None, cancel_event: threading.Event | None = None) -> str | None:
+    """Install portable .NET 9.0 SDK into TOOLS_DIR/dotnet if no .NET 9 SDK is present."""
+    existing = cfg.find_dotnet()
+    if existing and _has_dotnet9_sdk(existing):
+        return existing
+
+    dotnet_dir = cfg.TOOLS_DIR / "dotnet"
+    dotnet_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.is_windows():
+        script_url = "https://dot.net/v1/dotnet-install.ps1"
+        script_path = cfg.TOOLS_DIR / "_dotnet-install.ps1"
+        exe_name = "dotnet.exe"
+    else:
+        script_url = "https://dot.net/v1/dotnet-install.sh"
+        script_path = cfg.TOOLS_DIR / "_dotnet-install.sh"
+        exe_name = "dotnet"
+
+    try:
+        _download_url(
+            script_url, script_path, log_cb=log_cb, progress_cb=progress_cb,
+            cancel_event=cancel_event, label=".NET 9 Installer",
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Cancelled .NET 9 installation.")
+        _emit(log_cb, f"Installing portable .NET 9.0 SDK to {dotnet_dir}...")
+        if cfg.is_windows():
+            ps = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+            cmd = [
+                ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(script_path), "-Channel", "9.0", "-InstallDir", str(dotnet_dir),
+            ]
+        else:
+            _chmod_exec(script_path)
+            cmd = ["bash", str(script_path), "--channel", "9.0", "--install-dir", str(dotnet_dir)]
+        rc = _stream_cmd(cmd, log_cb=log_cb)
+        if rc != 0:
+            _emit(log_cb, f"[WARN] .NET 9 installer exited with code {rc}.")
+        exe_path = dotnet_dir / exe_name
+        _chmod_exec(exe_path)
+        if exe_path.is_file():
+            _emit(log_cb, f".NET 9 SDK ready: {exe_path}")
+            return str(exe_path)
+        return cfg.find_dotnet()
+    finally:
+        script_path.unlink(missing_ok=True)
+
+
+def ensure_wine(log_cb=None, progress_cb=None, cancel_event: threading.Event | None = None) -> str | None:
+    """Install portable WoW64 Wine on Linux x86_64 into TOOLS_DIR/wine if Wine is missing."""
+    if cfg.is_windows():
+        return None
+    existing = cfg.find_wine()
+    if existing:
+        return existing
+
+    arch = platform.machine().lower()
+    if not (cfg.is_linux() and arch in ("x86_64", "amd64")):
+        hint = "brew install --cask wine-stable" if cfg.is_macos() else "Install Wine via your distribution package manager."
+        _emit(log_cb, f"[INFO] Portable auto-Wine is only available on Linux x86_64 ({cfg.is_linux()}/{arch}). {hint}")
+        return None
+
+    _emit(log_cb, "Querying latest Kron4ek portable WoW64 Wine release...")
+    req = urllib.request.Request(
+        "https://api.github.com/repos/Kron4ek/Wine-Builds/releases/latest",
+        headers={"User-Agent": "OpenZenless/0.3"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        rel = json.loads(resp.read().decode("utf-8", errors="replace"))
+    assets = rel.get("assets") or []
+    preferred = [a for a in assets if re.match(r"^wine-[^-]+-amd64-wow64\.tar\.xz$", a.get("name", ""))]
+    if not preferred:
+        preferred = [a for a in assets if a.get("name", "").endswith("amd64-wow64.tar.xz")]
+    if not preferred:
+        _emit(log_cb, "[WARN] Could not find an amd64-wow64 Wine build in Kron4ek releases.")
+        return None
+
+    asset = preferred[0]
+    wine_dir = cfg.TOOLS_DIR / "wine"
+    tmp_tar = cfg.TOOLS_DIR / f"_{asset['name']}"
+    try:
+        _download_url(
+            asset["browser_download_url"], tmp_tar, log_cb=log_cb,
+            progress_cb=progress_cb, cancel_event=cancel_event, label=f"Portable {asset['name']}",
+        )
+        if wine_dir.exists():
+            shutil.rmtree(wine_dir, ignore_errors=True)
+        _emit(log_cb, f"Extracting Wine into {wine_dir} (this may take a moment)...")
+        _safe_extract_tar(tmp_tar, wine_dir, strip_top_dir=True)
+        for bname in ("wine", "wine64", "wineserver", "wineboot", "winecfg"):
+            _chmod_exec(wine_dir / "bin" / bname)
+        wine_bin = wine_dir / "bin" / "wine"
+        if not wine_bin.is_file():
+            wine_bin = wine_dir / "bin" / "wine64"
+        if wine_bin.is_file():
+            try:
+                res = subprocess.run(
+                    [str(wine_bin), "--version"], env=cfg.build_cli_env(),
+                    capture_output=True, text=True, timeout=15,
+                )
+                _emit(log_cb, f"Portable Wine ready: {wine_bin} ({(res.stdout or '').strip()})")
+            except Exception as exc:
+                _emit(log_cb, f"Portable Wine extracted to {wine_bin} ({exc})")
+            return str(wine_bin)
+        return cfg.find_wine()
+    finally:
+        tmp_tar.unlink(missing_ok=True)
+
+
+def ensure_blender(log_cb=None, progress_cb=None, cancel_event: threading.Event | None = None) -> str | None:
+    """Install portable Blender 4.2 LTS into TOOLS_DIR/blender on Linux x64 / Windows x64."""
+    existing = cfg.find_blender()
+    if existing:
+        return existing
+
+    arch = platform.machine().lower()
+    if arch not in ("x86_64", "amd64"):
+        _emit(log_cb, f"[INFO] Portable Blender auto-install targets x86_64/amd64 (got {arch}). Install Blender from blender.org.")
+        return None
+    if cfg.is_macos():
+        _emit(log_cb, "[INFO] On macOS, install Blender from https://www.blender.org/download/ or `brew install --cask blender`.")
+        return None
+
+    idx_url = "https://download.blender.org/release/Blender4.2/"
+    req = urllib.request.Request(idx_url, headers={"User-Agent": "OpenZenless/0.3"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    if cfg.is_windows():
+        matches = sorted(set(re.findall(r"blender-4\.2\.\d+-windows-x64\.zip", html)))
+        exe_name = "blender.exe"
+    else:
+        matches = sorted(set(re.findall(r"blender-4\.2\.\d+-linux-x64\.tar\.xz", html)))
+        exe_name = "blender"
+
+    if not matches:
+        _emit(log_cb, "[WARN] Could not locate Blender 4.2 LTS archive on download.blender.org.")
+        return None
+
+    fname = matches[-1]
+    bl_dir = cfg.TOOLS_DIR / "blender"
+    tmp_arch = cfg.TOOLS_DIR / f"_{fname}"
+    try:
+        _download_url(
+            idx_url + fname, tmp_arch, log_cb=log_cb,
+            progress_cb=progress_cb, cancel_event=cancel_event, label=fname,
+        )
+        if bl_dir.exists():
+            shutil.rmtree(bl_dir, ignore_errors=True)
+        _emit(log_cb, f"Extracting {fname} into {bl_dir}...")
+        if fname.endswith(".zip"):
+            _safe_extract_zip(tmp_arch, bl_dir, strip_top_dir=True)
+        else:
+            _safe_extract_tar(tmp_arch, bl_dir, strip_top_dir=True)
+        exe_path = bl_dir / exe_name
+        _chmod_exec(exe_path)
+        if exe_path.is_file():
+            _emit(log_cb, f"Blender ready: {exe_path}")
+            return str(exe_path)
+        return cfg.find_blender()
+    finally:
+        tmp_arch.unlink(missing_ok=True)
+
+
+def _fetch_github_repo(
+    repo: str,
+    dest: Path,
+    branch: str = "master",
+    log_cb=None,
+    progress_cb=None,
+    cancel_event: threading.Event | None = None,
+) -> bool:
+    """Clone via `git` or fall back to GitHub archive ZIP download when `git` is unavailable."""
+    if dest.exists() and any(dest.iterdir()):
+        return True
+    git = shutil.which("git")
+    url_git = f"https://github.com/{repo}.git"
+    if git:
+        rc = _stream_cmd([git, "clone", "--depth", "1", url_git, str(dest)], log_cb=log_cb)
+        if rc == 0 and dest.exists():
+            return True
+    zip_url = f"https://github.com/{repo}/archive/refs/heads/{branch}.zip"
+    tmp_zip = cfg.TOOLS_DIR / f"_{dest.name}_src.zip"
+    try:
+        _download_url(
+            zip_url, tmp_zip, log_cb=log_cb, progress_cb=progress_cb,
+            cancel_event=cancel_event, label=f"{repo} ({branch})",
+        )
+        _emit(log_cb, f"Extracting {repo} source to {dest}...")
+        _safe_extract_zip(tmp_zip, dest, strip_top_dir=True)
+        return dest.is_dir() and any(dest.iterdir())
+    finally:
+        tmp_zip.unlink(missing_ok=True)
+
+
+def _prep_animestudio_projects(as_dir: Path) -> None:
+    """Strip net10.0 TFMs and <SelfContained>false</SelfContained> so .NET 9 self-contained publish succeeds."""
+    for csproj in as_dir.rglob("*.csproj"):
+        txt = csproj.read_text(encoding="utf-8", errors="ignore")
+        new_txt = txt.replace(";net10.0-windows", "").replace(";net10.0", "")
+        new_txt = re.sub(r"\s*<SelfContained>false</SelfContained>\s*", "\n", new_txt)
+        if new_txt != txt:
+            csproj.write_text(new_txt, encoding="utf-8")
+
+
+def _build_animestudio_cli(as_dir: Path, dotnet: str, log_cb=None, progress_cb=None) -> bool:
+    """Patch, publish/build AnimeStudio.CLI for win-x64, and compile AnimeStudio.ACL.ZZZV2.dll if mingw exists."""
+    _patch_animestudio_cli(as_dir, log_cb=log_cb)
+    _prep_animestudio_projects(as_dir)
+
+    csproj = as_dir / "AnimeStudio.CLI" / "AnimeStudio.CLI.csproj"
+    if not csproj.is_file():
+        return False
+    env = cfg.build_cli_env({"DOTNET_ROOT": str(Path(dotnet).parent)})
+    bin_base = as_dir / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0-windows"
+    pub_dir = bin_base / "publish"
+
+    if progress_cb:
+        progress_cb(45, "Publishing AnimeStudio.CLI (self-contained win-x64)...")
+    _emit(log_cb, "Publishing AnimeStudio.CLI (net9.0-windows self-contained win-x64)...")
+    rc = _stream_cmd(
+        [
+            dotnet, "publish", str(csproj),
+            "-c", "Release", "-f", "net9.0-windows", "-r", "win-x64",
+            "--self-contained", "true", "-p:EnableWindowsTargeting=true",
+            "-o", str(pub_dir),
+        ],
+        log_cb=log_cb,
+        env=env,
+    )
+    if rc != 0 or not (pub_dir / "AnimeStudio.CLI.exe").is_file():
+        _emit(log_cb, "Self-contained publish incomplete; falling back to `dotnet build`...")
+        rc = _stream_cmd(
+            [dotnet, "build", str(csproj), "-c", "Release", "-f", "net9.0-windows", "-p:EnableWindowsTargeting=true"],
+            log_cb=log_cb,
+            env=env,
+        )
+
+    mingw = shutil.which("x86_64-w64-mingw32-g++")
+    zzzv2_src = as_dir / "AnimeStudio.ACL" / "AnimeStudio.ACL.ZZZV2"
+    if mingw and (zzzv2_src / "ACLLibrary.cpp").is_file():
+        if progress_cb:
+            progress_cb(65, "Building AnimeStudio.ACL.ZZZV2.dll (mingw-w64)...")
+        dll_tmp = cfg.TOOLS_DIR / "_AnimeStudio.ACL.ZZZV2.dll"
+        rc_dll = _stream_cmd(
+            [
+                mingw, "-std=c++20", "-O2", "-shared", f"-I{zzzv2_src}",
+                "-DNDEBUG", "-D_AS_DLL", "-DACLZZZV2_EXPORTS", "-D_WINDOWS", "-D_USRDLL", "-w",
+                str(zzzv2_src / "dllmain.cpp"), str(zzzv2_src / "ACLLibrary.cpp"),
+                "-o", str(dll_tmp), "-static", "-static-libgcc", "-static-libstdc++",
+            ],
+            log_cb=log_cb,
+            env=env,
+        )
+        if rc_dll == 0 and dll_tmp.is_file():
+            for dst_dir in (
+                pub_dir,
+                bin_base,
+                as_dir / "AnimeStudio.Libraries",
+                as_dir / "AnimeStudio.Utility" / "bin" / "Release" / "net9.0",
+            ):
+                if dst_dir.is_dir():
+                    shutil.copy2(dll_tmp, dst_dir / "AnimeStudio.ACL.ZZZV2.dll")
+            dll_tmp.unlink(missing_ok=True)
+
+    cfg._resolve_tool_paths()
+    return cfg.CLI_EXE.is_file()
+
+
+def ensure_extractor_tools(
+    log_cb=None,
+    progress_cb=None,
+    install_adb: bool = False,
+    install_blender: bool = False,
+    install_wine: bool = True,
+    install_vgmstream: bool = True,
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    """Install/build portable AnimeStudio.CLI, AnimeWwise, Wine, vgmstream, ADB, and Blender into TOOLS_DIR."""
     cfg.TOOLS_DIR.mkdir(parents=True, exist_ok=True)
     cfg._resolve_tool_paths()
 
@@ -2682,85 +3219,228 @@ def ensure_extractor_tools(log_cb=None, progress_cb=None) -> dict:
             progress_cb(pct, msg)
         _emit(log_cb, msg)
 
+    if install_wine and not cfg.is_windows() and not cfg.find_wine():
+        _prog(5, "Installing portable Wine runtime...")
+        try:
+            ensure_wine(log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] Wine auto-install failed: {exc}")
+
+    if install_vgmstream and not cfg.find_vgmstream():
+        _prog(15, "Installing portable vgmstream-cli...")
+        try:
+            ensure_vgmstream(log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] vgmstream auto-install failed: {exc}")
+
+    if install_adb and not cfg.find_adb():
+        _prog(22, "Installing portable Android Platform-Tools (ADB)...")
+        try:
+            ensure_adb(log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] ADB auto-install failed: {exc}")
+
+    if install_blender and not cfg.find_blender():
+        _prog(28, "Installing portable Blender 4.2 LTS...")
+        try:
+            ensure_blender(log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] Blender auto-install failed: {exc}")
+
+    as_dir = cfg.TOOLS_DIR / "AnimeStudio"
     if not cfg.CLI_EXE.is_file():
-        git = shutil.which("git")
-        dotnet = shutil.which("dotnet")
-        if not git or not dotnet:
-            _emit(log_cb, f"[WARN] Cannot auto-build AnimeStudio.CLI (git={bool(git)}, dotnet={bool(dotnet)}).")
-        else:
-            as_dir = cfg.TOOLS_DIR / "AnimeStudio"
-            if not as_dir.exists():
-                _prog(10, "Cloning Escartem/AnimeStudio...")
-                _stream_cmd(
-                    [git, "clone", "--depth", "1", "https://github.com/Escartem/AnimeStudio.git", str(as_dir)],
-                    log_cb=log_cb,
-                )
-            if as_dir.exists():
-                # Patch net10.0 target frameworks if local SDK is .NET 9
-                for csproj in as_dir.rglob("*.csproj"):
-                    txt = csproj.read_text(encoding="utf-8", errors="ignore")
-                    if "net10.0" in txt:
-                        csproj.write_text(
-                            txt.replace(";net10.0-windows", "").replace(";net10.0", ""),
-                            encoding="utf-8",
-                        )
-                _prog(35, "Building AnimeStudio.CLI (net9.0-windows)...")
-                _stream_cmd(
-                    [
-                        dotnet, "build",
-                        str(as_dir / "AnimeStudio.CLI" / "AnimeStudio.CLI.csproj"),
-                        "-c", "Release", "-f", "net9.0-windows",
-                    ],
-                    log_cb=log_cb,
-                )
-                mingw = shutil.which("x86_64-w64-mingw32-g++")
-                zzzv2_src = as_dir / "AnimeStudio.ACL" / "AnimeStudio.ACL.ZZZV2"
-                if mingw and (zzzv2_src / "ACLLibrary.cpp").is_file():
-                    _prog(55, "Building AnimeStudio.ACL.ZZZV2.dll (mingw-w64)...")
-                    dll_out = as_dir / "AnimeStudio.CLI" / "bin" / "Release" / "net9.0-windows" / "AnimeStudio.ACL.ZZZV2.dll"
-                    rc_dll = _stream_cmd(
-                        [
-                            mingw, "-std=c++20", "-O2", "-shared", f"-I{zzzv2_src}",
-                            "-DNDEBUG", "-D_AS_DLL", "-DACLZZZV2_EXPORTS", "-D_WINDOWS", "-D_USRDLL", "-w",
-                            str(zzzv2_src / "dllmain.cpp"), str(zzzv2_src / "ACLLibrary.cpp"),
-                            "-o", str(dll_out), "-static", "-static-libgcc", "-static-libstdc++",
-                        ],
-                        log_cb=log_cb,
-                    )
-                    if rc_dll == 0 and dll_out.is_file():
-                        for extra_dir in (
-                            as_dir / "AnimeStudio.Libraries",
-                            as_dir / "AnimeStudio.Utility" / "bin" / "Release" / "net9.0",
-                        ):
-                            if extra_dir.is_dir():
-                                shutil.copy2(dll_out, extra_dir / "AnimeStudio.ACL.ZZZV2.dll")
-                cfg._resolve_tool_paths()
+        _prog(32, "Fetching Escartem/AnimeStudio source...")
+        if _fetch_github_repo("Escartem/AnimeStudio", as_dir, branch="master", log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event):
+            dotnet = ensure_dotnet(log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event)
+            if dotnet:
+                _build_animestudio_cli(as_dir, dotnet, log_cb=log_cb, progress_cb=progress_cb)
+            else:
+                _emit(log_cb, "[WARN] .NET 9 SDK could not be installed; AnimeStudio.CLI build skipped.")
+    elif as_dir.is_dir() and _patch_animestudio_cli(as_dir, log_cb=log_cb):
+        dotnet = ensure_dotnet(log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event)
+        if dotnet:
+            _emit(log_cb, "Rebuilding AnimeStudio.CLI after applying OpenZenless patches...")
+            _build_animestudio_cli(as_dir, dotnet, log_cb=log_cb, progress_cb=progress_cb)
 
     if not cfg.NAP_MAP_FILE.is_file():
-        git = shutil.which("git")
-        if git:
-            ww_dir = cfg.TOOLS_DIR / "AnimeWwise"
-            if not ww_dir.exists():
-                _prog(70, "Cloning Escartem/AnimeWwise (nap.map)...")
-                _stream_cmd(
-                    [git, "clone", "--depth", "1", "https://github.com/Escartem/AnimeWwise.git", str(ww_dir)],
-                    log_cb=log_cb,
-                )
-            cfg._resolve_tool_paths()
+        ww_dir = cfg.TOOLS_DIR / "AnimeWwise"
+        _prog(80, "Fetching Escartem/AnimeWwise (nap.map)...")
+        try:
+            _fetch_github_repo("Escartem/AnimeWwise", ww_dir, branch="master", log_cb=log_cb, progress_cb=progress_cb, cancel_event=cancel_event)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] AnimeWwise fetch failed: {exc}")
+        cfg._resolve_tool_paths()
 
-    studio_dir = cfg.TOOLS_DIR / "AnimeStudio"
-    if studio_dir.is_dir() and _patch_animestudio_cli(studio_dir, log_cb=log_cb):
-        dotnet = shutil.which("dotnet")
-        csproj = studio_dir / "AnimeStudio.CLI" / "AnimeStudio.CLI.csproj"
-        if dotnet and csproj.is_file():
-            _emit(log_cb, "Rebuilding AnimeStudio.CLI after applying OpenZenless patches...")
-            _stream_cmd([dotnet, "build", str(csproj), "-c", "Release", "-f", "net9.0-windows"], log_cb=log_cb)
-            cfg._resolve_tool_paths()
-
+    _prog(100, "Tool check finished.")
     return {
         "cli_exists": cfg.CLI_EXE.is_file(),
         "cli_path": str(cfg.CLI_EXE),
         "nap_map_exists": cfg.NAP_MAP_FILE.is_file(),
         "nap_map_path": str(cfg.NAP_MAP_FILE),
-        "wine_exists": shutil.which("wine") is not None,
+        "wine_exists": True if cfg.is_windows() else (cfg.find_wine() is not None),
+        "runtime_ok": True if cfg.is_windows() else (cfg.find_wine() is not None),
+        "adb_exists": cfg.find_adb() is not None,
+        "adb_path": cfg.find_adb() or "",
+        "vgmstream_exists": cfg.VGMSTREAM_CLI.is_file(),
+        "vgmstream_path": str(cfg.VGMSTREAM_CLI) if cfg.VGMSTREAM_CLI.is_file() else "",
+        "blender_exists": cfg.find_blender() is not None,
+        "blender_path": cfg.find_blender() or "",
+        "dotnet_exists": cfg.find_dotnet() is not None,
+    }
+
+
+def _detect_linux_distro() -> str:
+    os_rel = Path("/etc/os-release")
+    if os_rel.is_file():
+        for line in os_rel.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip().strip('"')
+    return "Linux"
+
+
+def _detect_pkg_manager() -> str:
+    if cfg.is_windows():
+        return "winget" if shutil.which("winget") else "portable"
+    if cfg.is_macos():
+        return "brew" if shutil.which("brew") else "portable"
+    for pm in ("pacman", "apt-get", "dnf", "zypper", "apk"):
+        if shutil.which(pm):
+            return pm
+    return "portable"
+
+
+def get_environment_status() -> dict:
+    """Collect OS, Python module, and external tool diagnostics for CLI and GUI."""
+    py_mods = {}
+    for mod_name, imp_name in (
+        ("PySide6", "PySide6"),
+        ("Pillow", "PIL"),
+        ("numpy", "numpy"),
+        ("PyOpenGL", "OpenGL"),
+        ("pygltflib", "pygltflib"),
+    ):
+        try:
+            __import__(imp_name)
+            py_mods[mod_name] = True
+        except Exception:
+            py_mods[mod_name] = False
+    has_zstd = False
+    for zm in ("compression.zstd", "zstandard"):
+        try:
+            __import__(zm)
+            has_zstd = True
+            break
+        except Exception:
+            pass
+    py_mods["zstd"] = has_zstd or (shutil.which("zstd") is not None)
+
+    wine_path = cfg.find_wine()
+    adb_path = cfg.find_adb()
+    dotnet_path = cfg.find_dotnet()
+    blender_path = cfg.find_blender()
+    vgm_path = cfg.find_vgmstream()
+    arch = platform.machine().lower()
+    if cfg.is_windows():
+        display = "Windows Desktop"
+    elif cfg.is_macos():
+        display = "macOS Cocoa"
+    elif os.environ.get("WAYLAND_DISPLAY"):
+        qpa = os.environ.get("QT_QPA_PLATFORM", "auto")
+        display = f"Wayland (QT_QPA_PLATFORM={qpa})"
+    elif os.environ.get("DISPLAY"):
+        display = f"X11 ({os.environ.get('DISPLAY')})"
+    else:
+        display = "Headless"
+
+    pm = _detect_pkg_manager()
+    wine_hint = {
+        "pacman": "Auto-installs Wine WoW64 (x64) or: sudo pacman -S wine",
+        "apt-get": "Auto-installs Wine WoW64 (x64) or: sudo apt install wine",
+        "dnf": "Auto-installs Wine WoW64 (x64) or: sudo dnf install wine",
+        "brew": "brew install --cask wine-stable",
+    }.get(pm, "Auto-installs Wine WoW64 on Linux x64")
+
+    tools_list = [
+        {
+            "key": "cli",
+            "name": "AnimeStudio.CLI.exe",
+            "required_for": "Asset indexing & mesh/texture/anim export",
+            "ok": cfg.CLI_EXE.is_file(),
+            "status": "OK" if cfg.CLI_EXE.is_file() else "Missing",
+            "path": str(cfg.CLI_EXE) if cfg.CLI_EXE.is_file() else "",
+            "auto_installable": True,
+            "hint": "Click 'Auto-Install Core Tools' or `openzenless setup-tools`",
+        },
+        {
+            "key": "runtime",
+            "name": "Windows Native Runtime" if cfg.is_windows() else "Wine Runtime",
+            "required_for": "Running AnimeStudio.CLI.exe on Linux/macOS",
+            "ok": True if cfg.is_windows() else (wine_path is not None),
+            "status": "Native" if cfg.is_windows() else ("OK" if wine_path else "Missing"),
+            "path": "Native Windows" if cfg.is_windows() else (wine_path or ""),
+            "auto_installable": (cfg.is_linux() and arch in ("x86_64", "amd64")),
+            "hint": "Built-in on Windows" if cfg.is_windows() else wine_hint,
+        },
+        {
+            "key": "dotnet",
+            "name": ".NET 9 SDK",
+            "required_for": "Building & patching AnimeStudio.CLI from source",
+            "ok": bool(dotnet_path and _has_dotnet9_sdk(dotnet_path)),
+            "status": "OK" if (dotnet_path and _has_dotnet9_sdk(dotnet_path)) else ("Partial" if dotnet_path else "Missing"),
+            "path": dotnet_path or "",
+            "auto_installable": True,
+            "hint": "Auto-installs portable .NET 9 SDK when needed",
+        },
+        {
+            "key": "nap_map",
+            "name": "AnimeWwise (nap.map)",
+            "required_for": "Voice bank auto-naming & character sorting",
+            "ok": cfg.NAP_MAP_FILE.is_file(),
+            "status": "OK" if cfg.NAP_MAP_FILE.is_file() else "Missing",
+            "path": str(cfg.NAP_MAP_FILE) if cfg.NAP_MAP_FILE.is_file() else "",
+            "auto_installable": True,
+            "hint": "Auto-downloaded from Escartem/AnimeWwise",
+        },
+        {
+            "key": "vgmstream",
+            "name": "vgmstream-cli",
+            "required_for": "Decoding Wwise .wem audio to .wav",
+            "ok": bool(vgm_path and vgm_path.is_file()),
+            "status": "OK" if (vgm_path and vgm_path.is_file()) else "Missing",
+            "path": str(vgm_path) if (vgm_path and vgm_path.is_file()) else "",
+            "auto_installable": True,
+            "hint": "Auto-installs official binary from vgmstream releases",
+        },
+        {
+            "key": "adb",
+            "name": "Android Platform-Tools (ADB)",
+            "required_for": "Importing ZZZ files directly from Android",
+            "ok": adb_path is not None,
+            "status": "OK" if adb_path else "Missing",
+            "path": adb_path or "",
+            "auto_installable": True,
+            "hint": "Auto-installs official Google Platform-Tools zip",
+        },
+        {
+            "key": "blender",
+            "name": "Blender (Optional)",
+            "required_for": "FBX -> GLB conversion & facial morph injection",
+            "ok": blender_path is not None,
+            "status": "OK" if blender_path else "Not Installed",
+            "path": blender_path or "",
+            "auto_installable": (arch in ("x86_64", "amd64") and not cfg.is_macos()),
+            "hint": "Portable Blender 4.2 LTS (~300 MB) optional for GLB exports",
+        },
+    ]
+
+    return {
+        "os": platform.system(),
+        "os_detail": _detect_linux_distro() if cfg.is_linux() else platform.platform(),
+        "arch": platform.machine(),
+        "display": display,
+        "pkg_manager": pm,
+        "python": platform.python_version(),
+        "tools_dir": str(cfg.TOOLS_DIR),
+        "python_modules": py_mods,
+        "tools": tools_list,
     }
