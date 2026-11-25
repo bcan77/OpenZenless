@@ -601,6 +601,1101 @@ def _merge_glbs(chunk_paths: list[Path], out_path: Path, log_cb=None) -> int:
     return 0
 
 
+_BLENDER_CONVERT_SCRIPT = r'''
+import bpy, os, json as _json, re as _re, zlib as _zlib
+from pathlib import Path as _Path
+from mathutils import Matrix as _Mat, Vector as _Vec, Quaternion as _Quat
+
+bpy.ops.wm.read_factory_settings(use_empty=True)
+sc = bpy.context.scene
+sc.render.threads_mode = 'AUTO'
+try:
+    _cp = bpy.context.preferences.addons['cycles'].preferences
+    for _bt in ('OPTIX', 'CUDA', 'HIP', 'ONEAPI'):
+        try:
+            _cp.compute_device_type = _bt
+            _cp.get_devices()
+            if any(d.type != 'CPU' for d in _cp.devices):
+                for _d in _cp.devices:
+                    _d.use = (_d.type != 'CPU')
+                break
+        except Exception:
+            pass
+except Exception:
+    pass
+
+hold = bpy.data.collections.new('Hold')
+hold.use_fake_user = True
+_canonical_img_names = {}
+
+def _img_key(img):
+    fp = getattr(img, 'filepath', '') or ''
+    if fp:
+        try:
+            ap = bpy.path.abspath(fp)
+            if os.path.isfile(ap):
+                return 'file:' + os.path.basename(ap).lower() + ':' + str(os.path.getsize(ap))
+        except Exception:
+            pass
+    nm = os.path.splitext(os.path.basename(fp or img.name))[0].lower()
+    nm = _re.sub(r'(?:\.[0-9]+|\s*\([0-9]+\))$', '', nm)
+    return 'stem:' + nm
+
+def _mat_nodes_ok(m):
+    if m is None or not m.node_tree:
+        return False
+    return bpy.app.version >= (5, 0, 0) or bool(getattr(m, 'use_nodes', False))
+
+def _dedup_imgs():
+    remap = {}
+    for img in list(bpy.data.images):
+        if img.name in ('Render Result', 'Viewer Node'):
+            continue
+        k = _img_key(img)
+        cname = _canonical_img_names.get(k)
+        canon = bpy.data.images.get(cname) if cname else None
+        if canon is None:
+            _canonical_img_names[k] = img.name
+        elif canon != img:
+            remap[img] = canon
+    if remap:
+        for mat in bpy.data.materials:
+            if not _mat_nodes_ok(mat):
+                continue
+            for nd in mat.node_tree.nodes:
+                if nd.type == 'TEX_IMAGE' and nd.image in remap:
+                    nd.image = remap[nd.image]
+        for dup in remap:
+            try:
+                bpy.data.images.remove(dup, do_unlink=True)
+            except Exception:
+                pass
+
+def _stash():
+    for o in list(sc.collection.objects):
+        sc.collection.objects.unlink(o)
+        hold.objects.link(o)
+    for c in list(sc.collection.children):
+        sc.collection.children.unlink(c)
+        hold.children.link(c)
+
+def _fbx_import_call(fp, global_scale=None, auto_orient=False):
+    kw = {'filepath': fp}
+    if global_scale is not None:
+        kw['global_scale'] = float(global_scale)
+    try:
+        rna = bpy.ops.import_scene.fbx.get_rna_type().properties
+        if 'ignore_leaf_bones' in rna:
+            kw['ignore_leaf_bones'] = False
+        if auto_orient:
+            if 'automatic_bone_orientation' in rna:
+                kw['automatic_bone_orientation'] = True
+            elif 'use_automatic_bone_orientation' in rna:
+                kw['use_automatic_bone_orientation'] = True
+    except Exception:
+        pass
+    bpy.ops.import_scene.fbx(**kw)
+
+fbxs = _CFG['fbxs']
+objs = _CFG['objs']
+_char_dir = _CFG['char_dir']
+_char_name = _CFG['char_name']
+_out_glb = _CFG['out_glb']
+_save_blend = _CFG['save_blend']
+_anim_dir = _CFG['anim_dir']
+_is_char_dir = bool(_CFG['is_char'])
+_mat_to_tex = _CFG['mat_to_tex']
+_allow_fuzzy_base = bool(_CFG['allow_fuzzy'])
+_max_anims = int(_CFG.get('max_anims', 32))
+
+_obj_import_rank = {}
+def _import_fbx(fp, rank=0):
+    before = set(bpy.data.objects)
+    _fbx_import_call(fp, auto_orient=False)
+    new = [o for o in bpy.data.objects if o not in before]
+    if _is_char_dir:
+        arms = [o for o in new if o.type == 'ARMATURE']
+        if arms:
+            ascale = min((max(abs(float(v)) for v in o.matrix_world.to_scale()) for o in arms), default=1.0)
+            if 0.0 < ascale < 0.1:
+                for o in new:
+                    bpy.data.objects.remove(o, do_unlink=True)
+                _fbx_import_call(fp, global_scale=1.0 / ascale, auto_orient=False)
+                new = [o for o in bpy.data.objects if o not in before]
+                print(f'Normalized FBX scale {ascale:.4f} -> 1.0: {fp}', flush=True)
+    for o in new:
+        _obj_import_rank[o.as_pointer()] = rank
+
+for idx, fp in enumerate(fbxs, 1):
+    try:
+        _import_fbx(fp, idx)
+        _stash()
+    except Exception as _e:
+        print(f'SKIP FBX {fp}: {_e}', flush=True)
+    if idx % 50 == 0:
+        _dedup_imgs()
+    if idx % 250 == 0:
+        print(f'Imported FBX {idx}/{len(fbxs)} (unique images={len(bpy.data.images)})', flush=True)
+
+_imported_objs = False
+_need_objs = objs and (
+    not any(o.type == 'MESH' for o in bpy.data.objects)
+    or (_is_char_dir and not any(k in o.name.lower() for o in bpy.data.objects if o.type == 'MESH' for k in ('body', 'face', 'hair')))
+)
+if _need_objs:
+    _imported_objs = True
+    if _is_char_dir:
+        _sep = [p for p in objs if os.path.basename(p).lower().startswith('separatemesh_')]
+        if _sep:
+            _sep_low = ' '.join(os.path.basename(p).lower() for p in _sep)
+            objs = [p for p in objs if p in _sep or os.path.splitext(os.path.basename(p))[0].lower() not in _sep_low]
+    for idx, fp in enumerate(objs, 1):
+        if _is_char_dir or os.path.basename(fp).lower().startswith('separatemesh_'):
+            bpy.ops.wm.obj_import(filepath=fp, forward_axis='Y', up_axis='Z')
+        else:
+            bpy.ops.wm.obj_import(filepath=fp)
+        _stash()
+        if idx % 250 == 0:
+            print(f'Imported OBJ {idx}/{len(objs)}', flush=True)
+
+sc.collection.children.link(hold)
+_dedup_imgs()
+
+if any(o.type == 'ARMATURE' for o in bpy.data.objects) and (_anim_dir or _save_blend):
+    _is_char_dir = True
+
+def _mat_has_img(m):
+    if not _mat_nodes_ok(m):
+        return False
+    return any(n.type == 'TEX_IMAGE' and getattr(n, 'image', None) is not None for n in m.node_tree.nodes)
+
+def _is_greybox_mat(m):
+    if m is None:
+        return False
+    ml = m.name.lower()
+    if 'shadowproxy' in ml:
+        return True
+    if (ml == 'lit' or ml.startswith('lit.') or ml == 'unlit' or ml.startswith('unlit.') or 'mihoyo_unlit_unlit' in ml) and not _mat_has_img(m):
+        return True
+    return False
+
+def _is_proxy_obj(obj):
+    cur = obj
+    while cur is not None:
+        nl = cur.name.lower()
+        if _re.search(r'(?:_col(?:$|_|lider)|_proxy(?:$|_|\s|\.|[0-9])|_hairshadow(?:$|_|\s|\.|[0-9])|^volumetricfog|^scenepropcollider_|^blockout_|^stage_.*_ld$|^sm_merged_bp_|^napmesh,)', nl):
+            return True
+        cur = cur.parent
+    if obj.type == 'MESH' and obj.data and obj.data.materials:
+        non_none = [m for m in obj.data.materials if m is not None]
+        if non_none and all(_is_greybox_mat(m) for m in non_none):
+            return True
+    return False
+
+_mesh_objs = [o for o in bpy.data.objects if o.type == 'MESH' and o.data]
+_non_proxy = [o for o in _mesh_objs if not _is_proxy_obj(o)]
+if _non_proxy:
+    for o in _mesh_objs:
+        if o not in _non_proxy:
+            bpy.data.objects.remove(o, do_unlink=True)
+
+if not _is_char_dir and _non_proxy:
+    _seen_geo = set()
+    _dup_removed = 0
+    bpy.context.view_layer.update()
+    for o in sorted(_non_proxy, key=lambda _o: _obj_import_rank.get(_o.as_pointer(), 999999)):
+        if not o.data or len(o.data.vertices) == 0:
+            continue
+        _bm = _re.sub(r'(?:\.[0-9]+|\s*\([0-9]+\))$', '', o.data.name.lower()).strip()
+        _mw = o.matrix_world
+        _pts = [_mw @ _Vec(c) for c in o.bound_box]
+        _gkey = (
+            _bm, len(o.data.vertices), len(o.data.polygons),
+            round(min(p.x for p in _pts), 4), round(min(p.y for p in _pts), 4), round(min(p.z for p in _pts), 4),
+            round(max(p.x for p in _pts), 4), round(max(p.y for p in _pts), 4), round(max(p.z for p in _pts), 4),
+        )
+        if _gkey in _seen_geo:
+            bpy.data.objects.remove(o, do_unlink=True)
+            _dup_removed += 1
+        else:
+            _seen_geo.add(_gkey)
+    if _dup_removed:
+        print(f'Deduplicated {_dup_removed} exact co-planar duplicate mesh(es)', flush=True)
+
+# Rig & Armature Unification for pre-rigged animation use
+_master_arm = None
+if _is_char_dir:
+    _helper_re = _re.compile(
+        r'(?:hitcollider|wallcollider|camerabasepoint|hudpoint|faceshadowpoint|hairshadow|fx_root|_lod[0-9]+|foretwist old|normal_03_origin|set_tail_end|branch_04_center|^ctr_[a-z]_|^root$)'
+    )
+    for _eo in list(bpy.data.objects):
+        if _eo.type == 'EMPTY' and not _eo.children and _helper_re.search(_eo.name.lower()):
+            bpy.data.objects.remove(_eo, do_unlink=True)
+
+    _arms = [o for o in bpy.data.objects if o.type == 'ARMATURE' and o.data]
+    if _arms:
+        def _arm_score(_a):
+            _bips = sum(1 for _b in _a.data.bones if 'bip' in _b.name.lower() and not _re.search(r'\.[0-9]+$', _b.name))
+            return (_bips, len(_a.data.bones), -len(_a.name))
+        _master_arm = max(_arms, key=_arm_score)
+
+        # Strip .001 / .002 suffixes on master armature where base name is free
+        for _b in list(_master_arm.data.bones):
+            _bn_clean = _re.sub(r'\.[0-9]+$', '', _b.name)
+            if _bn_clean != _b.name and _bn_clean not in _master_arm.data.bones:
+                _b.name = _bn_clean
+
+        # Merge missing bones from secondary armatures into master armature
+        _sec_arms = [a for a in _arms if a != _master_arm]
+        if _sec_arms:
+            _bpy_active = bpy.context.view_layer.objects
+            _bpy_active.active = _master_arm
+            bpy.ops.object.mode_set(mode='EDIT')
+            _ebones = _master_arm.data.edit_bones
+            _inv_mw = _master_arm.matrix_world.inverted()
+            for _sa in _sec_arms:
+                _to_master = _inv_mw @ _sa.matrix_world
+                _pending = []
+                for _sb in _sa.data.bones:
+                    _clean = _re.sub(r'\.[0-9]+$', '', _sb.name)
+                    if _clean not in _ebones:
+                        _eb = _ebones.new(_clean)
+                        _eb.head = _to_master @ _sb.head_local
+                        _eb.tail = _to_master @ _sb.tail_local
+                        if (_eb.tail - _eb.head).length < 1e-5:
+                            _eb.tail = _eb.head + _Vec((0.0, 0.01, 0.0))
+                        _eb.matrix = _to_master @ _sb.matrix_local
+                        _p_clean = _re.sub(r'\.[0-9]+$', '', _sb.parent.name) if _sb.parent else None
+                        _pending.append((_eb.name, _p_clean))
+                for _bname, _pname in _pending:
+                    if _pname and _pname in _ebones:
+                        _ebones[_bname].parent = _ebones[_pname]
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Rebind every mesh to _master_arm and clean .001 vertex groups
+        _master_bone_names = set(_master_arm.data.bones.keys())
+        _char_meshes = [o for o in bpy.data.objects if o.type == 'MESH' and o.data]
+        for _mo in _char_meshes:
+            _mw = _mo.matrix_world.copy()
+            if _mo.parent != _master_arm:
+                _mo.parent = _master_arm
+                _mo.matrix_world = _mw
+            # Clean duplicate .001 vertex group suffixes and merge weights
+            _vgs = list(_mo.vertex_groups)
+            for _vg in _vgs:
+                _base = _re.sub(r'\.[0-9]+$', '', _vg.name)
+                if _base != _vg.name and _base in _master_bone_names:
+                    _dst_vg = _mo.vertex_groups.get(_base)
+                    if _dst_vg is None:
+                        _vg.name = _base
+                    elif _dst_vg != _vg:
+                        for _v in _mo.data.vertices:
+                            for _g in _v.groups:
+                                if _g.group == _vg.index:
+                                    _dst_vg.add([_v.index], _g.weight, 'ADD')
+                        _mo.vertex_groups.remove(_vg)
+            # Deduplicate / retarget ARMATURE modifiers to _master_arm
+            _kept_mod = None
+            for _mod in list(_mo.modifiers):
+                if _mod.type == 'ARMATURE':
+                    if _kept_mod is None:
+                        _mod.object = _master_arm
+                        _kept_mod = _mod
+                    else:
+                        _mo.modifiers.remove(_mod)
+            if _kept_mod is None and len(_mo.vertex_groups) > 0:
+                _mod = _mo.modifiers.new(name='Armature', type='ARMATURE')
+                _mod.object = _master_arm
+
+        # Auto-bind unrigged fallback meshes (e.g. SeparateMesh OBJ or unskinned weapon)
+        _donor_meshes = [o for o in _char_meshes if len(o.vertex_groups) >= 8]
+        _donor_mesh = max(_donor_meshes, key=lambda o: len(o.data.vertices), default=None)
+        for _mo in _char_meshes:
+            if len(_mo.vertex_groups) > 0 or len(_mo.data.vertices) == 0:
+                continue
+            _nl = _mo.name.lower()
+            _bound = False
+            if any(k in _nl for k in ('weapon', 'sword', 'blade', 'gun', 'hammer', 'staff', 'bow')):
+                _wbone = next((_bn for _bn in ('Weapon_R', 'Weapon_L', 'Bip001 Prop1', 'Bip001 R Hand', 'Bip001 L Hand') if _bn in _master_bone_names), None)
+                if _wbone:
+                    _vg = _mo.vertex_groups.new(name=_wbone)
+                    _vg.add(list(range(len(_mo.data.vertices))), 1.0, 'REPLACE')
+                    _bound = True
+            if not _bound and _donor_mesh is not None and _donor_mesh != _mo:
+                try:
+                    for _o in bpy.data.objects:
+                        _o.select_set(False)
+                    _donor_mesh.select_set(True)
+                    _mo.select_set(True)
+                    bpy.context.view_layer.objects.active = _mo
+                    bpy.ops.object.data_transfer(
+                        use_reverse_transfer=False,
+                        data_type='VGROUP_WEIGHTS',
+                        layers_select_src='ALL',
+                        layers_select_dst='NAME',
+                        vert_mapping='POLYINTERP_NEAREST',
+                    )
+                    _bound = len(_mo.vertex_groups) > 0
+                except Exception:
+                    pass
+            if not _bound:
+                _fbone = next((_bn for _bn in ('Bip001 Head', 'Bip001 Spine2', 'Bip001 Pelvis', 'Bip001') if _bn in _master_bone_names), None)
+                if not _fbone and _master_arm.data.bones:
+                    _fbone = _master_arm.data.bones[0].name
+                if _fbone:
+                    _vg = _mo.vertex_groups.new(name=_fbone)
+                    _vg.add(list(range(len(_mo.data.vertices))), 1.0, 'REPLACE')
+            if len(_mo.vertex_groups) > 0 and not any(_m.type == 'ARMATURE' for _m in _mo.modifiers):
+                _mod = _mo.modifiers.new(name='Armature', type='ARMATURE')
+                _mod.object = _master_arm
+
+        for _sa in _sec_arms:
+            try:
+                bpy.data.objects.remove(_sa, do_unlink=True)
+            except Exception:
+                pass
+
+        try:
+            _master_arm.name = _char_name or 'Armature'
+            if _master_arm.data:
+                _master_arm.data.name = f'{_char_name}_Rig' if _char_name else 'Rig'
+            _master_arm.show_in_front = True
+            _master_arm.data.display_type = 'OCTAHEDRAL'
+        except Exception:
+            pass
+        print(f'Unified rig on {_master_arm.name}: {len(_master_arm.data.bones)} bones, {len(_char_meshes)} bound meshes', flush=True)
+
+def _has_base_tex(mat):
+    if not _mat_nodes_ok(mat):
+        return False
+    for nd in mat.node_tree.nodes:
+        if nd.type == 'TEX_IMAGE' and nd.image is not None:
+            for lk in nd.outputs[0].links:
+                if lk.to_socket.name == 'Base Color':
+                    return True
+    return False
+
+def _img_has_alpha(img):
+    if img is None or img.depth not in (32, 64, 128) or not img.has_data:
+        return False
+    try:
+        px = img.pixels
+        n = len(px)
+        step = max(4, (n // 4096) * 4)
+        for i in range(3, n, step):
+            if px[i] < 0.98:
+                return True
+    except Exception:
+        pass
+    return False
+
+# Scan PNGs and Material JSONs across both _char_dir and its parent for diffuse & normal maps
+_png_roots = [_char_dir]
+if os.path.isdir(os.path.join(os.path.dirname(_char_dir), 'Texture2D')):
+    _png_roots.append(os.path.dirname(_char_dir))
+_all_pngs = []
+_all_mat_jsons = []
+for _pr in _png_roots:
+    for _p in sorted(_Path(_pr).rglob('*.png')):
+        _all_pngs.append(str(_p))
+    for _mp in sorted(_Path(_pr).rglob('*.json')):
+        if _mp.parent.name in ('Material', 'Materials') or _mp.stem.startswith('MAT_'):
+            _all_mat_jsons.append(_mp)
+
+_png_by_stem = {}
+for _p in _all_pngs:
+    _st = os.path.splitext(os.path.basename(_p))[0].lower()
+    _prev = _png_by_stem.get(_st)
+    if _prev is None or os.path.getsize(_p) > os.path.getsize(_prev):
+        _png_by_stem[_st] = _p
+
+_mat_diff_json = dict(_mat_to_tex)
+_mat_norm_json = {}
+_DIFF_SLOTS = ('_MainTex', '_BaseMap', '_BaseColorMap', '_Diffuse', '_Albedo', '_MainTex0', '_BaseColor', '_ColorMap')
+_NORM_SLOTS = ('_LightTex', '_BumpMap', '_NormalMap', '_NormalTex', '_Normal')
+for _mp in _all_mat_jsons:
+    try:
+        _md = _json.loads(_mp.read_text(encoding='utf-8', errors='ignore'))
+    except Exception:
+        continue
+    _tenv = (_md.get('m_SavedProperties') or {}).get('m_TexEnvs') or {}
+    if not isinstance(_tenv, dict):
+        continue
+    _mkeys = [_mp.stem.lower()]
+    if _md.get('m_Name'):
+        _mkeys.append(str(_md['m_Name']).lower())
+    for _sl in _DIFF_SLOTS:
+        _tv = _tenv.get(_sl)
+        if isinstance(_tv, dict):
+            _mt = _tv.get('m_Texture') or {}
+            _tn = (_mt.get('Name') or '').strip().lower()
+            if _tn and not _mt.get('IsNull', False):
+                for _mk in _mkeys:
+                    _mat_diff_json.setdefault(_mk, _tn)
+                break
+    for _sl in _NORM_SLOTS:
+        _tv = _tenv.get(_sl)
+        if isinstance(_tv, dict):
+            _mt = _tv.get('m_Texture') or {}
+            _tn = (_mt.get('Name') or '').strip().lower()
+            if _tn and not _mt.get('IsNull', False):
+                if _sl == '_LightTex' and (
+                    any(k in _tn for k in ('lightmap', 'ramp', 'sdf', 'shadow'))
+                    or not _tn.endswith(('_n', '_norm', '_normal', '_bump'))
+                ):
+                    continue
+                for _mk in _mkeys:
+                    _mat_norm_json.setdefault(_mk, _tn)
+                break
+
+_allow_fuzzy = _allow_fuzzy_base or _imported_objs
+if _allow_fuzzy and _png_by_stem:
+    diffuse_pngs = [
+        (_st, _p) for _st, _p in _png_by_stem.items()
+        if not _st.endswith(('_n', '_m', '_a', '_e', '_h', '_b', '_ao', '_occ', '_rough', '_metal', '_spec', '_ramp', '_lightmap', '_lm', '_norm', '_normal', '_bump', '_mask', '_sdf', '_data', '_rm'))
+    ]
+    _img_cache = {}
+    _mat_cache = {}
+    def _pick_tex(name):
+        raw_nl = _re.sub(r'\.[0-9]+$', '', name.lower())
+        nl = _re.sub(r'\s*\[[^\]]+\]$', '', raw_nl)
+        nl = _re.sub(r'\s*\([0-9]+\)$', '', nl).strip()
+        nl = _re.sub(r'^separatemesh_.*?_model_', '', nl)
+        nl = _re.sub(r'^separatemesh_avatar_[^_]+_[^_]+_[^_]+_', '', nl)
+        nl = _re.sub(r'_(?:lod[0-9]+|model)$', '', nl)
+        m_body = _re.search(r'_body_([0-9]+)(?:_[0-9]+)?$', nl)
+        m_num = _re.search(r'_([0-9]+)$', nl)
+        num_suf = m_body.group(1) if m_body else (m_num.group(1) if m_num else None)
+        nl_base = _re.sub(r'_[0-9]+$', '', nl)
+        mat_cands = [raw_nl, nl, 'mat_' + nl, nl_base, 'mat_' + nl_base]
+        if m_body:
+            m_bprefix = _re.search(r'^(.+_body_[0-9]+)_[0-9]+$', nl)
+            if m_bprefix:
+                bp = m_bprefix.group(1)
+                mat_cands.extend([bp, 'mat_' + bp])
+        for _ck in mat_cands:
+            _exact = _mat_diff_json.get(_ck)
+            if _exact and _exact in _png_by_stem:
+                return _png_by_stem[_exact]
+        toks = [t for t in nl_base.split('_') if t]
+        best_p, best_s = None, 0
+        for st, fp in diffuse_pngs:
+            if any(k in st for k in ('decal', 'floodlight', '_eff')) and not any(k in nl for k in ('decal', 'floodlight', 'eff', 'light')):
+                continue
+            sc_val = 0
+            map_bonus = (40 if (num_suf and f'_map{num_suf}' in st) else 0)
+            if st == nl + '_d' or st == nl_base + '_d' or st == nl:
+                sc_val = 1000
+            elif len(nl) >= 6 and st.startswith(nl + '_'):
+                sc_val = 800 + (20 if st.endswith('_d') else 0) + map_bonus
+            elif len(nl_base) >= 6 and st.startswith(nl_base + '_'):
+                sc_val = 500 + (20 if st.endswith('_d') else 0) + map_bonus
+            elif len(toks) >= 3:
+                for k in range(len(toks), 2, -1):
+                    pref = '_'.join(toks[:k])
+                    if st.startswith(pref + '_'):
+                        sc_val = 100 + k * 10 + (10 if st.endswith('_d') else 0) + map_bonus
+                        break
+            if sc_val > best_s:
+                best_s, best_p = sc_val, fp
+        return best_p
+
+    def _make_mat(fp, obj_name=''):
+        nl = (os.path.basename(fp) + ' ' + obj_name).lower()
+        is_sky = bool(_re.search(r'(?:^|[_\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\s.0-9])', nl))
+        is_cutout = any(t in nl for t in ('hair', 'lash', 'leaf', 'tree', 'plant', 'bush', 'grass', 'foliage', 'shadow'))
+        key = (fp, is_sky, is_cutout)
+        if key in _mat_cache:
+            return _mat_cache[key]
+        img = _img_cache.get(fp)
+        if img is None:
+            img = bpy.data.images.load(fp, check_existing=True)
+            _img_cache[fp] = img
+        mat = bpy.data.materials.new(name=os.path.splitext(os.path.basename(fp))[0])
+        mat.diffuse_color = (1.0, 1.0, 1.0, 1.0)
+        if bpy.app.version < (5, 0, 0) and hasattr(mat, 'use_nodes'):
+            mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None) or nt.nodes.new('ShaderNodeBsdfPrincipled')
+        tex = nt.nodes.new('ShaderNodeTexImage')
+        tex.image = img
+        nt.links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+        is_trans_hint = is_sky or is_cutout or any(t in nl for t in ('decal', 'glass', 'eff', 'fx', 'floodlight'))
+        if is_trans_hint and _img_has_alpha(img):
+            nt.links.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
+            if hasattr(mat, 'blend_method'):
+                mat.blend_method = 'CLIP' if (is_cutout or 'decal' in nl) else 'BLEND'
+            if hasattr(mat, 'alpha_threshold'):
+                mat.alpha_threshold = 0.45
+        if is_sky or is_cutout:
+            mat.use_backface_culling = False
+        _mat_cache[key] = mat
+        return mat
+
+    if diffuse_pngs:
+        for o in bpy.data.objects:
+            if o.type != 'MESH' or not o.data:
+                continue
+            if o.data.materials:
+                for _si in range(len(o.data.materials)):
+                    _om = o.data.materials[_si]
+                    if _has_base_tex(_om):
+                        continue
+                    _mn = _om.name if _om else ''
+                    _pn = o.parent.name if o.parent else ''
+                    _fp = (_pick_tex(_mn) if _mn else None) or _pick_tex(o.name) or _pick_tex(o.data.name) or (_pick_tex(_pn) if _pn else None)
+                    if _fp:
+                        o.data.materials[_si] = _make_mat(_fp, o.name)
+            else:
+                _pn = o.parent.name if o.parent else ''
+                _fp = _pick_tex(o.name) or _pick_tex(o.data.name) or (_pick_tex(_pn) if _pn else None)
+                if _fp:
+                    o.data.materials.append(_make_mat(_fp, o.name))
+
+_dedup_imgs()
+
+# Material polish + Normal Map (_LightTex / *_N.png) wiring + duplicate Alpha removal
+_norm_img_cache = {}
+def _find_normal_png(mat_name, base_img):
+    ml_clean = _re.sub(r'\.[0-9]+$', '', mat_name.lower())
+    for _ck in (ml_clean, 'mat_' + ml_clean):
+        _nhit = _mat_norm_json.get(_ck)
+        if _nhit and _nhit in _png_by_stem:
+            return _png_by_stem[_nhit]
+    if base_img is not None:
+        bfp = getattr(base_img, 'filepath', '') or base_img.name
+        bst = os.path.splitext(os.path.basename(bfp))[0].lower()
+        bst = _re.sub(r'\.[0-9]+$', '', bst)
+        for _cand_st in (
+            (_re.sub(r'_(?:d|diff|diffuse|albedo)$', '_n', bst) if bst.endswith(('_d', '_diff', '_diffuse', '_albedo')) else bst + '_n'),
+            bst + '_normal',
+        ):
+            if _cand_st in _png_by_stem:
+                return _png_by_stem[_cand_st]
+    return None
+
+for mat in bpy.data.materials:
+    if not _mat_nodes_ok(mat):
+        continue
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    ml = mat.name.lower()
+    is_alpha_mat = any(t in ml for t in ('hair', 'lash', 'eye', 'leaf', 'tree', 'plant', 'bush', 'grass', 'foliage', 'sky', 'decal', 'glass', 'fx', 'eff'))
+
+    # Clean Alpha links on opaque materials so ZZZ packed alpha maps do not turn models translucent
+    if bsdf and 'Alpha' in bsdf.inputs:
+        for _lk in list(bsdf.inputs['Alpha'].links):
+            _src_img = getattr(_lk.from_node, 'image', None)
+            if not _is_char_dir:
+                nt.links.remove(_lk)
+            elif not (is_alpha_mat and _img_has_alpha(_src_img)):
+                nt.links.remove(_lk)
+        if hasattr(mat, 'blend_method') and not bsdf.inputs['Alpha'].is_linked:
+            mat.blend_method = 'OPAQUE'
+
+    # Find linked Base Color image
+    base_img = None
+    if bsdf and 'Base Color' in bsdf.inputs and bsdf.inputs['Base Color'].is_linked:
+        _bn = bsdf.inputs['Base Color'].links[0].from_node
+        if _bn.type == 'TEX_IMAGE':
+            base_img = _bn.image
+
+    # Wire tangent Normal map on rigged characters/entities (or keep existing normal links)
+    if _is_char_dir and bsdf and 'Normal' in bsdf.inputs:
+        _nfp = _find_normal_png(mat.name, base_img)
+        if _nfp:
+            _nimg = _norm_img_cache.get(_nfp)
+            if _nimg is None:
+                _nimg = bpy.data.images.load(_nfp, check_existing=True)
+                try:
+                    _nimg.colorspace_settings.name = 'Non-Color'
+                except Exception:
+                    pass
+                _norm_img_cache[_nfp] = _nimg
+            _nm_node = next((n for n in nt.nodes if n.type == 'NORMAL_MAP'), None)
+            if _nm_node is None:
+                _nm_node = nt.nodes.new('ShaderNodeNormalMap')
+            if 'Strength' in _nm_node.inputs:
+                _nm_node.inputs['Strength'].default_value = 0.75
+            _ntex = next((n for n in nt.nodes if n.type == 'TEX_IMAGE' and n.image == _nimg), None)
+            if _ntex is None:
+                _ntex = nt.nodes.new('ShaderNodeTexImage')
+                _ntex.image = _nimg
+            nt.links.new(_ntex.outputs['Color'], _nm_node.inputs['Color'])
+            nt.links.new(_nm_node.outputs['Normal'], bsdf.inputs['Normal'])
+        else:
+            for _dnm in [n for n in nt.nodes if n.type == 'NORMAL_MAP']:
+                if 'Color' in _dnm.inputs and not _dnm.inputs['Color'].is_linked:
+                    nt.nodes.remove(_dnm)
+
+    # Remove unlinked orphan TEX_IMAGE nodes (keep connected Base Color / Alpha / Normal nodes)
+    for nd in list(nt.nodes):
+        if nd.type == 'TEX_IMAGE' and not any(out.is_linked for out in nd.outputs):
+            nt.nodes.remove(nd)
+
+    if bsdf:
+        _rough = (0.42 if any(t in ml for t in ('weapon', 'blade', 'metal', 'armor')) else 0.65) if _is_char_dir else 0.92
+        _spec = (0.50 if any(t in ml for t in ('weapon', 'blade', 'metal', 'armor')) else 0.35) if _is_char_dir else 0.05
+        if 'Roughness' in bsdf.inputs and not bsdf.inputs['Roughness'].is_linked:
+            bsdf.inputs['Roughness'].default_value = _rough
+        if 'Metallic' in bsdf.inputs and not bsdf.inputs['Metallic'].is_linked:
+            bsdf.inputs['Metallic'].default_value = 0.0
+        for _sp_k in ('Specular IOR Level', 'Specular'):
+            if _sp_k in bsdf.inputs and not bsdf.inputs[_sp_k].is_linked:
+                bsdf.inputs[_sp_k].default_value = _spec
+    if bsdf and 'Emission Color' in bsdf.inputs and not bsdf.inputs['Emission Color'].is_linked:
+        if 'Emission Strength' in bsdf.inputs:
+            bsdf.inputs['Emission Strength'].default_value = 0.0
+        bsdf.inputs['Emission Color'].default_value = (0.0, 0.0, 0.0, 1.0)
+    if bsdf and bsdf.inputs['Base Color'].is_linked:
+        dc = mat.diffuse_color
+        if any(abs(float(dc[k]) - 1.0) > 0.02 for k in range(3)):
+            src_sock = bsdf.inputs['Base Color'].links[0].from_socket
+            if src_sock.node.type != 'MIX':
+                mx = nt.nodes.new('ShaderNodeMix')
+                mx.data_type = 'RGBA'
+                mx.blend_type = 'MULTIPLY'
+                mx.inputs[0].default_value = 1.0
+                mx.inputs[7].default_value = (float(dc[0]), float(dc[1]), float(dc[2]), 1.0)
+                nt.links.new(src_sock, mx.inputs[6])
+                nt.links.new(mx.outputs[2], bsdf.inputs['Base Color'])
+    if any(t in ml for t in ('hair', 'lash', 'leaf', 'tree', 'plant', 'bush', 'grass', 'foliage', 'sky', 'decal')):
+        mat.use_backface_culling = False
+
+# Bake exported Unity .anim AnimationClips into Blender Actions & NLA Tracks
+_baked_actions = []
+if _is_char_dir and _master_arm is not None and _anim_dir and os.path.isdir(_anim_dir):
+    _anim_files = sorted(_Path(_anim_dir).rglob('*.anim'))
+    if _anim_files:
+        def _anim_prio(_p):
+            _nl = _p.stem.lower()
+            _rank = 5
+            if 'idle' in _nl or 'maincity' in _nl:
+                _rank = 0
+            elif any(k in _nl for k in ('stand', 'walk', 'run', 'sprint')):
+                _rank = 1
+            elif any(k in _nl for k in ('appear', 'win', 'select', 'switch')):
+                _rank = 2
+            elif any(k in _nl for k in ('attack', 'skill', 'special', 'ultimate')):
+                _rank = 3
+            try:
+                _big = 0 if _p.stat().st_size <= 5 * 1024 * 1024 else 1
+            except OSError:
+                _big = 0
+            return (_rank, _big, len(_nl), _nl)
+        _anim_files.sort(key=_anim_prio)
+        _anim_files = _anim_files[:max(1, _max_anims)]
+
+        try:
+            from bpy_extras import anim_utils as _anim_utils
+        except Exception:
+            _anim_utils = None
+        import math as _math
+
+        def _parse_anim_section(lines, start_idx, is_quat):
+            curves = {}
+            leaf_entries = []
+            leaf_counts = {}
+            i = start_idx + 1
+            n = len(lines)
+            base_indent = len(lines[start_idx]) - len(lines[start_idx].lstrip())
+            cur_t, cur_v, ct = [], [], None
+            while i < n:
+                ln = lines[i]
+                s = ln.strip()
+                if not s:
+                    i += 1
+                    continue
+                if (len(ln) - len(ln.lstrip())) <= base_indent and not s.startswith('-'):
+                    break
+                if s.startswith('- curve:'):
+                    cur_t, cur_v, ct = [], [], None
+                elif s.startswith('time:'):
+                    try:
+                        ct = float(s.split(':', 1)[1].strip())
+                    except ValueError:
+                        ct = None
+                elif s.startswith('value:') and ct is not None:
+                    _lb, _rb = s.find('{'), s.rfind('}')
+                    if _lb >= 0 and _rb > _lb:
+                        d = {}
+                        for _pt in s[_lb + 1:_rb].split(','):
+                            if ':' in _pt:
+                                _k, _v = _pt.split(':', 1)
+                                try:
+                                    d[_k.strip()] = float(_v.strip())
+                                except ValueError:
+                                    pass
+                        if d:
+                            cur_t.append(ct)
+                            if is_quat:
+                                cur_v.append((d.get('x', 0.0), d.get('y', 0.0), d.get('z', 0.0), d.get('w', 1.0)))
+                            else:
+                                cur_v.append((d.get('x', 0.0), d.get('y', 0.0), d.get('z', 0.0)))
+                    ct = None
+                elif s.startswith('path:'):
+                    rp = s.split(':', 1)[1].strip().strip("'\"")
+                    if cur_t:
+                        curves[rp] = (cur_t, cur_v)
+                        lf = rp.rsplit('/', 1)[-1]
+                        if lf:
+                            leaf_counts[lf] = leaf_counts.get(lf, 0) + 1
+                            leaf_entries.append((lf, cur_t, cur_v))
+                    cur_t, cur_v, ct = [], [], None
+                i += 1
+            for lf, ta, va in leaf_entries:
+                if leaf_counts.get(lf, 0) == 1 and lf not in curves:
+                    curves[lf] = (ta, va)
+            return curves, i
+
+        def _euler_deg_to_quat(vals):
+            out = []
+            for ex, ey, ez in vals:
+                rx = _math.radians(ex) * 0.5
+                ry = _math.radians(ey) * 0.5
+                rz = _math.radians(ez) * 0.5
+                cx, sx = _math.cos(rx), _math.sin(rx)
+                cy, sy = _math.cos(ry), _math.sin(ry)
+                cz, sz = _math.cos(rz), _math.sin(rz)
+                out.append((
+                    cy * sx * cz + sy * cx * sz,
+                    sy * cx * cz - cy * sx * sz,
+                    cy * cx * sz - sy * sx * cz,
+                    cy * cx * cz + sy * sx * sz,
+                ))
+            return out
+
+        def _load_unity_anim_fast(apath):
+            lines = apath.read_text(encoding='utf-8', errors='ignore').splitlines()
+            cname = apath.stem
+            rot_c, eul_c, pos_c = {}, {}, {}
+            i, n = 0, len(lines)
+            while i < n:
+                s = lines[i].strip()
+                if s.startswith('m_Name:') and cname == apath.stem:
+                    v = s.split(':', 1)[1].strip().strip("'\"")
+                    if v:
+                        cname = v
+                elif s.startswith('m_RotationCurves:'):
+                    c, i = _parse_anim_section(lines, i, True)
+                    rot_c.update(c)
+                    continue
+                elif s.startswith('m_EulerCurves:'):
+                    c, i = _parse_anim_section(lines, i, False)
+                    eul_c.update(c)
+                    continue
+                elif s.startswith('m_PositionCurves:'):
+                    c, i = _parse_anim_section(lines, i, False)
+                    pos_c.update(c)
+                    continue
+                i += 1
+            for k, (ta, ev) in eul_c.items():
+                if k not in rot_c and ev:
+                    rot_c[k] = (ta, _euler_deg_to_quat(ev))
+            return cname, rot_c, pos_c
+
+        # Build bone lookup table (names, paths, CRC32 hashes, and raw local rest transforms)
+        _arm_scale = sum(abs(float(v)) for v in _master_arm.matrix_world.to_scale()) / 3.0
+        _pos_scale = (1.0 / _arm_scale) if (0.005 < _arm_scale < 0.2) else 1.0
+        _prefixes = ['', f'{_char_name}_Model/', f'{_char_name}/', 'Root/', 'Model/']
+        _bone_records = []
+        for _b in _master_arm.data.bones:
+            pts = []
+            cur = _b
+            while cur is not None:
+                pts.append(cur.name)
+                cur = cur.parent
+            pts.reverse()
+            cands = [_b.name]
+            for k in range(len(pts)):
+                sub = '/'.join(pts[k:])
+                cands.append(sub)
+                for _pf in _prefixes:
+                    full_sub = _pf + sub
+                    cands.append(f'path_{_zlib.crc32(full_sub.encode("utf-8"))}')
+            loc_m = (_b.parent.matrix_local.inverted() @ _b.matrix_local) if _b.parent else _b.matrix_local
+            rest_q = loc_m.to_quaternion()
+            inv_rest_q = rest_q.inverted()
+            rest_t = loc_m.translation.copy()
+            _bone_records.append((_b.name, list(dict.fromkeys(cands)), rest_q, inv_rest_q, rest_t))
+
+        if _master_arm.animation_data is None:
+            _master_arm.animation_data_create()
+
+        for _ap in _anim_files:
+            try:
+                _cname, _rot_c, _pos_c = _load_unity_anim_fast(_ap)
+                if not _rot_c and not _pos_c:
+                    continue
+                _short_name = _cname
+                if _char_name and _short_name.startswith(_char_name + '_Ani_'):
+                    _short_name = _short_name[len(_char_name) + 5:]
+                elif _char_name and _short_name.startswith(_char_name + '_'):
+                    _short_name = _short_name[len(_char_name) + 1:]
+                _act = bpy.data.actions.new(name=_short_name or _cname)
+                _act.use_fake_user = True
+                _slot = None
+                if hasattr(_act, 'slots') and _anim_utils is not None:
+                    _slot = _act.slots.new('OBJECT', _master_arm.name)
+                    _master_arm.animation_data.action = _act
+                    _master_arm.animation_data.action_slot = _slot
+                    _fcurves = _anim_utils.action_ensure_channelbag_for_slot(_act, _slot).fcurves
+                else:
+                    _fcurves = _act.fcurves
+
+                _bone_tracks = []
+                for _bname, _cands, _rq, _inv_rq, _rt in _bone_records:
+                    _rc_hit = next((_rot_c[_c] for _c in _cands if _c in _rot_c), None)
+                    _pc_hit = next((_pos_c[_c] for _c in _cands if _c in _pos_c), None)
+                    if _rc_hit is None and _pc_hit is None:
+                        continue
+                    _dqs = None
+                    if _rc_hit is not None:
+                        _ts, _qvs = _rc_hit
+                        if len(_ts) > 120:
+                            _step = max(1, len(_ts) // 90)
+                            _idx = list(range(0, len(_ts) - 1, _step)) + [len(_ts) - 1]
+                            _ts = [_ts[i] for i in _idx]
+                            _qvs = [_qvs[i] for i in _idx]
+                        _prev_q = None
+                        _rows = []
+                        for _t, (_qx, _qy, _qz, _qw) in zip(_ts, _qvs):
+                            _uq = _Quat((_qw, _qx, -_qy, -_qz))
+                            _dq = _inv_rq @ _uq
+                            if _prev_q is not None and _prev_q.dot(_dq) < 0.0:
+                                _dq = -_dq
+                            _prev_q = _dq
+                            _rows.append((1.0 + _t * 60.0, _dq))
+                        _dqs = _rows
+                        _bname_q = _bname.replace('\\', '\\\\').replace('"', '\\"')
+                        _dp = f'pose.bones["{_bname_q}"].rotation_quaternion'
+                        for _ci, _attr_i in enumerate((0, 1, 2, 3)):
+                            _fc = _fcurves.new(data_path=_dp, index=_attr_i)
+                            _fc.keyframe_points.add(len(_rows))
+                            _co = []
+                            for _fr, _dq in _rows:
+                                _co.append(_fr)
+                                _co.append(float(_dq[_attr_i]))
+                            _fc.keyframe_points.foreach_set('co', _co)
+                            _fc.update()
+
+                    if _pc_hit is not None:
+                        _pts, _pvs = _pc_hit
+                        _is_root_bone = (_bname.lower() in ('bip001', 'root', 'bone_root', 'bip001 pelvis'))
+                        if not _is_root_bone:
+                            _max_pd = max(
+                                (_Vec((-_px * _pos_scale, _py * _pos_scale, _pz * _pos_scale)) - _rt).length
+                                for _px, _py, _pz in _pvs[::max(1, len(_pvs) // 8)]
+                            ) if _pvs else 0.0
+                            _include_pos = _max_pd > 1e-3
+                        else:
+                            _include_pos = True
+                        if _include_pos and _pvs:
+                            if len(_pts) > 120:
+                                _step = max(1, len(_pts) // 90)
+                                _idx = list(range(0, len(_pts) - 1, _step)) + [len(_pts) - 1]
+                                _pts = [_pts[i] for i in _idx]
+                                _pvs = [_pvs[i] for i in _idx]
+                            _prows = []
+                            for _t, (_px, _py, _pz) in zip(_pts, _pvs):
+                                _up = _Vec((-_px * _pos_scale, _py * _pos_scale, _pz * _pos_scale))
+                                _dl = _inv_rq @ (_up - _rt)
+                                _prows.append((1.0 + _t * 60.0, _dl))
+                            _dp = f'pose.bones["{_bname_q}"].location'
+                            for _ci in (0, 1, 2):
+                                _fc = _fcurves.new(data_path=_dp, index=_ci)
+                                _fc.keyframe_points.add(len(_prows))
+                                _co = []
+                                for _fr, _dl in _prows:
+                                    _co.append(_fr)
+                                    _co.append(float(_dl[_ci]))
+                                _fc.keyframe_points.foreach_set('co', _co)
+                                _fc.update()
+                    _bone_tracks.append((_bname, _dqs))
+
+                if len(_fcurves) > 0:
+                    _tr = _master_arm.animation_data.nla_tracks.new()
+                    _tr.name = _act.name
+                    _st = _tr.strips.new(_act.name, 1, _act)
+                    if hasattr(_st, 'action_slot') and _slot is not None:
+                        _st.action_slot = _slot
+                    _tr.mute = True
+                    _baked_actions.append((_act, _slot))
+                else:
+                    bpy.data.actions.remove(_act, do_unlink=True)
+            except Exception as _ae:
+                print(f'WARN anim bake {_ap.name}: {_ae}', flush=True)
+
+        _master_arm.animation_data.action = None
+        for _pb in _master_arm.pose.bones:
+            _pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+            _pb.location = (0.0, 0.0, 0.0)
+            _pb.scale = (1.0, 1.0, 1.0)
+        print(f'Baked {len(_baked_actions)} animation Action(s) onto {_master_arm.name}', flush=True)
+
+try:
+    bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+except Exception:
+    pass
+
+# Export GLB (preserving raw Unity bone axes for OpenZenless 3D Viewer & embedded Actions/Morphs)
+_gltf_kw = {'filepath': _out_glb, 'export_format': 'GLB'}
+if _is_char_dir:
+    try:
+        _grna = bpy.ops.export_scene.gltf.get_rna_type().properties
+        if 'export_skins' in _grna:
+            _gltf_kw['export_skins'] = True
+        if 'export_morph' in _grna:
+            _gltf_kw['export_morph'] = True
+        if 'export_morph_normal' in _grna:
+            _gltf_kw['export_morph_normal'] = True
+        if _baked_actions:
+            if 'export_animations' in _grna:
+                _gltf_kw['export_animations'] = True
+            if 'export_force_sampling' in _grna:
+                _gltf_kw['export_force_sampling'] = False
+            if 'export_animation_mode' in _grna:
+                _gltf_kw['export_animation_mode'] = 'ACTIONS'
+            elif 'export_nla_strips' in _grna:
+                _gltf_kw['export_nla_strips'] = True
+    except Exception:
+        pass
+bpy.ops.export_scene.gltf(**_gltf_kw)
+
+# Convert master armature bone orientations to clean Blender limb-aligned orientations + conjugate Actions & save .blend
+if _save_blend:
+    if _master_arm is not None and fbxs:
+        try:
+            _raw_mats = {b.name: b.matrix_local.copy() for b in _master_arm.data.bones}
+            _raw_parents = {b.name: (b.parent.name if b.parent else None) for b in _master_arm.data.bones}
+            _before_tmp = set(bpy.data.objects)
+            _raw_s = sum(abs(float(v)) for v in _master_arm.matrix_world.to_scale()) / 3.0
+            _imp_s = None
+            try:
+                _fbx_import_call(fbxs[0], auto_orient=True)
+                _tmp_new = [o for o in bpy.data.objects if o not in _before_tmp]
+                _tmp_arms = [o for o in _tmp_new if o.type == 'ARMATURE']
+                if _tmp_arms:
+                    _ts = min((max(abs(float(v)) for v in o.matrix_world.to_scale()) for o in _tmp_arms), default=1.0)
+                    if 0.0 < _ts < 0.1 and _raw_s > 0.2:
+                        for o in _tmp_new:
+                            bpy.data.objects.remove(o, do_unlink=True)
+                        _fbx_import_call(fbxs[0], global_scale=1.0 / _ts, auto_orient=True)
+                        _tmp_new = [o for o in bpy.data.objects if o not in _before_tmp]
+                        _tmp_arms = [o for o in _tmp_new if o.type == 'ARMATURE']
+                _auto_arm = max(_tmp_arms, key=lambda a: len(a.data.bones), default=None) if _tmp_arms else None
+                if _auto_arm is not None:
+                    _auto_info = {
+                        _re.sub(r'\.[0-9]+$', '', b.name): (b.head_local.copy(), b.tail_local.copy(), b.matrix_local.copy())
+                        for b in _auto_arm.data.bones
+                    }
+                    bpy.context.view_layer.objects.active = _master_arm
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    for _eb in _master_arm.data.edit_bones:
+                        _ai = _auto_info.get(_eb.name)
+                        if _ai is not None:
+                            _eb.head = _ai[0]
+                            _eb.tail = _ai[1]
+                            if (_eb.tail - _eb.head).length < 1e-5:
+                                _eb.tail = _eb.head + _Vec((0.0, 0.02, 0.0))
+                            try:
+                                _, _roll = _ai[2].to_3x3().to_quaternion(), 0.0
+                                _eb.align_roll((_ai[2].to_3x3() @ _Vec((0.0, 0.0, 1.0))))
+                            except Exception:
+                                pass
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+                    # Conjugate all baked rotation_quaternion & location FCurves from raw axes -> auto axes
+                    _D_q = {}
+                    _D_loc = {}
+                    for _b in _master_arm.data.bones:
+                        _rm = _raw_mats.get(_b.name)
+                        if _rm is None:
+                            continue
+                        _D_q[_b.name] = (_b.matrix_local.to_3x3().inverted() @ _rm.to_3x3()).to_quaternion()
+                        _pn = _raw_parents.get(_b.name)
+                        _rp = _raw_mats.get(_pn) if _pn else None
+                        if _rp is not None:
+                            _D_loc[_b.name] = (_b.matrix_local.to_3x3().inverted() @ _rp.to_3x3()) @ _rm.to_3x3().inverted()
+                        else:
+                            _D_loc[_b.name] = _b.matrix_local.to_3x3().inverted()
+
+                    if _baked_actions:
+                        from bpy_extras import anim_utils as _anim_utils
+                    for _act, _slot in _baked_actions:
+                        _fcs = _anim_utils.action_ensure_channelbag_for_slot(_act, _slot).fcurves if (hasattr(_act, 'slots') and _slot is not None) else _act.fcurves
+                        _by_bone_q = {}
+                        _by_bone_p = {}
+                        for _fc in _fcs:
+                            _dp = _fc.data_path
+                            if _dp.startswith('pose.bones[') and _dp.endswith('].rotation_quaternion'):
+                                _bn = _json.loads(_dp[len('pose.bones['):-len('].rotation_quaternion')])
+                                _by_bone_q.setdefault(_bn, {})[_fc.array_index] = _fc
+                            elif _dp.startswith('pose.bones[') and _dp.endswith('].location'):
+                                _bn = _json.loads(_dp[len('pose.bones['):-len('].location')])
+                                _by_bone_p.setdefault(_bn, {})[_fc.array_index] = _fc
+                        for _bn, _imap in _by_bone_q.items():
+                            _dq_conv = _D_q.get(_bn)
+                            if _dq_conv is None or len(_imap) != 4:
+                                continue
+                            _dq_inv = _dq_conv.inverted()
+                            _npts = len(_imap[0].keyframe_points)
+                            _bufs = []
+                            for _ci in range(4):
+                                _arr = [0.0] * (_npts * 2)
+                                _imap[_ci].keyframe_points.foreach_get('co', _arr)
+                                _bufs.append(_arr)
+                            for _ki in range(_npts):
+                                _vi = _ki * 2 + 1
+                                _q = _Quat((_bufs[0][_vi], _bufs[1][_vi], _bufs[2][_vi], _bufs[3][_vi]))
+                                _nq = _dq_conv @ _q @ _dq_inv
+                                for _ci in range(4):
+                                    _bufs[_ci][_vi] = float(_nq[_ci])
+                            for _ci in range(4):
+                                _imap[_ci].keyframe_points.foreach_set('co', _bufs[_ci])
+                                _imap[_ci].update()
+                        for _bn, _imap in _by_bone_p.items():
+                            _rm = _raw_mats.get(_bn)
+                            _b_final = _master_arm.data.bones.get(_bn)
+                            if _rm is None or _b_final is None or len(_imap) != 3:
+                                continue
+                            _M_p = _b_final.matrix_local.to_3x3().inverted() @ _rm.to_3x3()
+                            _npts = len(_imap[0].keyframe_points)
+                            _bufs = []
+                            for _ci in range(3):
+                                _arr = [0.0] * (_npts * 2)
+                                _imap[_ci].keyframe_points.foreach_get('co', _arr)
+                                _bufs.append(_arr)
+                            for _ki in range(_npts):
+                                _vi = _ki * 2 + 1
+                                _v = _M_p @ _Vec((_bufs[0][_vi], _bufs[1][_vi], _bufs[2][_vi]))
+                                for _ci in range(3):
+                                    _bufs[_ci][_vi] = float(_v[_ci])
+                            for _ci in range(3):
+                                _imap[_ci].keyframe_points.foreach_set('co', _bufs[_ci])
+                                _imap[_ci].update()
+            finally:
+                for o in [obj for obj in bpy.data.objects if obj not in _before_tmp and obj != _master_arm]:
+                    try:
+                        bpy.data.objects.remove(o, do_unlink=True)
+                    except Exception:
+                        pass
+                try:
+                    bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+                except Exception:
+                    pass
+        except Exception as _be:
+            print(f'WARN auto-orient .blend step: {_be}', flush=True)
+
+    try:
+        bpy.ops.file.pack_all()
+    except Exception as _pe:
+        print(f'WARN pack_all: {_pe}', flush=True)
+    bpy.ops.wm.save_as_mainfile(filepath=_save_blend, compress=True)
+    print(f'Saved pre-rigged Blender project -> {_save_blend}', flush=True)
+'''
+
+
 def _blender_convert_chunk(
     blender: str,
     char_dir: Path,
@@ -611,352 +1706,34 @@ def _blender_convert_chunk(
     mat_to_tex: dict[str, str],
     allow_fuzzy_fallback: bool,
     log_cb=None,
+    anim_dir: Path | None = None,
+    save_blend: Path | None = None,
+    is_char: bool | None = None,
 ) -> int:
-    fbx_list = [str(p) for p in fbxs]
-    obj_list = [str(p) for p in objs]
-    py_expr = (
-        "import bpy, os, re as _re\n"
-        "bpy.ops.wm.read_factory_settings(use_empty=True)\n"
-        "sc = bpy.context.scene\n"
-        "sc.render.threads_mode = 'AUTO'\n"
-        "try:\n"
-        "    _cp = bpy.context.preferences.addons['cycles'].preferences\n"
-        "    for _bt in ('OPTIX', 'CUDA', 'HIP', 'ONEAPI'):\n"
-        "        try:\n"
-        "            _cp.compute_device_type = _bt\n"
-        "            _cp.get_devices()\n"
-        "            if any(d.type != 'CPU' for d in _cp.devices):\n"
-        "                for _d in _cp.devices:\n"
-        "                    _d.use = (_d.type != 'CPU')\n"
-        "                break\n"
-        "        except Exception:\n"
-        "            pass\n"
-        "except Exception:\n"
-        "    pass\n"
-        "hold = bpy.data.collections.new('Hold')\n"
-        "hold.use_fake_user = True\n"
-        "_canonical_img_names = {}\n"
-        "def _img_key(img):\n"
-        "    fp = getattr(img, 'filepath', '') or ''\n"
-        "    if fp:\n"
-        "        try:\n"
-        "            ap = bpy.path.abspath(fp)\n"
-        "            if os.path.isfile(ap):\n"
-        "                return 'file:' + os.path.basename(ap).lower() + ':' + str(os.path.getsize(ap))\n"
-        "        except Exception:\n"
-        "            pass\n"
-        "    nm = os.path.splitext(os.path.basename(fp or img.name))[0].lower()\n"
-        "    nm = _re.sub(r'(?:\\.[0-9]+|\\s*\\([0-9]+\\))$', '', nm)\n"
-        "    return 'stem:' + nm\n"
-        "def _dedup_imgs():\n"
-        "    remap = {}\n"
-        "    for img in list(bpy.data.images):\n"
-        "        if img.name in ('Render Result', 'Viewer Node'):\n"
-        "            continue\n"
-        "        k = _img_key(img)\n"
-        "        cname = _canonical_img_names.get(k)\n"
-        "        canon = bpy.data.images.get(cname) if cname else None\n"
-        "        if canon is None:\n"
-        "            _canonical_img_names[k] = img.name\n"
-        "        elif canon != img:\n"
-        "            remap[img] = canon\n"
-        "    if remap:\n"
-        "        for mat in bpy.data.materials:\n"
-        "            if not mat.use_nodes or not mat.node_tree:\n"
-        "                continue\n"
-        "            for nd in mat.node_tree.nodes:\n"
-        "                if nd.type == 'TEX_IMAGE' and nd.image in remap:\n"
-        "                    nd.image = remap[nd.image]\n"
-        "        for dup in remap:\n"
-        "            bpy.data.images.remove(dup, do_unlink=True)\n"
-        "def _stash():\n"
-        "    for o in list(sc.collection.objects):\n"
-        "        sc.collection.objects.unlink(o)\n"
-        "        hold.objects.link(o)\n"
-        "    for c in list(sc.collection.children):\n"
-        "        sc.collection.children.unlink(c)\n"
-        "        hold.children.link(c)\n"
-        f"fbxs = {fbx_list!r}\n"
-        f"objs = {obj_list!r}\n"
-        f"_is_char_dir = {char_name.startswith('Avatar_')!r}\n"
-        "_obj_import_rank = {}\n"
-        "def _import_fbx(fp, rank=0):\n"
-        "    before = set(bpy.data.objects)\n"
-        "    bpy.ops.import_scene.fbx(filepath=fp)\n"
-        "    new = [o for o in bpy.data.objects if o not in before]\n"
-        "    if _is_char_dir:\n"
-        "        arms = [o for o in new if o.type == 'ARMATURE']\n"
-        "        if arms:\n"
-        "            ascale = min((max(abs(float(v)) for v in o.matrix_world.to_scale()) for o in arms), default=1.0)\n"
-        "            if 0.0 < ascale < 0.1:\n"
-        "                for o in new:\n"
-        "                    bpy.data.objects.remove(o, do_unlink=True)\n"
-        "                bpy.ops.import_scene.fbx(filepath=fp, global_scale=1.0 / ascale)\n"
-        "                new = [o for o in bpy.data.objects if o not in before]\n"
-        "                print(f'Normalized FBX scale {ascale:.4f} -> 1.0: {fp}', flush=True)\n"
-        "    for o in new:\n"
-        "        _obj_import_rank[o.as_pointer()] = rank\n"
-        "for idx, fp in enumerate(fbxs, 1):\n"
-        "    try:\n"
-        "        _import_fbx(fp, idx)\n"
-        "        _stash()\n"
-        "    except Exception as _e:\n"
-        "        print(f'SKIP FBX {fp}: {_e}', flush=True)\n"
-        "    if idx % 50 == 0:\n"
-        "        _dedup_imgs()\n"
-        "    if idx % 250 == 0:\n"
-        "        print(f'Imported FBX {idx}/{len(fbxs)} (unique images={len(bpy.data.images)})', flush=True)\n"
-        "_imported_objs = False\n"
-        "_need_objs = objs and (not any(o.type == 'MESH' for o in bpy.data.objects) or (_is_char_dir and not any(k in o.name.lower() for o in bpy.data.objects if o.type == 'MESH' for k in ('body', 'face', 'hair'))))\n"
-        "if _need_objs:\n"
-        "    _imported_objs = True\n"
-        "    if _is_char_dir:\n"
-        "        _sep = [p for p in objs if os.path.basename(p).lower().startswith('separatemesh_')]\n"
-        "        if _sep:\n"
-        "            _sep_low = ' '.join(os.path.basename(p).lower() for p in _sep)\n"
-        "            objs = [p for p in objs if p in _sep or os.path.splitext(os.path.basename(p))[0].lower() not in _sep_low]\n"
-        "    for idx, fp in enumerate(objs, 1):\n"
-        "        if _is_char_dir or os.path.basename(fp).lower().startswith('separatemesh_'):\n"
-        "            bpy.ops.wm.obj_import(filepath=fp, forward_axis='Y', up_axis='Z')\n"
-        "        else:\n"
-        "            bpy.ops.wm.obj_import(filepath=fp)\n"
-        "        _stash()\n"
-        "        if idx % 250 == 0:\n"
-        "            print(f'Imported OBJ {idx}/{len(objs)}', flush=True)\n"
-        "sc.collection.children.link(hold)\n"
-        "_dedup_imgs()\n"
-        "def _mat_has_img(m):\n"
-        "    if m is None or not m.use_nodes or not m.node_tree:\n"
-        "        return False\n"
-        "    return any(n.type == 'TEX_IMAGE' and getattr(n, 'image', None) is not None for n in m.node_tree.nodes)\n"
-        "def _is_greybox_mat(m):\n"
-        "    if m is None:\n"
-        "        return False\n"
-        "    ml = m.name.lower()\n"
-        "    if 'shadowproxy' in ml:\n"
-        "        return True\n"
-        "    if (ml == 'lit' or ml.startswith('lit.') or ml == 'unlit' or ml.startswith('unlit.') or 'mihoyo_unlit_unlit' in ml) and not _mat_has_img(m):\n"
-        "        return True\n"
-        "    return False\n"
-        "def _is_proxy_obj(obj):\n"
-        "    cur = obj\n"
-        "    while cur is not None:\n"
-        "        nl = cur.name.lower()\n"
-        "        if _re.search(r'(?:_col(?:$|_|lider)|_proxy(?:$|_|\\s|\\.|[0-9])|_hairshadow(?:$|_|\\s|\\.|[0-9])|^volumetricfog|^scenepropcollider_|^blockout_|^stage_.*_ld$|^sm_merged_bp_|^napmesh,)', nl):\n"
-        "            return True\n"
-        "        cur = cur.parent\n"
-        "    if obj.type == 'MESH' and obj.data and obj.data.materials:\n"
-        "        non_none = [m for m in obj.data.materials if m is not None]\n"
-        "        if non_none and all(_is_greybox_mat(m) for m in non_none):\n"
-        "            return True\n"
-        "    return False\n"
-        "_mesh_objs = [o for o in bpy.data.objects if o.type == 'MESH' and o.data]\n"
-        "_non_proxy = [o for o in _mesh_objs if not _is_proxy_obj(o)]\n"
-        "if _non_proxy:\n"
-        "    for o in _mesh_objs:\n"
-        "        if o not in _non_proxy:\n"
-        "            bpy.data.objects.remove(o, do_unlink=True)\n"
-        "if not _is_char_dir and _non_proxy:\n"
-        "    from mathutils import Vector as _Vec\n"
-        "    _seen_geo = set()\n"
-        "    _dup_removed = 0\n"
-        "    bpy.context.view_layer.update()\n"
-        "    for o in sorted(_non_proxy, key=lambda _o: _obj_import_rank.get(_o.as_pointer(), 999999)):\n"
-        "        if not o.data or len(o.data.vertices) == 0:\n"
-        "            continue\n"
-        "        _bm = _re.sub(r'(?:\\.[0-9]+|\\s*\\([0-9]+\\))$', '', o.data.name.lower()).strip()\n"
-        "        _mw = o.matrix_world\n"
-        "        _pts = [_mw @ _Vec(c) for c in o.bound_box]\n"
-        "        _gkey = (\n"
-        "            _bm, len(o.data.vertices), len(o.data.polygons),\n"
-        "            round(min(p.x for p in _pts), 4), round(min(p.y for p in _pts), 4), round(min(p.z for p in _pts), 4),\n"
-        "            round(max(p.x for p in _pts), 4), round(max(p.y for p in _pts), 4), round(max(p.z for p in _pts), 4),\n"
-        "        )\n"
-        "        if _gkey in _seen_geo:\n"
-        "            bpy.data.objects.remove(o, do_unlink=True)\n"
-        "            _dup_removed += 1\n"
-        "        else:\n"
-        "            _seen_geo.add(_gkey)\n"
-        "    if _dup_removed:\n"
-        "        print(f'Deduplicated {_dup_removed} exact co-planar duplicate mesh(es)', flush=True)\n"
-        "def _has_base_tex(mat):\n"
-        "    if not mat or not mat.use_nodes or not mat.node_tree:\n"
-        "        return False\n"
-        "    for nd in mat.node_tree.nodes:\n"
-        "        if nd.type == 'TEX_IMAGE' and nd.image is not None:\n"
-        "            for lk in nd.outputs[0].links:\n"
-        "                if lk.to_socket.name == 'Base Color':\n"
-        "                    return True\n"
-        "    return False\n"
-        f"_allow_fuzzy = {allow_fuzzy_fallback!r} or _imported_objs\n"
-        "if _allow_fuzzy:\n"
-        f"    pngs = [str(p) for p in sorted(__import__('pathlib').Path({str(char_dir)!r}).rglob('*.png'))]\n"
-        f"    _mat_to_tex = {mat_to_tex!r}\n"
-        "    _png_by_stem = {}\n"
-        "    for _p in pngs:\n"
-        "        _st = os.path.splitext(os.path.basename(_p))[0].lower()\n"
-        "        _prev = _png_by_stem.get(_st)\n"
-        "        if _prev is None or os.path.getsize(_p) > os.path.getsize(_prev):\n"
-        "            _png_by_stem[_st] = _p\n"
-        "    diffuse_pngs = []\n"
-        "    for _st, _p in _png_by_stem.items():\n"
-        "        if _st.endswith(('_n', '_m', '_a', '_e', '_h', '_b', '_ao', '_occ', '_rough', '_metal', '_spec', '_ramp', '_lightmap', '_lm', '_norm', '_normal', '_bump', '_mask', '_sdf', '_data', '_rm')):\n"
-        "            continue\n"
-        "        diffuse_pngs.append((_st, _p))\n"
-        "    _img_cache = {}\n"
-        "    _mat_cache = {}\n"
-        "    def _pick_tex(name):\n"
-        "        raw_nl = _re.sub(r'\\.[0-9]+$', '', name.lower())\n"
-        "        nl = _re.sub(r'\\s*\\[[^\\]]+\\]$', '', raw_nl)\n"
-        "        nl = _re.sub(r'\\s*\\([0-9]+\\)$', '', nl).strip()\n"
-        "        nl = _re.sub(r'^separatemesh_.*?_model_', '', nl)\n"
-        "        nl = _re.sub(r'^separatemesh_avatar_[^_]+_[^_]+_[^_]+_', '', nl)\n"
-        "        nl = _re.sub(r'_(?:lod[0-9]+|model)$', '', nl)\n"
-        "        m_body = _re.search(r'_body_([0-9]+)(?:_[0-9]+)?$', nl)\n"
-        "        m_num = _re.search(r'_([0-9]+)$', nl)\n"
-        "        num_suf = m_body.group(1) if m_body else (m_num.group(1) if m_num else None)\n"
-        "        nl_base = _re.sub(r'_[0-9]+$', '', nl)\n"
-        "        mat_cands = [raw_nl, nl, 'mat_' + nl, nl_base, 'mat_' + nl_base]\n"
-        "        if m_body:\n"
-        "            m_bprefix = _re.search(r'^(.+_body_[0-9]+)_[0-9]+$', nl)\n"
-        "            if m_bprefix:\n"
-        "                bp = m_bprefix.group(1)\n"
-        "                mat_cands.extend([bp, 'mat_' + bp])\n"
-        "        for _ck in mat_cands:\n"
-        "            _exact = _mat_to_tex.get(_ck)\n"
-        "            if _exact and _exact in _png_by_stem:\n"
-        "                return _png_by_stem[_exact]\n"
-        "        toks = [t for t in nl_base.split('_') if t]\n"
-        "        best_p, best_s = None, 0\n"
-        "        for st, fp in diffuse_pngs:\n"
-        "            if any(k in st for k in ('decal', 'floodlight', '_eff')) and not any(k in nl for k in ('decal', 'floodlight', 'eff', 'light')):\n"
-        "                continue\n"
-        "            sc_val = 0\n"
-        "            map_bonus = (40 if (num_suf and f'_map{num_suf}' in st) else 0)\n"
-        "            if st == nl + '_d' or st == nl_base + '_d' or st == nl:\n"
-        "                sc_val = 1000\n"
-        "            elif len(nl) >= 6 and st.startswith(nl + '_'):\n"
-        "                sc_val = 800 + (20 if st.endswith('_d') else 0) + map_bonus\n"
-        "            elif len(nl_base) >= 6 and st.startswith(nl_base + '_'):\n"
-        "                sc_val = 500 + (20 if st.endswith('_d') else 0) + map_bonus\n"
-        "            elif len(toks) >= 3:\n"
-        "                for k in range(len(toks), 2, -1):\n"
-        "                    pref = '_'.join(toks[:k])\n"
-        "                    if st.startswith(pref + '_'):\n"
-        "                        sc_val = 100 + k * 10 + (10 if st.endswith('_d') else 0) + map_bonus\n"
-        "                        break\n"
-        "            if sc_val > best_s:\n"
-        "                best_s, best_p = sc_val, fp\n"
-        "        return best_p\n"
-        "    def _img_has_alpha(img):\n"
-        "        if img.depth not in (32, 64, 128) or not img.has_data:\n"
-        "            return False\n"
-        "        try:\n"
-        "            px = img.pixels\n"
-        "            n = len(px)\n"
-        "            step = max(4, (n // 4096) * 4)\n"
-        "            for i in range(3, n, step):\n"
-        "                if px[i] < 0.98:\n"
-        "                    return True\n"
-        "        except Exception:\n"
-        "            pass\n"
-        "        return False\n"
-        "    def _make_mat(fp, obj_name=''):\n"
-        "        nl = (os.path.basename(fp) + ' ' + obj_name).lower()\n"
-        "        is_sky = bool(_re.search(r'(?:^|[_\\s.])(skybox|skydome|sky_?dome|sky_?sphere|sky_?plane|sky|cloud|dome|backdrop)(?:$|[_\\s.0-9])', nl))\n"
-        "        is_cutout = any(t in nl for t in ('hair', 'lash', 'leaf', 'tree', 'plant', 'bush', 'grass', 'foliage', 'shadow'))\n"
-        "        key = (fp, is_sky, is_cutout)\n"
-        "        if key in _mat_cache:\n"
-        "            return _mat_cache[key]\n"
-        "        img = _img_cache.get(fp)\n"
-        "        if img is None:\n"
-        "            img = bpy.data.images.load(fp, check_existing=True)\n"
-        "            _img_cache[fp] = img\n"
-        "        mat = bpy.data.materials.new(name=os.path.splitext(os.path.basename(fp))[0])\n"
-        "        mat.diffuse_color = (1.0, 1.0, 1.0, 1.0)\n"
-        "        mat.use_nodes = True\n"
-        "        nt = mat.node_tree\n"
-        "        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None) or nt.nodes.new('ShaderNodeBsdfPrincipled')\n"
-        "        tex = nt.nodes.new('ShaderNodeTexImage')\n"
-        "        tex.image = img\n"
-        "        nt.links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])\n"
-        "        is_trans_hint = is_sky or is_cutout or any(t in nl for t in ('decal', 'glass', 'eff', 'fx', 'floodlight'))\n"
-        "        if is_trans_hint and _img_has_alpha(img):\n"
-        "            nt.links.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])\n"
-        "            if hasattr(mat, 'blend_method'):\n"
-        "                mat.blend_method = 'CLIP' if (is_cutout or 'decal' in nl) else 'BLEND'\n"
-        "            if hasattr(mat, 'alpha_threshold'):\n"
-        "                mat.alpha_threshold = 0.45\n"
-        "        if is_sky or is_cutout:\n"
-        "            mat.use_backface_culling = False\n"
-        "        _mat_cache[key] = mat\n"
-        "        return mat\n"
-        "    if diffuse_pngs:\n"
-        "        for o in bpy.data.objects:\n"
-        "            if o.type != 'MESH' or not o.data:\n"
-        "                continue\n"
-        "            if o.data.materials:\n"
-        "                for _si in range(len(o.data.materials)):\n"
-        "                    _om = o.data.materials[_si]\n"
-        "                    if _has_base_tex(_om):\n"
-        "                        continue\n"
-        "                    _mn = _om.name if _om else ''\n"
-        "                    _pn = o.parent.name if o.parent else ''\n"
-        "                    _fp = (_pick_tex(_mn) if _mn else None) or _pick_tex(o.name) or _pick_tex(o.data.name) or (_pick_tex(_pn) if _pn else None)\n"
-        "                    if _fp:\n"
-        "                        o.data.materials[_si] = _make_mat(_fp, o.name)\n"
-        "            else:\n"
-        "                _pn = o.parent.name if o.parent else ''\n"
-        "                _fp = _pick_tex(o.name) or _pick_tex(o.data.name) or (_pick_tex(_pn) if _pn else None)\n"
-        "                if _fp:\n"
-        "                    o.data.materials.append(_make_mat(_fp, o.name))\n"
-        "_dedup_imgs()\n"
-        "for mat in bpy.data.materials:\n"
-        "    if not mat.use_nodes or not mat.node_tree:\n"
-        "        continue\n"
-        "    nt = mat.node_tree\n"
-        "    for nd in list(nt.nodes):\n"
-        "        if nd.type == 'TEX_IMAGE' and not any(lk.to_socket.name == 'Base Color' for lk in nd.outputs[0].links):\n"
-        "            nt.nodes.remove(nd)\n"
-        "    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)\n"
-        "    if bsdf:\n"
-        "        if 'Roughness' in bsdf.inputs and not bsdf.inputs['Roughness'].is_linked:\n"
-        "            bsdf.inputs['Roughness'].default_value = 0.92\n"
-        "        if 'Metallic' in bsdf.inputs and not bsdf.inputs['Metallic'].is_linked:\n"
-        "            bsdf.inputs['Metallic'].default_value = 0.0\n"
-        "        for _sp_k in ('Specular IOR Level', 'Specular'):\n"
-        "            if _sp_k in bsdf.inputs and not bsdf.inputs[_sp_k].is_linked:\n"
-        "                bsdf.inputs[_sp_k].default_value = 0.05\n"
-        "    if bsdf and 'Emission Color' in bsdf.inputs and not bsdf.inputs['Emission Color'].is_linked:\n"
-        "        if 'Emission Strength' in bsdf.inputs:\n"
-        "            bsdf.inputs['Emission Strength'].default_value = 0.0\n"
-        "        bsdf.inputs['Emission Color'].default_value = (0.0, 0.0, 0.0, 1.0)\n"
-        "    if bsdf and bsdf.inputs['Base Color'].is_linked:\n"
-        "        dc = mat.diffuse_color\n"
-        "        if any(abs(float(dc[k]) - 1.0) > 0.02 for k in range(3)):\n"
-        "            src_sock = bsdf.inputs['Base Color'].links[0].from_socket\n"
-        "            if src_sock.node.type != 'MIX':\n"
-        "                mx = nt.nodes.new('ShaderNodeMix')\n"
-        "                mx.data_type = 'RGBA'\n"
-        "                mx.blend_type = 'MULTIPLY'\n"
-        "                mx.inputs[0].default_value = 1.0\n"
-        "                mx.inputs[7].default_value = (float(dc[0]), float(dc[1]), float(dc[2]), 1.0)\n"
-        "                nt.links.new(src_sock, mx.inputs[6])\n"
-        "                nt.links.new(mx.outputs[2], bsdf.inputs['Base Color'])\n"
-        "    if any(t in mat.name.lower() for t in ('hair', 'lash', 'leaf', 'tree', 'plant', 'bush', 'grass', 'foliage', 'sky', 'decal')):\n"
-        "        mat.use_backface_culling = False\n"
-        "try:\n"
-        "    bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)\n"
-        "except Exception:\n"
-        "    pass\n"
-        f"bpy.ops.export_scene.gltf(filepath={str(out_glb)!r}, export_format='GLB')\n"
-    )
+    try:
+        max_anims = int(os.environ.get("OPENZENLESS_MAX_BAKED_ANIMS", "16"))
+    except ValueError:
+        max_anims = 16
+    cfg_dict = {
+        "fbxs": [str(p) for p in fbxs],
+        "objs": [str(p) for p in objs],
+        "char_dir": str(char_dir),
+        "char_name": char_name,
+        "out_glb": str(out_glb),
+        "save_blend": str(save_blend) if save_blend else "",
+        "anim_dir": str(anim_dir) if (anim_dir and anim_dir.is_dir()) else "",
+        "is_char": bool(is_char if is_char is not None else char_name.startswith(("Avatar_", "Monster_", "Boss_", "NPC_", "Bangboo_", "Pet_", "Weapon_"))),
+        "mat_to_tex": mat_to_tex,
+        "allow_fuzzy": bool(allow_fuzzy_fallback),
+        "max_anims": max_anims,
+    }
+    py_expr = f"import json as _init_json\n_CFG = _init_json.loads({json.dumps(cfg_dict)!r})\n" + _BLENDER_CONVERT_SCRIPT
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
         tf.write(py_expr)
         script_path = Path(tf.name)
     env = {**os.environ, **cfg.configure_gpu_env(apply=False)}
     try:
-        return run_streaming_cmd([blender, "--background", "--python", str(script_path)], env=env, log_cb=log_cb)
+        return run_streaming_cmd([blender, "--background", "--python-exit-code", "1", "--python", str(script_path)], env=env, log_cb=log_cb)
     finally:
         script_path.unlink(missing_ok=True)
 
@@ -966,6 +1743,7 @@ def _convert_dir_to_glb(
     char_name: str,
     log_cb=None,
     out_glb: Path | None = None,
+    anim_dir: Path | None = None,
 ) -> int:
     blender = cfg.find_blender()
     if not blender:
@@ -1000,7 +1778,16 @@ def _convert_dir_to_glb(
             return (2, str(p))
         return (1, str(p))
     fbxs.sort(key=_fbx_priority)
-    is_char = char_name.startswith("Avatar_")
+    eff_anim_dir = (
+        anim_dir
+        if (anim_dir and anim_dir.is_dir() and any(anim_dir.rglob("*.anim")))
+        else (
+            char_dir / "AnimationClip"
+            if ((char_dir / "AnimationClip").is_dir() and any((char_dir / "AnimationClip").rglob("*.anim")))
+            else None
+        )
+    )
+    is_char = char_name.startswith(("Avatar_", "Monster_", "Boss_", "NPC_", "Bangboo_", "Pet_", "Weapon_")) or (eff_anim_dir is not None)
     if is_char:
         fbxs = [p for p in fbxs if "Animations" not in p.parts and "AnimationClip" not in p.parts]
         objs = [p for p in objs if "Animations" not in p.parts and "AnimationClip" not in p.parts]
@@ -1011,14 +1798,16 @@ def _convert_dir_to_glb(
         _emit(log_cb, f"No FBX/OBJ models found in {char_dir}; skipping GLB conversion.")
         return 0
     glb_path = out_glb or (char_dir / f"{char_name}.glb")
+    blend_path = glb_path.with_suffix(".blend") if is_char else None
     cab_active = _zzz_cab_map_exists() and bool(fbxs)
     mat_to_tex, _, _ = ({}, [], []) if (cab_active and not is_char and not objs) else resolve_material_textures(char_dir)
     chunk_size = 350
-    if len(fbxs) <= chunk_size:
-        _emit(log_cb, f"Converting {len(fbxs)} FBX / {len(objs)} OBJ model(s) to GLB via Blender -> {glb_path.name}")
+    if is_char or len(fbxs) <= chunk_size:
+        _emit(log_cb, f"Converting {len(fbxs)} FBX / {len(objs)} OBJ model(s) to GLB{' + .blend' if blend_path else ''} via Blender -> {glb_path.name}")
         return _blender_convert_chunk(
             blender, char_dir, char_name, fbxs, objs, glb_path, mat_to_tex,
             allow_fuzzy_fallback=(not cab_active or is_char), log_cb=log_cb,
+            anim_dir=eff_anim_dir, save_blend=blend_path, is_char=is_char,
         )
     chunks = [fbxs[i : i + chunk_size] for i in range(0, len(fbxs), chunk_size)]
     max_w = min(len(chunks), cfg.default_worker_count(4))
@@ -1160,7 +1949,7 @@ def _export_oz_entry(
                 log_cb=log_cb,
                 map_op="CABMap",
                 map_name="ZZZ",
-                diffuse_only=(not export_shaders),
+                diffuse_only=False,
                 skip_proxies=False,
                 container_hash_file=hash_file,
                 cab_filter=prefab_cab,
@@ -1206,7 +1995,7 @@ def _export_oz_entry(
                 export_mode="Convert",
                 name_filter=pat,
                 log_cb=log_cb,
-                diffuse_only=(not export_shaders),
+                diffuse_only=False,
                 group_assets="BySource",
                 skip_animations=True,
             )
@@ -1251,44 +2040,50 @@ def _export_oz_entry(
             return last_rc or 2
         if chosen_name != matched_name:
             _emit(log_cb, f"Using fallback prefab {chosen_name} for {matched_name}.")
+
+        # Export AnimationClips first so Blender conversion can bake them into Actions & NLA tracks
+        anim_entry = entry if (entry.get("anim_blks") or []) else chosen_entry
+        anim_blks = [
+            p for b in (anim_entry.get("anim_blks") or [])
+            if (p := cfg.resolve_blk_path(root, b)) is not None
+        ]
+        if anim_blks:
+            anim_keys = anim_entry.get("anim_keys") or []
+            anim_hash_file: Path | None = None
+            try:
+                if anim_keys:
+                    with tempfile.NamedTemporaryFile("w", suffix=".hashes", delete=False, encoding="utf-8") as ahf:
+                        ahf.write("\n".join(str(k) for k in anim_keys) + "\n")
+                        anim_hash_file = Path(ahf.name)
+                rc_anim = export_blks_batch(
+                    anim_blks, dest,
+                    types=["AnimationClip"],
+                    export_mode="Convert",
+                    name_filter="" if anim_keys else re.escape(matched_name),
+                    log_cb=log_cb,
+                    use_cab_map=_zzz_cab_map_exists(),
+                    container_hash_file=anim_hash_file,
+                    group_assets="ByType",
+                )
+                if rc_anim != 0:
+                    _emit(log_cb, f"WARNING: AnimationClip export returned rc={rc_anim} (some clips could not be decoded).")
+            finally:
+                if anim_hash_file is not None:
+                    anim_hash_file.unlink(missing_ok=True)
+
         if convert_glb and last_rc == 0:
             rc_glb = _convert_dir_to_glb(
-                stage_dir, matched_name, log_cb=log_cb, out_glb=dest / f"{matched_name}.glb"
+                stage_dir,
+                matched_name,
+                log_cb=log_cb,
+                out_glb=dest / f"{matched_name}.glb",
+                anim_dir=dest / "AnimationClip",
             )
             if rc_glb != 0:
                 last_rc = rc_glb
         _organize_character_stage(stage_dir, dest)
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
-
-    anim_entry = entry if (entry.get("anim_blks") or []) else chosen_entry
-    anim_blks = [
-        p for b in (anim_entry.get("anim_blks") or [])
-        if (p := cfg.resolve_blk_path(root, b)) is not None
-    ]
-    if anim_blks:
-        anim_keys = anim_entry.get("anim_keys") or []
-        anim_hash_file: Path | None = None
-        try:
-            if anim_keys:
-                with tempfile.NamedTemporaryFile("w", suffix=".hashes", delete=False, encoding="utf-8") as ahf:
-                    ahf.write("\n".join(str(k) for k in anim_keys) + "\n")
-                    anim_hash_file = Path(ahf.name)
-            rc_anim = export_blks_batch(
-                anim_blks, dest,
-                types=["AnimationClip"],
-                export_mode="Convert",
-                name_filter="" if anim_keys else re.escape(matched_name),
-                log_cb=log_cb,
-                use_cab_map=_zzz_cab_map_exists(),
-                container_hash_file=anim_hash_file,
-                group_assets="ByType",
-            )
-            if rc_anim != 0:
-                _emit(log_cb, f"WARNING: AnimationClip export returned rc={rc_anim} (some clips could not be decoded).")
-        finally:
-            if anim_hash_file is not None:
-                anim_hash_file.unlink(missing_ok=True)
     return last_rc
 
 
@@ -1326,7 +2121,7 @@ def export_character_full(
         if blocks and cfg.can_run_cli():
             files_root = cfg.resolve_files_root(game_root or cfg.GAME_ROOT)
             blocks_dir = files_root / "Blocks"
-            resolved = [blocks_dir / f"{os.path.basename(b)}" for b in blocks if (blocks_dir / f"{os.path.basename(b)}").is_file()]
+            resolved = [blocks_dir / f"{os.path.basename(b.replace(chr(92), '/'))}" for b in blocks if (blocks_dir / f"{os.path.basename(b.replace(chr(92), '/'))}").is_file()]
             if not resolved:
                 resolved = [blocks_dir / f"{b}.blk" for b in blocks if (blocks_dir / f"{b}.blk").is_file()]
             if resolved:
@@ -1342,12 +2137,8 @@ def export_character_full(
                     export_mode="Convert",
                     name_filter=char_short,
                     log_cb=log_cb,
-                    diffuse_only=(not export_shaders),
+                    diffuse_only=False,
                 )
-                if convert_glb and last_rc == 0:
-                    rc_glb = _convert_dir_to_glb(dest, char_name, log_cb=log_cb)
-                    if rc_glb != 0:
-                        last_rc = rc_glb
                 rc_anim = export_blks_batch(
                     resolved, dest,
                     types=["AnimationClip"],
@@ -1357,6 +2148,10 @@ def export_character_full(
                 )
                 if rc_anim != 0:
                     _emit(log_cb, f"WARNING: AnimationClip export returned rc={rc_anim} (some clips could not be decoded).")
+                if convert_glb and last_rc == 0:
+                    rc_glb = _convert_dir_to_glb(dest, char_name, log_cb=log_cb, anim_dir=dest / "AnimationClip")
+                    if rc_glb != 0:
+                        last_rc = rc_glb
                 return last_rc
         raise FileNotFoundError(
             f"Missing {script} (and AnimeStudio.CLI.exe fallback unavailable). "

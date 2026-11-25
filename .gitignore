@@ -5,6 +5,7 @@ venv/
 cache/
 Exports/
 dist/
+build/
 *.AppImage
 *.AppDir/
 *.blk
@@ -14,4 +15,5 @@ dist/
 *.wav
 *.fbx
 *.glb
+*.blend
 .DS_Store

@@ -2167,6 +2167,7 @@ def build_asset_map(
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                **cfg.subprocess_no_window_kwargs(),
             )
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -2349,6 +2350,19 @@ def build_asset_map(
             json.dumps({"stages": stages_fallback}, indent=2)
         )
 
+    was_cancelled = bool(cancel_event is not None and cancel_event.is_set())
+    if was_cancelled and oz_chars_file.is_file() and oz_maps_file.is_file():
+        try:
+            if not auto_chars:
+                d_c = json.loads(oz_chars_file.read_text(encoding="utf-8", errors="ignore"))
+                auto_chars = len(d_c.get("characters", d_c))
+            if not auto_stages:
+                d_m = json.loads(oz_maps_file.read_text(encoding="utf-8", errors="ignore"))
+                auto_stages = len(d_m.get("maps", d_m))
+        except Exception:
+            pass
+    prev_good = (oz_chars_file.is_file() and oz_maps_file.is_file() and auto_chars > 0 and auto_stages > 0)
+
     manifest = {
         "files_root": str(files_root),
         "oz_index_version": 5,
@@ -2359,7 +2373,7 @@ def build_asset_map(
         "auto_fonts": auto_fonts,
         "fallback_characters": len(chars_fallback),
         "fallback_stages": len(stages_fallback),
-        "user_skipped": bool(cancel_event is not None and cancel_event.is_set()),
+        "user_skipped": False if prev_good else was_cancelled,
         "ran_scripts": ran_scripts,
         "built_at": int(time.time()),
     }

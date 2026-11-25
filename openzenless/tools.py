@@ -3031,6 +3031,7 @@ def ensure_wine(log_cb=None, progress_cb=None, cancel_event: threading.Event | N
                 res = subprocess.run(
                     [str(wine_bin), "--version"], env=cfg.build_cli_env(),
                     capture_output=True, text=True, timeout=15,
+                    **cfg.subprocess_no_window_kwargs(),
                 )
                 _emit(log_cb, f"Portable Wine ready: {wine_bin} ({(res.stdout or '').strip()})")
             except Exception as exc:
@@ -3170,8 +3171,15 @@ def _build_animestudio_cli(as_dir: Path, dotnet: str, log_cb=None, progress_cb=N
             env=env,
         )
 
-    mingw = shutil.which("x86_64-w64-mingw32-g++")
+    mingw = shutil.which("x86_64-w64-mingw32-g++") or (shutil.which("g++") if cfg.is_windows() else None)
     zzzv2_src = as_dir / "AnimeStudio.ACL" / "AnimeStudio.ACL.ZZZV2"
+    acl_dst_dirs = (
+        pub_dir,
+        bin_base,
+        as_dir / "AnimeStudio.Libraries",
+        as_dir / "AnimeStudio.Utility" / "bin" / "Release" / "net9.0",
+    )
+    copied_acl = False
     if mingw and (zzzv2_src / "ACLLibrary.cpp").is_file():
         if progress_cb:
             progress_cb(65, "Building AnimeStudio.ACL.ZZZV2.dll (mingw-w64)...")
@@ -3187,15 +3195,17 @@ def _build_animestudio_cli(as_dir: Path, dotnet: str, log_cb=None, progress_cb=N
             env=env,
         )
         if rc_dll == 0 and dll_tmp.is_file():
-            for dst_dir in (
-                pub_dir,
-                bin_base,
-                as_dir / "AnimeStudio.Libraries",
-                as_dir / "AnimeStudio.Utility" / "bin" / "Release" / "net9.0",
-            ):
+            for dst_dir in acl_dst_dirs:
                 if dst_dir.is_dir():
                     shutil.copy2(dll_tmp, dst_dir / "AnimeStudio.ACL.ZZZV2.dll")
             dll_tmp.unlink(missing_ok=True)
+            copied_acl = True
+    bundled_acl = cfg.ASSETS_DIR / "win64" / "AnimeStudio.ACL.ZZZV2.dll"
+    if not copied_acl and bundled_acl.is_file():
+        _emit(log_cb, "Installing prebuilt AnimeStudio.ACL.ZZZV2.dll...")
+        for dst_dir in acl_dst_dirs:
+            if dst_dir.is_dir():
+                shutil.copy2(bundled_acl, dst_dir / "AnimeStudio.ACL.ZZZV2.dll")
 
     cfg._resolve_tool_paths()
     return cfg.CLI_EXE.is_file()
@@ -3261,6 +3271,14 @@ def ensure_extractor_tools(
         if dotnet:
             _emit(log_cb, "Rebuilding AnimeStudio.CLI after applying OpenZenless patches...")
             _build_animestudio_cli(as_dir, dotnet, log_cb=log_cb, progress_cb=progress_cb)
+
+    bundled_acl = cfg.ASSETS_DIR / "win64" / "AnimeStudio.ACL.ZZZV2.dll"
+    if cfg.CLI_EXE.is_file() and bundled_acl.is_file() and not (cfg.CLI_DIR / "AnimeStudio.ACL.ZZZV2.dll").is_file():
+        try:
+            shutil.copy2(bundled_acl, cfg.CLI_DIR / "AnimeStudio.ACL.ZZZV2.dll")
+            _emit(log_cb, f"Copied prebuilt AnimeStudio.ACL.ZZZV2.dll -> {cfg.CLI_DIR}")
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] Could not copy AnimeStudio.ACL.ZZZV2.dll: {exc}")
 
     if not cfg.NAP_MAP_FILE.is_file():
         ww_dir = cfg.TOOLS_DIR / "AnimeWwise"
