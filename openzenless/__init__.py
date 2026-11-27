@@ -1,7 +1,7 @@
 """OpenZenless — OpenIV-style ZZZ proprietary file viewer & batch exporter."""
 from __future__ import annotations
 
-__version__ = "0.3.0-N25.11-01"
+__version__ = "0.3.0-N27.11-01"
 
 from . import config
 config.configure_gpu_env()

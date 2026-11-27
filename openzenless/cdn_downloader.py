@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -51,6 +52,9 @@ DOWNLOAD_PROFILES: dict[str, str] = {
 }
 
 _STATE_FILENAME = ".openzenless_cdn_state.json"
+_CDN_INFO_CACHE: dict[str, tuple[float, dict]] = {}
+_MANIFEST_ASSETS_CACHE: dict[str, list["SophonAsset"]] = {}
+_NAP_RES_CACHE: dict[str, dict] = {}
 
 
 @dataclass(frozen=True)
@@ -106,8 +110,12 @@ def _http_get_json(url: str, timeout: int = 25) -> dict:
     return json.loads(raw.decode("utf-8", errors="replace"))
 
 
+_ZSTD_INSTALL_ATTEMPTED = False
+
+
 def _zstd_decompress(data: bytes) -> bytes:
-    """Decompress zstd bytes via Python 3.14 stdlib, `zstandard` package, or `zstd` CLI."""
+    """Decompress zstd bytes via Python 3.14 stdlib, `zstandard` package (auto-installed if missing), or `zstd` CLI."""
+    global _ZSTD_INSTALL_ATTEMPTED
     try:
         import compression.zstd as _cz  # type: ignore
         return _cz.decompress(data)
@@ -130,6 +138,19 @@ def _zstd_decompress(data: bytes) -> bytes:
         if proc.returncode == 0:
             return proc.stdout
         raise RuntimeError(f"zstd CLI failed (rc={proc.returncode}): {proc.stderr.decode('utf-8', 'replace')}")
+    if not _ZSTD_INSTALL_ATTEMPTED and sys.version_info < (3, 14):
+        _ZSTD_INSTALL_ATTEMPTED = True
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", "zstandard>=0.22.0"],
+                capture_output=True,
+                timeout=90,
+                **cfg.subprocess_no_window_kwargs(),
+            )
+            import zstandard as _zs  # type: ignore
+            return _zs.ZstdDecompressor().decompress(data)
+        except Exception:
+            pass
     raise RuntimeError(
         "No zstd decompressor available. Upgrade Python to 3.14+, install `zstandard` (`pip install zstandard`), "
         "or install the `zstd` CLI tool."
@@ -278,6 +299,10 @@ def _load_manifest_assets(manifest_meta: dict) -> list[SophonAsset]:
     if not man_id or not prefix:
         raise ValueError("Invalid Sophon manifest metadata entry (missing id or url_prefix).")
 
+    cached = _MANIFEST_ASSETS_CACHE.get(man_id)
+    if cached is not None:
+        return cached
+
     cache_dir = cfg.CACHE_DIR / "cdn_manifests"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{man_id}.pb"
@@ -293,7 +318,9 @@ def _load_manifest_assets(manifest_meta: dict) -> list[SophonAsset]:
         tmp_c = cache_file.with_suffix(".pb.tmp")
         tmp_c.write_bytes(raw)
         tmp_c.replace(cache_file)
-    return _decode_sophon_manifest(raw)
+    assets = _decode_sophon_manifest(raw)
+    _MANIFEST_ASSETS_CACHE[man_id] = assets
+    return assets
 
 
 def fetch_legacy_packages(region: str = "global") -> dict:
@@ -309,11 +336,44 @@ def fetch_legacy_packages(region: str = "global") -> dict:
     return pkgs[0] if pkgs else {}
 
 
+def _build_profiles_summary(game_man: dict, parse_game_manifest: bool) -> dict[str, dict[str, int]]:
+    game_stats = game_man.get("stats") or {}
+    summary: dict[str, dict[str, int]] = {
+        "full": {
+            "size": int(game_stats.get("uncompressed_size") or 0),
+            "file_count": int(game_stats.get("file_count") or 0),
+        }
+    }
+    if parse_game_manifest:
+        game_assets = _load_manifest_assets(game_man)
+        for prof in ("assets", "blocks"):
+            matched = [a for a in game_assets if _matches_profile(a.name, prof)]
+            summary[prof] = {
+                "size": sum(a.size for a in matched),
+                "file_count": len(matched),
+            }
+        summary["full"] = {
+            "size": sum(a.size for a in game_assets),
+            "file_count": len(game_assets),
+        }
+    else:
+        summary["assets"] = dict(summary["full"])
+        summary["blocks"] = dict(summary["full"])
+    return summary
+
+
 def fetch_zzz_cdn_info(region: str = "global", parse_game_manifest: bool = True) -> dict:
     """Query live HoYoPlay `getGameBranches` + Sophon `getBuild` for Zenless Zone Zero PC."""
     reg = REGIONS.get(region)
     if not reg:
         raise ValueError(f"Unknown region {region!r}; expected one of {tuple(REGIONS)}")
+
+    now = time.monotonic()
+    cached_entry = _CDN_INFO_CACHE.get(region)
+    if cached_entry is not None and (now - cached_entry[0]) < 600.0:
+        cached = dict(cached_entry[1])
+        cached["profiles"] = _build_profiles_summary(cached["manifests_by_field"]["game"], parse_game_manifest)
+        return cached
 
     br_url = f"{reg['hyp_api']}/getGameBranches?launcher_id={reg['launcher_id']}&game_ids[]={reg['game_id']}"
     br_res = _http_get_json(br_url, timeout=20)
@@ -353,30 +413,9 @@ def fetch_zzz_cdn_info(region: str = "global", parse_game_manifest: bool = True)
     game_man = by_field.get("game")
     if not game_man:
         raise RuntimeError("Sophon getBuild did not include the base `game` manifest.")
-    game_stats = game_man.get("stats") or {}
-    profiles_summary: dict[str, dict[str, int]] = {
-        "full": {
-            "size": int(game_stats.get("uncompressed_size") or 0),
-            "file_count": int(game_stats.get("file_count") or 0),
-        }
-    }
-    if parse_game_manifest:
-        game_assets = _load_manifest_assets(game_man)
-        for prof in ("assets", "blocks"):
-            matched = [a for a in game_assets if _matches_profile(a.name, prof)]
-            profiles_summary[prof] = {
-                "size": sum(a.size for a in matched),
-                "file_count": len(matched),
-            }
-        profiles_summary["full"] = {
-            "size": sum(a.size for a in game_assets),
-            "file_count": len(game_assets),
-        }
-    else:
-        profiles_summary["assets"] = dict(profiles_summary["full"])
-        profiles_summary["blocks"] = dict(profiles_summary["full"])
+    profiles_summary = _build_profiles_summary(game_man, parse_game_manifest)
 
-    return {
+    res = {
         "region": region,
         "region_label": reg["label"],
         "version": str(gb_data.get("tag") or main_br.get("tag") or ""),
@@ -386,6 +425,8 @@ def fetch_zzz_cdn_info(region: str = "global", parse_game_manifest: bool = True)
         "voices": voices,
         "manifests_by_field": by_field,
     }
+    _CDN_INFO_CACHE[region] = (now, dict(res))
+    return res
 
 
 def _file_md5(path: Path) -> str:
@@ -663,3 +704,293 @@ def download_pc_build(
     if progress_cb:
         progress_cb(100, f"v{version} • Complete ({total_files} files, {_fmt_bytes(total_bytes)} in {elapsed_all})")
     return dest_root
+
+
+def init_cdn_workspace(dest_root: Path, region: str | None = None) -> Path:
+    """Prepare a zero-install on-demand CDN workspace directory under `dest_root`."""
+    dest_root = Path(dest_root).expanduser()
+    sa_blocks = dest_root / "ZenlessZoneZero_Data" / "StreamingAssets" / "Blocks"
+    sa_blocks.mkdir(parents=True, exist_ok=True)
+    state_path = dest_root / _STATE_FILENAME
+    if not state_path.is_file():
+        state_path.write_text(
+            json.dumps({"version": "", "mode": "on_demand", "files": {}}, indent=2),
+            encoding="utf-8",
+        )
+    if region:
+        cfg.set_cdn_preferences(auto_pull=True, region=region)
+    return dest_root
+
+
+def download_targeted_assets(
+    dest_root: Path,
+    asset_names: Sequence[str],
+    region: str | None = None,
+    workers: int = 4,
+    log_cb: Callable[[str], None] | None = None,
+    progress_cb: Callable[[int, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    ignore_space_check: bool = False,
+) -> list[Path]:
+    """Download only specific `.blk` (or `.pck`) files for targeted exporting from HoYoverse Sophon CDN."""
+    dest_root = Path(dest_root).expanduser()
+    orig_files_root = cfg.resolve_files_root(dest_root)
+
+    wanted_low: set[str] = set()
+    ordered_req: list[str] = []
+    need_audio_profile = False
+    for raw_name in asset_names:
+        s = str(raw_name or "").replace("\\", "/").strip()
+        if not s:
+            continue
+        base = s.rsplit("/", 1)[-1]
+        if "." not in base:
+            base = f"{base}.blk"
+        low = base.lower()
+        if low.endswith(".pck"):
+            need_audio_profile = True
+        if low not in wanted_low:
+            wanted_low.add(low)
+            ordered_req.append(base)
+
+    if not wanted_low:
+        return []
+
+    has_res_meta = any(
+        (d / name).is_file()
+        for d in (orig_files_root, dest_root / "ZenlessZoneZero_Data" / "StreamingAssets")
+        for name in ("res_version", "res_version_persist", "data_version", "data_version_persist")
+    )
+    meta_names = {"res_version", "data_version", "res_revision"} if not has_res_meta else set()
+
+    reg = (region or cfg.get_cdn_region() or "global").strip().lower()
+    info = fetch_zzz_cdn_info(region=reg, parse_game_manifest=False)
+    by_field = info["manifests_by_field"]
+    game_assets = _load_manifest_assets(by_field["game"])
+    matched_assets = [
+        a.name for a in game_assets
+        if (
+            a.name.replace("\\", "/").rsplit("/", 1)[-1].lower() in wanted_low
+            or a.name.replace("\\", "/").rsplit("/", 1)[-1].lower() in meta_names
+        )
+    ]
+    if not matched_assets:
+        _emit_log(
+            log_cb,
+            f"[CDN] Warning: none of {len(wanted_low)} requested container(s) matched live build v{info.get('version', '?')}.",
+        )
+        return []
+
+    _emit_log(
+        log_cb,
+        f"[CDN] Targeted pull: fetching {len([m for m in matched_assets if m.lower().endswith(('.blk', '.pck'))])} "
+        f"container(s) from ZZZ PC v{info.get('version', '?')} ({reg}) -> {dest_root}",
+    )
+
+    def _filter(aname: str) -> bool:
+        b = aname.replace("\\", "/").lstrip("/").rsplit("/", 1)[-1].lower()
+        return b in wanted_low or b in meta_names
+
+    profile = "assets" if need_audio_profile else "blocks"
+    download_pc_build(
+        dest_root=dest_root,
+        region=reg,
+        profile=profile,
+        workers=workers,
+        log_cb=log_cb,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        filter_fn=_filter,
+        ignore_space_check=ignore_space_check,
+    )
+
+    # If caller uses an Android-layout workspace, mirror newly pulled .blk files into files_root/Blocks
+    sa_blocks = dest_root / "ZenlessZoneZero_Data" / "StreamingAssets" / "Blocks"
+    orig_blocks = orig_files_root / "Blocks"
+    if sa_blocks.is_dir() and orig_blocks.is_dir():
+        try:
+            same_dir = sa_blocks.resolve() == orig_blocks.resolve()
+        except Exception:
+            same_dir = sa_blocks == orig_blocks
+        if not same_dir:
+            for req in ordered_req:
+                src_b = sa_blocks / req
+                dst_b = orig_blocks / req
+                if src_b.is_file() and not dst_b.is_file():
+                    try:
+                        os.link(src_b, dst_b)
+                    except OSError:
+                        shutil.copy2(src_b, dst_b)
+
+    cfg.invalidate_blk_cache()
+    out_paths: list[Path] = []
+    for req in ordered_req:
+        p = cfg.resolve_blk_path(dest_root, req)
+        if p is not None and p.is_file():
+            out_paths.append(p)
+    return out_paths
+
+
+def ensure_cdn_nap_index(
+    dest_root: Path,
+    region: str | None = None,
+    log_cb: Callable[[str], None] | None = None,
+    progress_cb: Callable[[int, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    ignore_space_check: bool = False,
+) -> dict | None:
+    """Ensure the live PC `NapAssetBundleIndexAsset` (`Res.dat` from `2837526243.blk`) is cached and parsed."""
+    from . import indexer
+
+    reg = (region or cfg.get_cdn_region() or "global").strip().lower()
+    info = fetch_zzz_cdn_info(region=reg, parse_game_manifest=False)
+    ver = str(info.get("version") or "latest")
+    cache_key = f"{reg}:{ver}"
+    cached = _NAP_RES_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    res_cache_file = cfg.CACHE_DIR / "cdn_manifests" / f"nap_res_{reg}_{ver}.dat"
+    raw_res: bytes | None = None
+    if res_cache_file.is_file() and res_cache_file.stat().st_size > 1_000_000:
+        raw_res = res_cache_file.read_bytes()
+    else:
+        pc_idx_blk = Path(dest_root).expanduser() / "ZenlessZoneZero_Data" / "StreamingAssets" / "Blocks" / indexer.NAP_INDEX_BLK_NAME
+        if not pc_idx_blk.is_file():
+            _emit_log(
+                log_cb,
+                f"[CDN] Fetching PC bundle index {indexer.NAP_INDEX_BLK_NAME} (~28 MB) to resolve exact PC CDN .blk hashes...",
+            )
+            dl_paths = download_targeted_assets(
+                dest_root,
+                [indexer.NAP_INDEX_BLK_NAME],
+                region=reg,
+                workers=2,
+                log_cb=log_cb,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+                ignore_space_check=ignore_space_check,
+            )
+            pc_idx_blk = next((p for p in dl_paths if p.name == indexer.NAP_INDEX_BLK_NAME), pc_idx_blk)
+        if pc_idx_blk.is_file():
+            raw_res = indexer.extract_nap_res_dat(pc_idx_blk, cache_file=res_cache_file)
+
+    if not raw_res:
+        return None
+    parsed = indexer.parse_nap_res_dat(raw_res)
+    _NAP_RES_CACHE[cache_key] = parsed
+    return parsed
+
+
+def resolve_and_download_targeted_blks(
+    dest_root: Path,
+    blk_names: Sequence[str] = (),
+    path_hashes: Sequence[int | str] = (),
+    bundle_hashes: Sequence[int | str] = (),
+    include_deps: bool = True,
+    region: str | None = None,
+    workers: int = 4,
+    log_cb: Callable[[str], None] | None = None,
+    progress_cb: Callable[[int, str], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    ignore_space_check: bool = False,
+) -> list[Path]:
+    """Translate target `pathHash` / `bundleHashName` / `.blk` refs via live PC `Res.dat` and pull missing `.blk`s."""
+    from . import indexer
+
+    dest_root = Path(dest_root).expanduser()
+    reg = (region or cfg.get_cdn_region() or "global").strip().lower()
+    info = fetch_zzz_cdn_info(region=reg, parse_game_manifest=False)
+    game_assets = _load_manifest_assets(info["manifests_by_field"]["game"])
+    cdn_blk_set = {
+        a.name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        for a in game_assets
+        if a.name.lower().endswith(".blk")
+    }
+
+    want_names: list[str] = []
+    seen_req: set[str] = set()
+    for raw_b in blk_names:
+        s = str(raw_b or "").replace("\\", "/").strip()
+        if not s:
+            continue
+        bname = s.rsplit("/", 1)[-1]
+        if "." not in bname:
+            bname = f"{bname}.blk"
+        low = bname.lower()
+        if low not in seen_req:
+            seen_req.add(low)
+            want_names.append(bname)
+
+    direct_in_cdn = [b for b in want_names if b.lower() in cdn_blk_set]
+    unmapped = [b for b in want_names if b.lower() not in cdn_blk_set]
+    has_hashes = any(x is not None and x != "" for x in path_hashes) or any(
+        x is not None and x != "" for x in bundle_hashes
+    )
+
+    resolved_names: list[str] = []
+    resolved_low: set[str] = set()
+
+    def _add_target(name: str):
+        low = name.lower()
+        if low in cdn_blk_set and low not in resolved_low:
+            resolved_low.add(low)
+            resolved_names.append(name)
+
+    for b in direct_in_cdn:
+        _add_target(b)
+
+    if has_hashes or unmapped:
+        nap_idx = ensure_cdn_nap_index(
+            dest_root,
+            region=reg,
+            log_cb=log_cb,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            ignore_space_check=ignore_space_check,
+        )
+        if nap_idx is not None:
+            all_bhs: list[int | str] = [x for x in bundle_hashes if x is not None and x != ""]
+            pc_blks = (
+                nap_idx["resolve_blks"](
+                    path_hashes=path_hashes,
+                    bundle_hashes=all_bhs,
+                    include_deps=include_deps,
+                )
+                if has_hashes
+                else []
+            )
+            if not pc_blks and unmapped:
+                blk_bh_map = indexer.load_blk_bundle_hashes()
+                for ub in unmapped:
+                    all_bhs.extend(blk_bh_map.get(ub.lower(), ()))
+                pc_blks = nap_idx["resolve_blks"](
+                    path_hashes=path_hashes,
+                    bundle_hashes=all_bhs,
+                    include_deps=include_deps,
+                )
+            for pb_name in pc_blks:
+                _add_target(pb_name)
+
+    missing_to_pull = [b for b in resolved_names if cfg.resolve_blk_path(dest_root, b) is None]
+    if missing_to_pull:
+        download_targeted_assets(
+            dest_root,
+            missing_to_pull,
+            region=reg,
+            workers=workers,
+            log_cb=log_cb,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            ignore_space_check=ignore_space_check,
+        )
+
+    out_paths: list[Path] = []
+    for b in resolved_names:
+        rp = cfg.resolve_blk_path(dest_root, b)
+        if rp is not None and rp.is_file():
+            out_paths.append(rp)
+    return out_paths
+
+
+download_targeted_blks = download_targeted_assets

@@ -28,6 +28,8 @@ from .cdn_downloader import (
 )
 from .containers import detect_magic, extract_bnk_wems, format_hex_dump, human_size, parse_akpk, parse_bnk, scan_blk_json
 from .exporters import (
+    collect_entry_required_blks,
+    collect_map_required_blks,
     export_audio_entries,
     export_audio_pck,
     export_blk_asset_types,
@@ -47,7 +49,9 @@ from .exporters import (
 )
 from .indexer import (
     build_asset_map,
+    ensure_prebuilt_index_loaded,
     has_asset_map,
+    invalidate_index_cache,
     load_character_index,
     load_character_names,
     load_oz_character_index,
@@ -176,6 +180,10 @@ def launch_gui(root_path: Path):
         font-weight: 600; color: #9ca3af;
     }
     QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+    QFrame#sourceCard {
+        background-color: #131722; border: 1px solid #262e42; border-radius: 8px;
+    }
+    QFrame#sourceCard:hover { border-color: #f59e0b; }
     QTreeWidget, QListWidget, QTableWidget, QPlainTextEdit, QTextBrowser {
         background-color: #0d1016; border: 1px solid #222836; border-radius: 6px;
         alternate-background-color: #12161f; gridline-color: #1c2230;
@@ -944,9 +952,17 @@ def launch_gui(root_path: Path):
         def _refresh(self):
             st = get_environment_status()
             py_mods = ", ".join(f"{k}:{'OK' if ok else 'NO'}" for k, ok in st["python_modules"].items())
+            hw = st.get("hardware") or {}
+            hw_line = (
+                f"<br><b>Hardware:</b> {hw.get('cpu_threads', '?')} threads &nbsp;|&nbsp; "
+                f"{hw.get('ram_avail_gb', '?')}/{hw.get('ram_total_gb', '?')} GiB RAM free &nbsp;|&nbsp; "
+                f"GPU: {hw.get('gpu_vendor', 'Unknown')} &nbsp;|&nbsp; "
+                f"Adaptive Workers: index={hw.get('index_workers', '?')}, blender={hw.get('blender_workers', '?')} (chunk={hw.get('blender_chunk_size', '?')})"
+                if hw else ""
+            )
             self.env_summary.setText(
                 f"<b>Host:</b> {st['os_detail']} ({st['arch']}, {st['display']}) &nbsp;|&nbsp; "
-                f"<b>Python {st['python']}:</b> {py_mods}<br>"
+                f"<b>Python {st['python']}:</b> {py_mods}{hw_line}<br>"
                 f"<b>Portable Tools Dir:</b> {st['tools_dir']}"
             )
             gv = cfg.collect_game_version(self.game_root)
@@ -1698,65 +1714,143 @@ def launch_gui(root_path: Path):
             super().reject()
 
     class GameRootDialog(QDialog):
+        """Unified Game Data Source Manager for On-Demand CDN, Local Install, Bulk CDN, and Phone ADB."""
+
         def __init__(self, initial_root: Path, parent=None):
             super().__init__(parent)
-            self.setWindowTitle("OpenZenless — Select ZZZ Game Installation")
-            _fit_to_screen(self, 740, 320)
+            self.setWindowTitle("OpenZenless — Game Data Source Manager")
+            _fit_to_screen(self, 800, 540)
             self.selected_root = initial_root
 
             lay = QVBoxLayout(self)
             lay.setContentsMargins(18, 16, 18, 16)
             lay.setSpacing(10)
 
-            title = QLabel("Locate Your Zenless Zone Zero Installation")
-            title.setStyleSheet("font-size: 15px; font-weight: 700; color: #f59e0b;")
+            title = QLabel("Game Data Source Manager")
+            title.setStyleSheet("font-size: 16px; font-weight: 700; color: #f59e0b;")
             lay.addWidget(title)
 
             desc = QLabel(
-                "Select an existing ZZZ PC or Android build, pull from your Android phone via ADB, "
-                "or download the official PC files directly from HoYoverse's CDN."
+                "Pick any of the 4 supported ways to load ZZZ assets: zero-install On-Demand CDN streaming, "
+                "an existing local PC/Android build, bulk HoYoverse CDN download, or Android ADB pull."
             )
             desc.setWordWrap(True)
             desc.setStyleSheet("color: #94a3b8;")
             lay.addWidget(desc)
+
+            ws_box = QGroupBox("Active Workspace & On-Demand CDN Settings")
+            ws_lay = QVBoxLayout(ws_box)
+            ws_lay.setSpacing(8)
 
             detected = cfg.scan_existing_game_installs()
             if detected:
                 det_row = QHBoxLayout()
                 det_row.addWidget(QLabel("Detected Builds:"))
                 self.detected_combo = QComboBox()
-                self.detected_combo.addItem(f"Found {len(detected)} ZZZ install(s) — select to fill...", "")
+                self.detected_combo.addItem(f"Found {len(detected)} workspace(s) on disk — select to fill...", "")
                 for dp in detected:
                     fr = cfg.resolve_files_root(dp)
-                    plat = cfg.detect_build_platform(dp, fr)
+                    plat = "On-Demand CDN" if cfg.is_cdn_workspace_root(dp) else cfg.detect_build_platform(dp, fr)
                     self.detected_combo.addItem(f"[{plat}] {dp}", str(dp))
                 self.detected_combo.currentIndexChanged.connect(self._pick_detected)
                 det_row.addWidget(self.detected_combo, 1)
-                lay.addLayout(det_row)
+                ws_lay.addLayout(det_row)
             else:
                 self.detected_combo = None
 
-            start_val = str(initial_root) if cfg.is_valid_game_root(initial_root) else (str(detected[0]) if detected else "")
-            row = QHBoxLayout()
+            if cfg.is_valid_game_root(initial_root):
+                start_val = str(initial_root)
+            elif detected:
+                start_val = str(detected[0])
+            else:
+                start_val = str(Path.home() / "OpenZenless_ZZZ_CDN")
+
+            path_row = QHBoxLayout()
+            path_row.addWidget(QLabel("Workspace Folder:"))
             self.path_edit = QLineEdit(start_val)
-            self.path_edit.setPlaceholderText("Select ZZZ game root folder...")
-            self.path_edit.textChanged.connect(self._validate_path)
+            self.path_edit.setPlaceholderText("Select ZZZ folder or On-Demand CDN workspace...")
+            self.path_edit.textChanged.connect(lambda _t: self._validate_path())
             btn_browse = QPushButton("Browse...")
             btn_browse.clicked.connect(self._browse)
-            btn_phone = QPushButton("Load from Phone (ADB)...")
-            btn_phone.clicked.connect(self._load_from_phone)
-            self.btn_cdn = QPushButton("Download PC Build (CDN)...")
-            self.btn_cdn.setToolTip("Download official Zenless Zone Zero PC files directly from HoYoverse CDN")
-            self.btn_cdn.clicked.connect(self._download_from_cdn)
-            row.addWidget(self.path_edit, 1)
-            row.addWidget(btn_browse)
-            row.addWidget(btn_phone)
-            row.addWidget(self.btn_cdn)
-            lay.addLayout(row)
+            path_row.addWidget(self.path_edit, 1)
+            path_row.addWidget(btn_browse)
+            ws_lay.addLayout(path_row)
+
+            cdn_opts = QHBoxLayout()
+            self.chk_auto_cdn = QCheckBox("Auto-pull missing .blk files from HoYoverse CDN on export (On-Demand Mode)")
+            self.chk_auto_cdn.setChecked(cfg.is_auto_cdn_pull_enabled())
+            self.chk_auto_cdn.stateChanged.connect(lambda _s: self._validate_path())
+            cdn_opts.addWidget(self.chk_auto_cdn, 1)
+            cdn_opts.addWidget(QLabel("Server:"))
+            self.cdn_region_combo = QComboBox()
+            for rkey, rmeta in REGIONS.items():
+                self.cdn_region_combo.addItem(rmeta["label"], rkey)
+            cur_reg_idx = self.cdn_region_combo.findData(cfg.get_cdn_region())
+            if cur_reg_idx >= 0:
+                self.cdn_region_combo.setCurrentIndex(cur_reg_idx)
+            cdn_opts.addWidget(self.cdn_region_combo)
+            ws_lay.addLayout(cdn_opts)
 
             self.status_lbl = QLabel("")
             self.status_lbl.setWordWrap(True)
-            lay.addWidget(self.status_lbl)
+            ws_lay.addWidget(self.status_lbl)
+            lay.addWidget(ws_box)
+
+            src_box = QGroupBox("Acquire / Switch Game Files")
+            grid = QGridLayout(src_box)
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(10)
+
+            def _make_card(card_title: str, body: str, btn_label: str, slot, primary: bool = False) -> QFrame:
+                card = QFrame()
+                card.setObjectName("sourceCard")
+                c_lay = QVBoxLayout(card)
+                c_lay.setContentsMargins(12, 10, 12, 10)
+                c_lay.setSpacing(6)
+                t_lbl = QLabel(card_title)
+                t_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #f59e0b;" if primary else "font-size: 13px; font-weight: 700; color: #e2e8f0;")
+                b_lbl = QLabel(body)
+                b_lbl.setWordWrap(True)
+                b_lbl.setStyleSheet("color: #94a3b8; font-size: 11px;")
+                c_lay.addWidget(t_lbl)
+                c_lay.addWidget(b_lbl, 1)
+                btn = QPushButton(btn_label)
+                if primary:
+                    btn.setObjectName("primaryBtn")
+                btn.clicked.connect(slot)
+                c_lay.addWidget(btn)
+                return card
+
+            self.card_ondemand = _make_card(
+                "On-Demand CDN (Zero-Install)",
+                "Browse the bundled 196 characters & 320 maps immediately (0 GB upfront) and automatically pull only the required .blk containers when exporting.",
+                "Start in On-Demand CDN Mode",
+                self._start_ondemand_mode,
+                primary=True,
+            )
+            self.card_local = _make_card(
+                "Local Installation (PC / Android)",
+                "Point to an existing ZenlessZoneZero Game folder or previously pulled Android files/ directory on your drive.",
+                "Browse Local Folder...",
+                self._browse,
+            )
+            self.card_bulk_cdn = _make_card(
+                "Bulk HoYoverse CDN Download",
+                "Download all Blocks (54 GB), Assets + Audio, or the full verified ZZZ PC build with chunk MD5 resume.",
+                "Open Bulk CDN Downloader...",
+                self._download_from_cdn,
+            )
+            self.card_adb = _make_card(
+                "Android Phone (USB / Wi-Fi ADB)",
+                "Pull Blocks/, Audio/, and split APKs directly from a connected Android phone (auto-installs ADB if needed).",
+                "Open Phone ADB Importer...",
+                self._load_from_phone,
+            )
+            grid.addWidget(self.card_ondemand, 0, 0)
+            grid.addWidget(self.card_local, 0, 1)
+            grid.addWidget(self.card_bulk_cdn, 1, 0)
+            grid.addWidget(self.card_adb, 1, 1)
+            lay.addWidget(src_box, 1)
 
             btn_row = QHBoxLayout()
             btn_tools = QPushButton("Tools & Dependencies...")
@@ -1764,16 +1858,16 @@ def launch_gui(root_path: Path):
             btn_tools.clicked.connect(self._open_tools)
             btn_row.addWidget(btn_tools)
             btn_row.addStretch()
-            self.btn_skip = QPushButton("Skip for now")
+            self.btn_skip = QPushButton("Cancel / Skip")
             self.btn_skip.clicked.connect(self.reject)
-            self.btn_continue = QPushButton("Continue & Index")
+            self.btn_continue = QPushButton("Use Selected Workspace")
             self.btn_continue.setObjectName("primaryBtn")
             self.btn_continue.clicked.connect(self._accept_root)
             btn_row.addWidget(self.btn_skip)
             btn_row.addWidget(self.btn_continue)
             lay.addLayout(btn_row)
 
-            self._validate_path(self.path_edit.text())
+            self._validate_path()
 
         def _pick_detected(self, idx: int):
             if self.detected_combo and idx > 0:
@@ -1787,43 +1881,80 @@ def launch_gui(root_path: Path):
             if d:
                 self.path_edit.setText(d)
 
+        def _start_ondemand_mode(self):
+            cur = self.path_edit.text().strip()
+            cur_p = Path(cur).expanduser() if cur else (Path.home() / "OpenZenless_ZZZ_CDN")
+            if cur_p.exists() and cfg.is_valid_game_root(cur_p) and not cfg.is_cdn_workspace_root(cur_p):
+                dest = Path.home() / "OpenZenless_ZZZ_CDN"
+            else:
+                dest = cur_p
+            reg = str(self.cdn_region_combo.currentData() or "global")
+            cdn_downloader.init_cdn_workspace(dest, region=reg)
+            ensure_prebuilt_index_loaded()
+            self.chk_auto_cdn.setChecked(True)
+            self.path_edit.setText(str(dest))
+            self._accept_root()
+
         def _load_from_phone(self):
             cur = self.path_edit.text().strip()
-            default_dest = Path(cur) if cur else (Path.home() / "OpenZenless_ZZZ_Android")
+            default_dest = Path(cur) if (cur and not cur.endswith("_CDN")) else (Path.home() / "OpenZenless_ZZZ_Android")
             dlg = PhoneImportDialog(self, default_dest=default_dest)
             if dlg.exec() == QDialog.Accepted:
                 self.path_edit.setText(str(dlg.dest_root))
-                self._validate_path(str(dlg.dest_root))
+                self._validate_path()
 
         def _download_from_cdn(self):
             cur = self.path_edit.text().strip()
-            default_dest = Path(cur) if cur else (Path.home() / "OpenZenless_ZZZ_PC")
+            default_dest = Path(cur) if (cur and not cur.endswith("_CDN")) else (Path.home() / "OpenZenless_ZZZ_PC")
             dlg = CdnDownloadDialog(self, default_dest=default_dest)
             if dlg.exec() == QDialog.Accepted:
                 self.path_edit.setText(str(dlg.dest_root))
-                self._validate_path(str(dlg.dest_root))
+                self._validate_path()
 
         def _open_tools(self):
             cur = Path(self.path_edit.text().strip() or str(self.selected_root))
             ToolsManagerDialog(cur, self).exec()
 
-        def _validate_path(self, text: str):
-            p = Path(text.strip()) if text.strip() else None
-            if p and cfg.is_valid_game_root(p):
+        def _validate_path(self):
+            text = self.path_edit.text().strip()
+            p = Path(text).expanduser() if text else None
+            auto_cdn = self.chk_auto_cdn.isChecked()
+            if p and cfg.is_cdn_workspace_root(p):
+                fr = cfg.resolve_files_root(p)
+                n_blk = len(list((fr / "Blocks").glob("*.blk"))) if (fr / "Blocks").is_dir() else 0
+                self.status_lbl.setText(
+                    f"Ready: On-Demand CDN Workspace ({n_blk:,} cached .blk) at {p}"
+                )
+                self.status_lbl.setStyleSheet("color: #4ade80;")
+                self.btn_continue.setEnabled(True)
+            elif p and cfg.is_valid_game_root(p):
                 fr = cfg.resolve_files_root(p)
                 plat = cfg.detect_build_platform(p, fr)
-                self.status_lbl.setText(f"Detected valid ZZZ files ({plat}) at: {fr}")
+                extra = " (missing .blks will auto-pull via CDN)" if auto_cdn else ""
+                self.status_lbl.setText(f"Detected valid ZZZ files ({plat}) at: {fr}{extra}")
                 self.status_lbl.setStyleSheet("color: #4ade80;")
+                self.btn_continue.setEnabled(True)
+            elif p and auto_cdn:
+                self.status_lbl.setText(
+                    f"Ready for On-Demand CDN Mode — will initialize workspace at {p} with the bundled catalog."
+                )
+                self.status_lbl.setStyleSheet("color: #93c5fd;")
                 self.btn_continue.setEnabled(True)
             else:
                 self.status_lbl.setText(
-                    "No ZZZ Blocks/ or .blk/.pck files detected yet. Choose a folder, pull via Phone ADB, or download via HoYoverse CDN."
+                    "No ZZZ Blocks/ or .blk/.pck files detected yet. Choose one of the 4 sources below or enable On-Demand Mode."
                 )
                 self.status_lbl.setStyleSheet("color: #fbbf24;")
                 self.btn_continue.setEnabled(False)
 
         def _accept_root(self):
-            p = Path(self.path_edit.text().strip())
+            raw = self.path_edit.text().strip() or str(Path.home() / "OpenZenless_ZZZ_CDN")
+            p = Path(raw).expanduser()
+            auto_cdn = self.chk_auto_cdn.isChecked()
+            reg = str(self.cdn_region_combo.currentData() or "global")
+            cfg.set_cdn_preferences(auto_pull=auto_cdn, region=reg)
+            if auto_cdn and not cfg.is_valid_game_root(p):
+                cdn_downloader.init_cdn_workspace(p, region=reg)
             self.selected_root = p
             cfg.GAME_ROOT = p
             cfg.save_user_config({"game_root": str(p)})
@@ -1923,8 +2054,8 @@ def launch_gui(root_path: Path):
             self.header_version_pill.clicked.connect(self.show_version_dialog)
             h_lay.addWidget(self.header_version_pill)
 
-            self.btn_open_folder = QPushButton("Open Root...")
-            self.btn_open_folder.setToolTip("Choose ZZZ game root folder")
+            self.btn_open_folder = QPushButton("Game Source...")
+            self.btn_open_folder.setToolTip("Configure On-Demand CDN, Local Game Folder, Bulk CDN Download, or Phone ADB Import")
             self.btn_open_folder.clicked.connect(self.choose_root_folder)
             h_lay.addWidget(self.btn_open_folder)
 
@@ -2949,6 +3080,32 @@ def launch_gui(root_path: Path):
                     self.btn_basic_export1.setText("Export All Fonts (TTF/OTF)")
                     if r.get("blocks"):
                         lines.append(f"Font Blocks ({len(r['blocks'])}): {', '.join(r['blocks'][:20])}")
+            req_chk_blks: list[str] = []
+            if cat in ("characters", "bangboo") and not is_folder:
+                oz_rec = load_oz_character_index().get(r["id"])
+                if isinstance(oz_rec, dict):
+                    req_chk_blks = collect_entry_required_blks(oz_rec, include_anims=True, include_deps=True)
+            elif cat in ("monsters", "npcs", "weapons") and not is_folder:
+                src_k = r.get("category_src") if cat == "weapons" else cat
+                oz_rec = (self.entities_index.get(src_k or cat) or {}).get(r["id"])
+                if isinstance(oz_rec, dict):
+                    req_chk_blks = collect_entry_required_blks(oz_rec, include_anims=True, include_deps=True)
+            elif cat == "maps" and not is_folder:
+                oz_rec = load_oz_map_index().get(r["id"])
+                if isinstance(oz_rec, dict):
+                    req_chk_blks = collect_map_required_blks(r["id"], oz_rec)
+            if not req_chk_blks and not is_folder and r.get("blocks"):
+                req_chk_blks = list(r.get("blocks") or [])
+            if req_chk_blks:
+                local_n = sum(1 for b in req_chk_blks if cfg.resolve_blk_path(self.game_root, str(b)) is not None)
+                miss_n = len(req_chk_blks) - local_n
+                if miss_n == 0:
+                    lines.append(f"Sources  : {local_n}/{len(req_chk_blks)} .blk on disk (ready offline)")
+                elif cfg.is_auto_cdn_pull_enabled():
+                    lines.append(f"Sources  : {local_n}/{len(req_chk_blks)} .blk on disk ({miss_n} will auto-pull via CDN on export)")
+                else:
+                    lines.append(f"Sources  : {local_n}/{len(req_chk_blks)} .blk on disk ({miss_n} missing locally)")
+
             self.basic_info.setPlainText("\n".join(lines))
 
         def _basic_inspect_in_advanced(self):
@@ -2991,6 +3148,8 @@ def launch_gui(root_path: Path):
             self.workers.append(w)
             w.start()
             dlg.exec()
+            self._refresh_version_badge()
+            self._on_basic_item_selected()
 
         def _basic_export_primary(self):
             r = self._selected_basic_item()
@@ -3120,7 +3279,13 @@ def launch_gui(root_path: Path):
                 cli_tag = "CLI Missing (Click to Setup)"
             else:
                 cli_tag = "Wine Missing (Click to Setup)"
-            txt = f"{v['platform']} | Unity {v['unity_version']} | res {v['res_revision']} | {v['blk_count']} .blk | {cli_tag}"
+            if v["blk_count"] == 0 and (v.get("cdn_workspace") or v.get("auto_cdn_pull")):
+                reg = str(v.get("cdn_region") or "global").upper()
+                pull_tag = "Auto-Pull ON" if v.get("auto_cdn_pull") else "Auto-Pull OFF"
+                txt = f"On-Demand CDN ({reg}) | 0 local .blk ({pull_tag}) | {cli_tag}"
+            else:
+                cdn_tag = " (+CDN)" if v.get("auto_cdn_pull") else ""
+                txt = f"{v['platform']} | Unity {v['unity_version']} | res {v['res_revision']} | {v['blk_count']} .blk{cdn_tag} | {cli_tag}"
             self.header_version_pill.setText(txt)
 
         def show_version_dialog(self):
@@ -3213,6 +3378,7 @@ def launch_gui(root_path: Path):
                 self._open_block_group(f"Character: {val}", self.char_blocks.get(val, []))
 
         def _reload_indexes(self):
+            invalidate_index_cache()
             self.stage_blocks = self._load_stage_blocks()
             self.curated_maps = load_curated_map_index()
             self.char_blocks = self._load_char_blocks()
@@ -3226,8 +3392,9 @@ def launch_gui(root_path: Path):
 
         def rebuild_asset_map(self):
             self._release_viewer_before_heavy_task("rebuilding asset map")
+            force_full = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
             map_dir = cfg.CACHE_DIR / "asset_map"
-            for fname in (
+            to_unlink = [
                 "manifest.json",
                 "zzz_assets_map.json",
                 "oz_maps_index.json",
@@ -3238,13 +3405,17 @@ def launch_gui(root_path: Path):
                 "stage_index_auto.json",
                 "fonts_index_auto.json",
                 "shaders_index_auto.json",
-            ):
+            ]
+            if force_full:
+                to_unlink.extend(["oz_index_records.jsonl", "oz_index_blk_state.json"])
+            for fname in to_unlink:
                 p = map_dir / fname
                 if p.exists():
                     try:
                         p.unlink()
                     except OSError:
                         pass
+            invalidate_index_cache()
             if self.files_root.exists():
                 AssetMapDialog(self.game_root, self).exec()
             self._reload_indexes()
@@ -3254,7 +3425,8 @@ def launch_gui(root_path: Path):
             if dlg.exec() == QDialog.Accepted:
                 self.game_root = dlg.selected_root
                 self.files_root = cfg.resolve_files_root(self.game_root)
-                if not has_asset_map(self.game_root) and self.files_root.exists():
+                has_blks = any(self.files_root.rglob("*.blk")) if self.files_root.exists() else False
+                if not has_asset_map(self.game_root) and has_blks:
                     AssetMapDialog(self.game_root, self).exec()
                 self._reload_indexes()
                 if self.files_root.exists():
@@ -3648,13 +3820,17 @@ def launch_gui(root_path: Path):
             self.status.showMessage("Error")
             QMessageBox.warning(self, "BlkExplorer Error", msg)
 
+    cfg.ensure_stdio_handles()
     cfg.configure_gpu_env()
+    safe_gl = cfg.should_use_safe_opengl()
     from PySide6.QtGui import QSurfaceFormat
+    if safe_gl:
+        QApplication.setAttribute(Qt.AA_UseSoftwareOpenGL, True)
     fmt = QSurfaceFormat()
     fmt.setRenderableType(QSurfaceFormat.OpenGL)
     fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
     fmt.setDepthBufferSize(24)
-    fmt.setSamples(4)
+    fmt.setSamples(0 if safe_gl else 4)
     fmt.setSwapInterval(1)
     QSurfaceFormat.setDefaultFormat(fmt)
     app = QApplication(sys.argv)

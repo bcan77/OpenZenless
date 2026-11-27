@@ -106,7 +106,7 @@ REQ_HASH="$(_req_hash)"
 
 # 1. Fast path: managed OpenZenless venv matches current requirements
 if [ -x "$VENV_DIR/bin/python" ] && [ -f "$VENV_DIR/.req.sha256" ] && [ "$(cat "$VENV_DIR/.req.sha256" 2>/dev/null || true)" = "$REQ_HASH" ]; then
-  if "$VENV_DIR/bin/python" -c 'import PySide6, PIL, numpy, OpenGL, pygltflib' >/dev/null 2>&1; then
+  if _py_ok "$VENV_DIR/bin/python"; then
     exec "$VENV_DIR/bin/python" "$APP_MAIN" "$@"
   fi
 fi

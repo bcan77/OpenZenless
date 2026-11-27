@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-0.3.0-N25.11-01}"
+VERSION="${1:-0.3.0-N27.11-01}"
 ARCH="${ARCH:-$(uname -m)}"
 APPDIR="$ROOT/dist/OpenZenless.AppDir"
 OUT_APPIMAGE="$ROOT/dist/OpenZenless-${VERSION}-${ARCH}.AppImage"

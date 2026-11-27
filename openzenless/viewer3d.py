@@ -44,13 +44,8 @@ from . import config as cfg
 
 
 def _release_os_memory() -> None:
-    """Run Python GC and return freed heap arenas to the OS on Linux glibc."""
-    gc.collect()
-    if sys.platform.startswith("linux"):
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+    """Run Python GC and reclaim freed C-heap arenas across Linux and Windows."""
+    cfg.release_os_memory()
 
 
 _COMP_DTYPES = {
@@ -820,7 +815,7 @@ def load_glb_scene(path: Path) -> GLScene:
             mats[k] = _world_of(int(j)) @ ibm[k]
         return mats
 
-    max_tex_dim = 4096 if len(images) <= 80 else (2048 if len(images) <= 500 else 1024)
+    max_tex_dim = cfg.adaptive_viewer_max_tex_dim(len(images))
     textures = _g(gltf, "textures") or []
     tex_cache: dict[int, tuple[bytes, int, int, int, float] | None] = {}
     img_cache: dict[int, tuple[bytes, int, int, int, float] | None] = {}
@@ -852,7 +847,7 @@ def load_glb_scene(path: Path) -> GLScene:
             with tex_lock:
                 img_cache[src_i] = res
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.adaptive_worker_count("io", max_workers=8)) as pool:
             list(pool.map(_predecode_src, rep_tex_by_src))
         for ti, src_i in tex_to_src.items():
             if src_i in img_cache:
@@ -1933,6 +1928,7 @@ class GLBViewport(QOpenGLWidget):
         self._gpu_skin_supported: bool = False
         self._gpu_skin_active: bool = False
         self._max_aniso: float = 1.0
+        self._max_tex_size: int = 4096
         self._skin_vbo_chunks: list[tuple[int, int]] = []
         self._skin_sm_vbo_idx: list[int] = []
         self._skin_sm_idx_bytes: list[int] = []
@@ -2302,6 +2298,8 @@ class GLBViewport(QOpenGLWidget):
             _flush_skin()
 
             pal = np.repeat(np.eye(4, dtype=np.float32)[None, :, :], self._bone_tex_h, axis=0)
+            while gl.glGetError() != gl.GL_NO_ERROR:
+                pass
             gl.glActiveTexture(gl.GL_TEXTURE3)
             tid = int(gl.glGenTextures(1))
             gl.glBindTexture(gl.GL_TEXTURE_2D, tid)
@@ -2313,8 +2311,18 @@ class GLBViewport(QOpenGLWidget):
                 gl.GL_TEXTURE_2D, 0, 0x8814, 4, self._bone_tex_h, 0,
                 gl.GL_RGBA, gl.GL_FLOAT, pal,
             )
+            gl_err = gl.glGetError()
             gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
             gl.glActiveTexture(gl.GL_TEXTURE0)
+            if gl_err != gl.GL_NO_ERROR or not tid:
+                if tid:
+                    try:
+                        gl.glDeleteTextures([tid])
+                    except Exception:
+                        pass
+                self._gpu_skin_supported = False
+                self._free_skin_vbos()
+                return
             self._bone_tex_id = tid
             self._bone_palette = pal
             self._bone_tex_dirty = True
@@ -2464,11 +2472,20 @@ class GLBViewport(QOpenGLWidget):
                             gl.glTexParameterf(gl.GL_TEXTURE_2D, 0x84FE, self._max_aniso)
                         except Exception:
                             pass
+                    tw, th = int(sm.tex_w), int(sm.tex_h)
+                    rgba_buf = sm.tex_rgba
+                    if max(tw, th) > self._max_tex_size:
+                        scale = self._max_tex_size / float(max(tw, th))
+                        nw = max(1, int(round(tw * scale)))
+                        nh = max(1, int(round(th * scale)))
+                        im_up = Image.frombytes("RGBA", (tw, th), rgba_buf).resize((nw, nh), Image.BILINEAR)
+                        tw, th = nw, nh
+                        rgba_buf = im_up.tobytes()
                     gl.glTexImage2D(
-                        gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, sm.tex_w, sm.tex_h, 0,
-                        gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, sm.tex_rgba,
+                        gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, tw, th, 0,
+                        gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, rgba_buf,
                     )
-                    max_mip = int(math.floor(math.log2(max(1, sm.tex_w, sm.tex_h))))
+                    max_mip = int(math.floor(math.log2(max(1, tw, th))))
                     try:
                         gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
                         gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR_MIPMAP_LINEAR)
@@ -2637,6 +2654,16 @@ class GLBViewport(QOpenGLWidget):
             self._max_aniso = min(16.0, float(gl.glGetFloatv(0x84FF)))
         except Exception:
             self._max_aniso = 1.0
+        try:
+            max_ts = int(gl.glGetIntegerv(gl.GL_MAX_TEXTURE_SIZE))
+            self._max_tex_size = max(1024, min(8192, max_ts)) if max_ts > 0 else 4096
+        except Exception:
+            self._max_tex_size = 4096
+        rend_low = self._gpu_renderer.lower()
+        if any(tok in rend_low for tok in ("gdi generic", "llvmpipe", "softpipe", "microsoft basic render")):
+            self._max_tex_size = min(self._max_tex_size, 2048)
+            if "gdi generic" in rend_low:
+                self._gpu_skin_supported = False
 
         gl.glClearColor(0.06, 0.075, 0.105, 1.0)
         gl.glEnable(gl.GL_DEPTH_TEST)

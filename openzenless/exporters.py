@@ -13,11 +13,14 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from typing import Sequence
 
+from . import cdn_downloader
 from . import config as cfg
 from .containers import extract_bnk_wems, parse_akpk, parse_bnk
 from .indexer import (
     _emit,
+    _retarget_cab_map_base,
     load_character_index,
     load_curated_map_index,
     load_font_blocks,
@@ -26,10 +29,12 @@ from .indexer import (
     load_oz_map_index,
     load_oz_media_index,
     load_shader_blocks,
+    load_stage_index,
     load_stage_texture_blocks,
     load_stage_texture_blocks_for_dir,
     load_wwise_mapper,
     resolve_material_textures,
+    sync_ondemand_blks_index,
 )
 
 
@@ -598,6 +603,7 @@ def _merge_glbs(chunk_paths: list[Path], out_path: Path, log_cb=None) -> int:
             fout.write(struct.pack("<II", len(bin_bytes), 0x004E4942))
             fout.write(bin_bytes)
     _emit(log_cb, f"Merged {len(chunk_paths)} GLB chunk(s) -> {out_path.name} ({len(images)} unique images, {len(nodes)} nodes)")
+    cfg.release_os_memory()
     return 0
 
 
@@ -1801,7 +1807,7 @@ def _convert_dir_to_glb(
     blend_path = glb_path.with_suffix(".blend") if is_char else None
     cab_active = _zzz_cab_map_exists() and bool(fbxs)
     mat_to_tex, _, _ = ({}, [], []) if (cab_active and not is_char and not objs) else resolve_material_textures(char_dir)
-    chunk_size = 350
+    chunk_size = cfg.adaptive_blender_chunk_size()
     if is_char or len(fbxs) <= chunk_size:
         _emit(log_cb, f"Converting {len(fbxs)} FBX / {len(objs)} OBJ model(s) to GLB{' + .blend' if blend_path else ''} via Blender -> {glb_path.name}")
         return _blender_convert_chunk(
@@ -1810,7 +1816,7 @@ def _convert_dir_to_glb(
             anim_dir=eff_anim_dir, save_blend=blend_path, is_char=is_char,
         )
     chunks = [fbxs[i : i + chunk_size] for i in range(0, len(fbxs), chunk_size)]
-    max_w = min(len(chunks), cfg.default_worker_count(4))
+    max_w = min(len(chunks), cfg.adaptive_worker_count("blender", max_workers=4))
     _emit(log_cb, f"Converting {len(fbxs)} FBX model(s) in {len(chunks)} bounded Blender batch(es) (workers={max_w}) -> {glb_path.name}")
     tmp_dir = Path(tempfile.mkdtemp(prefix="oz_glb_chunks_"))
     log_lock = threading.Lock()
@@ -1882,6 +1888,147 @@ def _organize_character_stage(stage_dir: Path, dest: Path) -> None:
             shutil.copy2(p, dst)
 
 
+def collect_entry_required_blks(
+    entry: dict,
+    include_anims: bool = True,
+    include_deps: bool = True,
+) -> list[str]:
+    """Collect unique referenced `.blk` names for a character/entity index record."""
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    def _add(val: str):
+        if val:
+            b = Path(str(val).replace("\\", "/")).name
+            if b and b not in seen:
+                seen.add(b)
+                refs.append(b)
+
+    _add(entry.get("prefab_blk", ""))
+    for b in entry.get("mesh_blks") or ():
+        _add(b)
+    for b in entry.get("blocks") or ():
+        _add(b)
+    if include_deps:
+        for b in entry.get("dep_blks") or ():
+            _add(b)
+    if include_anims:
+        for b in entry.get("anim_blks") or ():
+            _add(b)
+    return refs
+
+
+def collect_map_required_blks(stage_name: str, entry: dict) -> list[str]:
+    """Collect unique referenced `.blk` names (base scene + streaming + dependencies) for an OZ map entry."""
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    def _add(val: str):
+        if val:
+            b = Path(str(val).replace("\\", "/")).name
+            if b and b not in seen:
+                seen.add(b)
+                refs.append(b)
+
+    st = entry.get("streaming") or {}
+    if isinstance(st, dict):
+        _add(st.get("manifest_blk", ""))
+        for b in st.get("blks") or ():
+            _add(b)
+    bs = entry.get("base_scene") or {}
+    if isinstance(bs, dict):
+        _add(bs.get("blk", ""))
+    for es in entry.get("extra_scenes") or ():
+        if isinstance(es, dict):
+            _add(es.get("blk", ""))
+    for b in entry.get("dep_blks") or ():
+        _add(b)
+    if not refs and stage_name:
+        for b in load_stage_index().get(stage_name, ()):
+            _add(b)
+    return refs
+
+
+def ensure_required_blks(
+    game_root: Path | None,
+    blk_refs: Sequence[str],
+    path_hashes: Sequence[int | str] = (),
+    bundle_hashes: Sequence[int | str] = (),
+    include_deps: bool = True,
+    log_cb=None,
+    label: str = "",
+    sync_index: bool = True,
+) -> list[Path]:
+    """Resolve required `.blk` paths locally and auto-pull missing containers via HoYoverse CDN if enabled."""
+    root = game_root or cfg.GAME_ROOT
+    clean_refs: list[str] = []
+    seen_ref: set[str] = set()
+    for b in blk_refs:
+        if not b:
+            continue
+        s = str(b).replace("\\", "/").strip()
+        if s and s not in seen_ref:
+            seen_ref.add(s)
+            clean_refs.append(s)
+
+    local_paths: list[Path] = []
+    seen_local: set[Path] = set()
+    missing_refs: list[str] = []
+    for bref in clean_refs:
+        rp = cfg.resolve_blk_path(root, bref)
+        if rp is not None and rp.is_file():
+            try:
+                rrp = rp.resolve()
+            except Exception:
+                rrp = rp
+            if rrp not in seen_local:
+                seen_local.add(rrp)
+                local_paths.append(rp)
+        else:
+            missing_refs.append(bref)
+
+    pulled: list[Path] = []
+    need_pull = bool(missing_refs) or (not local_paths and (bool(path_hashes) or bool(bundle_hashes)))
+    if need_pull and cfg.is_auto_cdn_pull_enabled():
+        tag = label or "export"
+        _emit(
+            log_cb,
+            f"[CDN] {tag}: {len(missing_refs)}/{len(clean_refs)} .blk ref(s) missing locally — checking HoYoverse CDN ({cfg.get_cdn_region()})...",
+        )
+        try:
+            pulled = cdn_downloader.resolve_and_download_targeted_blks(
+                root,
+                blk_names=missing_refs or clean_refs,
+                path_hashes=path_hashes,
+                bundle_hashes=bundle_hashes,
+                include_deps=include_deps,
+                log_cb=log_cb,
+            )
+        except Exception as exc:
+            _emit(log_cb, f"[CDN] WARNING: targeted .blk pull failed ({exc}); continuing with local files.")
+
+    all_paths: list[Path] = []
+    seen_all: set[Path] = set()
+    for p in (*local_paths, *pulled):
+        if not p.is_file():
+            continue
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        if rp not in seen_all:
+            seen_all.add(rp)
+            all_paths.append(p)
+
+    if sync_index and all_paths:
+        if pulled or cfg.is_cdn_workspace_root(root) or not _zzz_cab_map_exists():
+            sync_ondemand_blks_index(root, pulled or all_paths, log_cb=log_cb)
+        else:
+            common_base, _, _ = cfg.collect_ordered_blks_with_prio(root, use_cache=True)
+            _retarget_cab_map_base(cfg.CLI_DIR / "Maps" / "ZZZ.bin", cfg.to_cli_path(common_base))
+    return all_paths
+
+
 def _export_oz_entry(
     matched_name: str,
     entry: dict,
@@ -1892,8 +2039,34 @@ def _export_oz_entry(
     game_root: Path | None = None,
     export_shaders: bool = False,
     fallback_subdir: str = "",
+    entity_category: str = "",
 ) -> int:
     root = game_root or cfg.GAME_ROOT
+    req_blks = collect_entry_required_blks(entry, include_anims=True, include_deps=True)
+    p_hashes = [h for h in [entry.get("prefab_key"), *(entry.get("anim_keys") or ())] if h]
+    b_hashes = list(entry.get("bundle_hashes") or ())
+    if req_blks or p_hashes or b_hashes:
+        ensure_required_blks(
+            root,
+            req_blks,
+            path_hashes=p_hashes,
+            bundle_hashes=b_hashes,
+            include_deps=True,
+            log_cb=log_cb,
+            label=matched_name,
+            sync_index=True,
+        )
+        # Reload entry/all_entries in case on-demand CDN pull updated CAB/block pointers cleanly
+        if entity_category:
+            refreshed = load_oz_entities_index().get(entity_category) or {}
+            if refreshed:
+                all_entries = refreshed
+                entry = refreshed.get(matched_name, entry)
+        else:
+            refreshed = load_oz_character_index()
+            if refreshed:
+                all_entries = refreshed
+                entry = refreshed.get(matched_name, entry)
     base_out = out_dir or (cfg.FINAL_ROOT / "Exports")
     if fallback_subdir and base_out.name.lower() != fallback_subdir.lower():
         dest = base_out / fallback_subdir / matched_name
@@ -2119,11 +2292,15 @@ def export_character_full(
         chars = load_character_index()
         blocks = chars.get(char_name)
         if blocks and cfg.can_run_cli():
-            files_root = cfg.resolve_files_root(game_root or cfg.GAME_ROOT)
-            blocks_dir = files_root / "Blocks"
-            resolved = [blocks_dir / f"{os.path.basename(b.replace(chr(92), '/'))}" for b in blocks if (blocks_dir / f"{os.path.basename(b.replace(chr(92), '/'))}").is_file()]
-            if not resolved:
-                resolved = [blocks_dir / f"{b}.blk" for b in blocks if (blocks_dir / f"{b}.blk").is_file()]
+            root_eff = game_root or cfg.GAME_ROOT
+            resolved = ensure_required_blks(
+                root_eff,
+                blocks,
+                include_deps=False,
+                log_cb=log_cb,
+                label=char_name,
+                sync_index=True,
+            )
             if resolved:
                 dest = (out_dir or (cfg.FINAL_ROOT / "Exports")) / char_name
                 char_short = _char_short_name(char_name, chars.keys())
@@ -2223,6 +2400,7 @@ def export_entity_full(
                 game_root=game_root,
                 export_shaders=export_shaders,
                 fallback_subdir=_ENTITY_SUBDIR_MAP.get(ck, ""),
+                entity_category=ck,
             )
     return export_character_full(
         entity_id, out_dir=out_dir, convert_glb=convert_glb,
@@ -2264,15 +2442,35 @@ def _export_oz_anims_entry(
     game_root: Path,
     dest_dir: Path,
     log_cb=None,
+    entity_category: str = "",
 ) -> int | None:
-    anim_blks = [
-        p for b in (entry.get("anim_blks") or [])
-        if (p := cfg.resolve_blk_path(game_root, b)) is not None
-    ]
+    anim_keys = entry.get("anim_keys") or []
+    anim_blks = ensure_required_blks(
+        game_root,
+        entry.get("anim_blks") or [],
+        path_hashes=anim_keys,
+        bundle_hashes=entry.get("bundle_hashes") or [],
+        include_deps=False,
+        log_cb=log_cb,
+        label=f"{matched_name} animations",
+        sync_index=True,
+    )
+    if entity_category:
+        ref = (load_oz_entities_index().get(entity_category) or {}).get(matched_name)
+    else:
+        ref = load_oz_character_index().get(matched_name)
+    if isinstance(ref, dict):
+        entry = ref
+        anim_keys = entry.get("anim_keys") or anim_keys
+        resolved_ref = [
+            p for b in (entry.get("anim_blks") or [])
+            if (p := cfg.resolve_blk_path(game_root, b)) is not None
+        ]
+        if resolved_ref:
+            anim_blks = resolved_ref
     if not anim_blks:
         return None
     dest_dir.mkdir(parents=True, exist_ok=True)
-    anim_keys = entry.get("anim_keys") or []
     anim_hash_file: Path | None = None
     try:
         if anim_keys:
@@ -2318,7 +2516,7 @@ def export_entity_animations_only(
         if m is not None:
             sub = _ENTITY_SUBDIR_MAP.get(ck, "")
             dest_dir = (out_dir / sub / m) if (sub and out_dir.name.lower() != sub.lower()) else (out_dir / m)
-            rc = _export_oz_anims_entry(m, cmap[m], game_root, dest_dir, log_cb=log_cb)
+            rc = _export_oz_anims_entry(m, cmap[m], game_root, dest_dir, log_cb=log_cb, entity_category=ck)
             if rc is not None:
                 return rc
             raise ValueError(f"No animation blocks indexed for {m}")
@@ -2346,15 +2544,16 @@ def export_character_animations_only(
     blocks = chars.get(char_name)
     if not blocks:
         raise KeyError(f"Character '{char_name}' not found in character index.")
-    files_root = cfg.resolve_files_root(game_root)
-    blocks_dir = files_root / "Blocks"
-    resolved = [blocks_dir / f"{os.path.basename(b)}" for b in blocks if (blocks_dir / f"{os.path.basename(b)}").is_file()]
+    resolved = ensure_required_blks(
+        game_root,
+        blocks,
+        include_deps=False,
+        log_cb=log_cb,
+        label=f"{char_name} animations",
+        sync_index=True,
+    )
     if not resolved:
-        resolved = [blocks_dir / f"{b}.blk" for b in blocks if (blocks_dir / f"{b}.blk").is_file()]
-    if not resolved:
-        resolved = [files_root / b for b in blocks if (files_root / b).is_file()]
-    if not resolved:
-        raise FileNotFoundError(f"No .blk files found for '{char_name}' under {files_root}")
+        raise FileNotFoundError(f"No .blk files found for '{char_name}' under {cfg.resolve_files_root(game_root)}")
 
     dest_dir = out_dir / char_name
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -2382,7 +2581,7 @@ def export_scene_map(
     script = cfg.EXTRACTOR_ROOT / "lib" / "export_maps_pipeline.py"
     if not script.exists():
         oz_maps = load_oz_map_index()
-        if oz_maps and _zzz_cab_map_exists() and cfg.can_run_cli():
+        if oz_maps and cfg.can_run_cli():
             oz_targets: list[tuple[str, dict]] = []
             if not stage_name or stage_name.lower() == "all":
                 oz_targets = list(oz_maps.items())
@@ -2404,6 +2603,27 @@ def export_scene_map(
                             log_cb(msg)
 
                 def _export_one_oz_map(sname: str, entry: dict) -> int:
+                    req_blks = collect_map_required_blks(sname, entry)
+                    st_pre = entry.get("streaming") or {}
+                    p_hashes = (st_pre.get("hashes") or ()) if isinstance(st_pre, dict) else ()
+                    b_hashes = entry.get("bundle_hashes") or ()
+                    if req_blks or p_hashes or b_hashes:
+                        ensure_required_blks(
+                            root,
+                            req_blks,
+                            path_hashes=p_hashes,
+                            bundle_hashes=b_hashes,
+                            include_deps=True,
+                            log_cb=_safe_log,
+                            label=f"map {sname}",
+                            sync_index=True,
+                        )
+                        ref_m = load_oz_map_index().get(sname)
+                        if isinstance(ref_m, dict):
+                            entry = ref_m
+                    if not _zzz_cab_map_exists():
+                        _emit(_safe_log, f"WARNING: CABMap ZZZ.bin not available for {sname}; skipping.")
+                        return 1
                     dest = base_out / sname
                     dest.mkdir(parents=True, exist_ok=True)
                     rc = 0
@@ -2558,9 +2778,14 @@ def export_scene_map(
                 base_out = out_dir or (cfg.FINAL_ROOT / "Exports")
                 last_rc = 0
                 for sname, blocks in targets:
-                    resolved = [blocks_dir / os.path.basename(b) for b in blocks if (blocks_dir / os.path.basename(b)).is_file()]
-                    if not resolved:
-                        resolved = [blocks_dir / f"{b}.blk" for b in blocks if (blocks_dir / f"{b}.blk").is_file()]
+                    resolved = ensure_required_blks(
+                        game_root or cfg.GAME_ROOT,
+                        blocks,
+                        include_deps=True,
+                        log_cb=log_cb,
+                        label=sname,
+                        sync_index=True,
+                    )
                     if not resolved:
                         continue
                     dest = base_out / sname
@@ -2684,7 +2909,11 @@ def export_fonts(
     if source_path is not None and source_path.is_file():
         return export_blk_asset_types(source_path, out_dir, ["Font"], "Convert", log_cb=log_cb)
     font_refs = load_font_blocks()
-    resolved = _resolve_unique_blks(game_root, font_refs) if font_refs else []
+    resolved = (
+        ensure_required_blks(game_root, font_refs, include_deps=False, log_cb=log_cb, label="fonts", sync_index=False)
+        if font_refs
+        else []
+    )
     if resolved:
         _emit(log_cb, f"Exporting Fonts from {len(resolved)} indexed .blk(s) -> {out_dir}")
         return export_blks_batch(resolved, out_dir, ["Font"], "Convert", log_cb=log_cb)
@@ -2700,7 +2929,7 @@ def export_texture_section(
     log_cb=None,
 ) -> int:
     """Export Texture2D & Sprite assets for a texture_sections_index section (split-APK safe)."""
-    resolved = _resolve_unique_blks(game_root, blks)
+    resolved = ensure_required_blks(game_root, blks, include_deps=False, log_cb=log_cb, label=sec_name, sync_index=False)
     if not resolved:
         raise FileNotFoundError(f"No .blk files found for section '{sec_name}' under {game_root}")
     dest = out_dir / sec_name.replace("/", "_")
@@ -2720,7 +2949,9 @@ def export_spine_rig(
     if key is None:
         raise KeyError(f"Spine rig '{rig_name}' not found in oz_media_index.json")
     info = spine_map[key]
-    resolved = _resolve_unique_blks(game_root, list(info.get("blks") or []))
+    resolved = ensure_required_blks(
+        game_root, list(info.get("blks") or []), include_deps=False, log_cb=log_cb, label=f"Spine {key}", sync_index=False
+    )
     if not resolved:
         raise FileNotFoundError(f"No .blk files resolved for Spine rig '{key}' under {game_root}")
     stem = info.get("name") or key
@@ -2748,7 +2979,9 @@ def export_ui_sprite_group(
     if key is None:
         raise KeyError(f"UI Sprite pack '{group_key}' not found in oz_media_index.json")
     info = ui_map[key]
-    resolved = _resolve_unique_blks(game_root, list(info.get("blks") or []))
+    resolved = ensure_required_blks(
+        game_root, list(info.get("blks") or []), include_deps=False, log_cb=log_cb, label=f"Sprites {key}", sync_index=False
+    )
     if not resolved:
         raise FileNotFoundError(f"No .blk files resolved for UI Sprite pack '{key}' under {game_root}")
     dest = out_dir / "UI_Sprites" / key
@@ -2778,7 +3011,9 @@ def export_data_pack(
     blks = list(info.get("blks") or [])
     if not blks and key == "shaders":
         blks = load_shader_blocks()
-    resolved = _resolve_unique_blks(game_root, blks)
+    resolved = ensure_required_blks(
+        game_root, blks, include_deps=False, log_cb=log_cb, label=f"Data {key}", sync_index=False
+    )
     if not resolved:
         raise FileNotFoundError(f"No .blk files resolved for data pack '{key}' under {game_root}")
     types = list(info.get("types") or ["TextAsset"])
@@ -2839,7 +3074,7 @@ def _decode_wav_jobs(wav_jobs: list[tuple[Path, Path]]) -> None:
         )
         if proc.returncode == 0 and w_dst.is_file():
             w_src.unlink(missing_ok=True)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, os.cpu_count() or 4)) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.adaptive_worker_count("audio", max_workers=12)) as pool:
         list(pool.map(_decode_one, wav_jobs))
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from .cdn_downloader import (
     VOICE_LANGS,
     download_pc_build,
     fetch_zzz_cdn_info,
+    init_cdn_workspace,
+    resolve_and_download_targeted_blks,
 )
 from .containers import detect_magic, format_hex_dump, human_size, parse_akpk, scan_blk_json
 from .tools import (
@@ -32,7 +35,19 @@ from .tools import (
     ensure_wine,
     get_environment_status,
 )
+from .indexer import (
+    build_asset_map,
+    build_supplementary_indexes_from_asset_map,
+    ensure_prebuilt_index_loaded,
+    load_oz_character_index,
+    load_oz_entities_index,
+    load_oz_map_index,
+    sync_ondemand_blks_index,
+    validate_and_repair_indexes,
+)
 from .exporters import (
+    collect_entry_required_blks,
+    collect_map_required_blks,
     export_audio_pck,
     export_blk_asset_types,
     export_character_animations_only,
@@ -86,7 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_phone.add_argument("--no-extract-apk-blocks", action="store_true", help="Skip extracting base .blk files from split_UnityDataAssetPack.apk")
     p_phone.add_argument("--no-auto-install-adb", action="store_true", help="Do not auto-install Google Platform-Tools (adb) if missing")
 
-    p_cdn = sub.add_parser("download-pc", help="Download official ZZZ PC build directly from HoYoverse CDN")
+    p_cdn = sub.add_parser(
+        "download-pc",
+        aliases=["download-cdn"],
+        help="Download full, partial, or targeted `.blk` files from HoYoverse CDN",
+    )
     p_cdn.add_argument("--dest", type=Path, default=Path.home() / "OpenZenless_ZZZ_PC", help="Destination root folder")
     p_cdn.add_argument("--region", choices=["global", "cn"], default="global", help="HoYoverse server region (default: global)")
     p_cdn.add_argument("--profile", choices=list(DOWNLOAD_PROFILES.keys()), default="assets", help="Download scope (default: assets)")
@@ -94,6 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--langs", nargs="*", default=[], choices=[c for c, _ in VOICE_LANGS],
         help="Optional voice language packs (en-us, ja-jp, zh-cn, ko-kr)",
     )
+    p_cdn.add_argument("--blks", nargs="+", default=None, help="Pull only specific `.blk` filename(s) from HoYoverse CDN")
+    p_cdn.add_argument("--target", default="", help="Pull only the `.blk` files needed for a named character, entity, or map")
     p_cdn.add_argument("--workers", type=int, default=4, help="Concurrent download workers (1-8, default: 4)")
     p_cdn.add_argument("--info", action="store_true", help="Query live version & profile sizes without downloading")
     p_cdn.add_argument("--ignore-space-check", action="store_true", help="Skip free disk space verification")
@@ -107,6 +128,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_tools.add_argument("--wine", action="store_true", help="Auto-install portable WoW64 Wine (Linux x86_64)")
     p_tools.add_argument("--dotnet", action="store_true", help="Auto-install portable .NET 9 SDK")
     p_tools.add_argument("--blender", action="store_true", help="Auto-install portable Blender 4.2 LTS")
+
+    p_idx = sub.add_parser("index", help="Build or incrementally update OZ asset indexes and CABMap")
+    p_idx.add_argument("--root", type=Path, default=cfg.GAME_ROOT, help="Path to ZZZ Android/PC build root")
+    p_idx.add_argument("--force", action="store_true", help="Ignore incremental .blk state cache and rescan all .blk files")
+    p_idx.add_argument("--workers", type=int, default=None, help="Override AnimeStudio indexing worker count")
+    p_idx.add_argument("--supplementary", action="store_true", help="Also upgrade supplementary entity/media indexes from zzz_assets_map.json")
+    p_idx.add_argument("--validate", action="store_true", help="Validate and repair existing OZ indexes without full rescan")
 
     p_exp = sub.add_parser(
         "export",
@@ -140,6 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--skip-fonts", action="store_true", help="Skip fonts in 'full' export")
     p_exp.add_argument("--skip-audio", action="store_true", help="Skip audio in 'full' export")
     p_exp.add_argument("--dry-run", action="store_true", help="Preview 'full' export plan without running")
+    p_exp.add_argument("--no-cdn-pull", action="store_true", help="Disable automatic pulling of missing .blk files from HoYoverse CDN")
+    p_exp.add_argument("--cdn-region", choices=["global", "cn"], default=None, help="HoYoverse CDN server region for on-demand .blk pulls")
     return p
 
 
@@ -254,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {ex}", file=sys.stderr)
             return 1
 
-    if cmd == "download-pc":
+    if cmd in ("download-pc", "download-cdn"):
         try:
             if args.info:
                 info = fetch_zzz_cdn_info(region=args.region, parse_game_manifest=True)
@@ -270,6 +300,66 @@ def main(argv: list[str] | None = None) -> int:
                     if v:
                         gb = v["size"] / (1024 ** 3)
                         print(f"  {code:8s}: {v['file_count']:5d} files, {gb:5.2f} GB ({label})")
+                return 0
+            if args.blks or args.target:
+                init_cdn_workspace(args.dest, region=args.region)
+                req_blks: list[str] = list(args.blks or ())
+                p_hashes: list[str] = []
+                b_hashes: list[str] = []
+                if args.target:
+                    ensure_prebuilt_index_loaded()
+                    t_low = args.target.strip().lower()
+                    matched = False
+                    oz_chars = load_oz_character_index()
+                    ck = next((k for k in oz_chars if k.lower() == t_low), None)
+                    if ck is not None:
+                        rec = oz_chars[ck]
+                        req_blks.extend(collect_entry_required_blks(rec, include_anims=True, include_deps=True))
+                        if rec.get("prefab_key"):
+                            p_hashes.append(rec["prefab_key"])
+                        p_hashes.extend(rec.get("anim_keys") or ())
+                        b_hashes.extend(rec.get("bundle_hashes") or ())
+                        matched = True
+                    if not matched:
+                        oz_ents = load_oz_entities_index()
+                        for cat_k in ("monsters", "npcs", "weapons", "props"):
+                            bucket = oz_ents.get(cat_k) or {}
+                            ek = next((k for k in bucket if k.lower() == t_low), None)
+                            if ek is not None:
+                                rec = bucket[ek]
+                                req_blks.extend(collect_entry_required_blks(rec, include_anims=True, include_deps=True))
+                                if rec.get("prefab_key"):
+                                    p_hashes.append(rec["prefab_key"])
+                                p_hashes.extend(rec.get("anim_keys") or ())
+                                b_hashes.extend(rec.get("bundle_hashes") or ())
+                                matched = True
+                                break
+                    if not matched:
+                        oz_maps = load_oz_map_index()
+                        mk = next((k for k in oz_maps if k.lower() == t_low), None)
+                        if mk is not None:
+                            rec = oz_maps[mk]
+                            req_blks.extend(collect_map_required_blks(mk, rec))
+                            p_hashes.extend((rec.get("streaming") or {}).get("hashes") or ())
+                            b_hashes.extend(rec.get("bundle_hashes") or ())
+                            matched = True
+                    if not matched:
+                        print(f"Error: Target '{args.target}' not found in OZ character/entity/map index.", file=sys.stderr)
+                        return 2
+                pulled = resolve_and_download_targeted_blks(
+                    args.dest,
+                    blk_names=req_blks,
+                    path_hashes=p_hashes,
+                    bundle_hashes=b_hashes,
+                    include_deps=True,
+                    region=args.region,
+                    workers=args.workers,
+                    log_cb=print,
+                    ignore_space_check=args.ignore_space_check,
+                )
+                if pulled:
+                    sync_ondemand_blks_index(args.dest, pulled, log_cb=print)
+                print(f"Pulled {len(pulled)} targeted .blk container(s) into {args.dest}")
                 return 0
             out = download_pc_build(
                 dest_root=args.dest,
@@ -293,6 +383,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(st, indent=2))
                 return 0
             print(f"OS        : {st['os_detail']} ({st['arch']}, {st['display']}, pkg={st['pkg_manager']})")
+            hw = st.get("hardware") or {}
+            if hw:
+                print(
+                    f"Hardware  : {hw.get('cpu_threads')} CPU threads, "
+                    f"{hw.get('ram_avail_gb')}/{hw.get('ram_total_gb')} GiB RAM free, "
+                    f"GPU={hw.get('gpu_vendor')} "
+                    f"(workers: index={hw.get('index_workers')}, blender={hw.get('blender_workers')}, chunk={hw.get('blender_chunk_size')})"
+                )
             print(f"Python    : {st['python']} ({', '.join(k for k, ok in st['python_modules'].items() if ok)})")
             print(f"Tools Dir : {st['tools_dir']}")
             missing_py = [k for k, ok in st["python_modules"].items() if not ok]
@@ -326,7 +424,27 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2))
         return 0 if res.get("cli_exists") else 1
 
+    if cmd == "index":
+        if getattr(args, "validate", False):
+            report = validate_and_repair_indexes(game_root=args.root, fix=True, log_cb=print)
+            print(json.dumps(report, indent=2))
+            return 0
+        manifest = build_asset_map(
+            args.root,
+            log_cb=print,
+            force_full=args.force,
+            max_workers=args.workers,
+        )
+        if args.supplementary and (cfg.CACHE_DIR / "asset_map" / "zzz_assets_map.json").is_file():
+            build_supplementary_indexes_from_asset_map(log_cb=print)
+        print(json.dumps(manifest, indent=2))
+        return 0
+
     if cmd == "export":
+        if getattr(args, "no_cdn_pull", False):
+            os.environ["OPENZENLESS_AUTO_CDN_PULL"] = "0"
+        if getattr(args, "cdn_region", None):
+            os.environ["OPENZENLESS_CDN_REGION"] = args.cdn_region
         files_root = cfg.resolve_files_root(args.root)
         scope = args.scope
         if scope == "character":

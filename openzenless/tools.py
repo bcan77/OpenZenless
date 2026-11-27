@@ -295,6 +295,12 @@ _OZ_DUMP_CS = (
     "                                try\n"
     "                                {\n"
     "                                    if (mainCls == ClassIDType.GameObject) mainName = new GameObject(new ObjectReader(sf.reader, sf, mainOi, Game)).m_Name ?? \"\";\n"
+    "                                    else if (mainCls == ClassIDType.Animator)\n"
+    "                                    {\n"
+    "                                        var anim = new Animator(new ObjectReader(sf.reader, sf, mainOi, Game));\n"
+    "                                        if (anim.m_GameObject != null && anim.m_GameObject.m_FileID == 0 && infoById.TryGetValue(anim.m_GameObject.m_PathID, out var goOi))\n"
+    "                                            mainName = new GameObject(new ObjectReader(sf.reader, sf, goOi, Game)).m_Name ?? \"\";\n"
+    "                                    }\n"
     "                                    else if (mainCls == ClassIDType.Mesh || mainCls == ClassIDType.AnimationClip || mainCls == ClassIDType.Font || mainCls == ClassIDType.TextAsset || mainCls == ClassIDType.Sprite || mainCls == ClassIDType.Texture2D || mainCls == ClassIDType.Shader)\n"
     "                                    {\n"
     "                                        var nr = new ObjectReader(sf.reader, sf, mainOi, Game); nr.Reset();\n"
@@ -2341,6 +2347,14 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "                    var fullPath = Path.GetFullPath(Path.Combine(BaseFolder, entry.Path));",
         ),
         (
+            "                    var fullPath = Path.GetFullPath(Path.Combine(BaseFolder, entry.Path));\n"
+            "                    Logger.Verbose($\"Found {cab} in {fullPath}\");",
+            "                    var fullPath = Path.GetFullPath(Path.Combine(BaseFolder, entry.Path));\n"
+            "                    if (!File.Exists(fullPath))\n"
+            "                        continue;\n"
+            "                    Logger.Verbose($\"Found {cab} in {fullPath}\");",
+        ),
+        (
             "            var relativePath = Path.GetRelativePath(BaseFolder, path);",
             "            var relativePath = Path.GetRelativePath(BaseFolder, Path.GetFullPath(path));",
         ),
@@ -2394,6 +2408,20 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "        internal HashSet<string> assetsFileListHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);",
             "        internal HashSet<string> assetsFileListHash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);\n"
             "        internal HashSet<SerializedFile> fallbackAssetsFiles = new HashSet<SerializedFile>();",
+        ),
+        (
+            "                .ThenBy(file => new FileInfo(file).Length)",
+            "                .ThenBy(file => File.Exists(file) ? new FileInfo(file).Length : 0L)",
+        ),
+        (
+            "        private void LoadFile(string fullName)\n"
+            "        {\n"
+            "            if (Game?.Type == GameType.AFKJourney",
+            "        private void LoadFile(string fullName)\n"
+            "        {\n"
+            "            if (!File.Exists(fullName))\n"
+            "                return;\n"
+            "            if (Game?.Type == GameType.AFKJourney",
         ),
         (
             "        public bool EnsureAnimatorAvatarLoaded(Animator animator)\n"
@@ -2773,13 +2801,17 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "                                    }\n"
             "                                }\n"
             "                            }\n\n"
-            "                            if (!childAttached && childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                            if (!childAttached && ((childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull) || (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)))\n"
             "                            {\n"
             "                                if (separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_{childName}\", out var mp)\n"
-            "                                    || separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_Model_{childName}\", out mp))\n"
+            "                                    || separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_Model_{childName}\", out mp)\n"
+            "                                    || separateMeshes.TryGetValue(childName, out mp))\n"
             "                                {\n"
             "                                    Logger.Info($\"Attached SeparateMesh fallback to {childName} under {rootName}\");\n"
-            "                                    childGO.m_SkinnedMeshRenderer.m_Mesh = mp;\n"
+            "                                    if (childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                                        childGO.m_SkinnedMeshRenderer.m_Mesh = mp;\n"
+            "                                    else if (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)\n"
+            "                                        childGO.m_MeshFilter.m_Mesh = mp;\n"
             "                                    attachedAnyLod0 = true;\n"
             "                                }\n"
             "                            }\n"
@@ -2799,6 +2831,350 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "                        }\n"
             "                    }",
         ),
+        (
+            "                            if (!childAttached && childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                            {\n"
+            "                                if (separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_{childName}\", out var mp)\n"
+            "                                    || separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_Model_{childName}\", out mp))\n"
+            "                                {\n"
+            "                                    Logger.Info($\"Attached SeparateMesh fallback to {childName} under {rootName}\");\n"
+            "                                    childGO.m_SkinnedMeshRenderer.m_Mesh = mp;\n"
+            "                                    attachedAnyLod0 = true;\n"
+            "                                }\n"
+            "                            }",
+            "                            if (!childAttached && ((childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull) || (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)))\n"
+            "                            {\n"
+            "                                if (separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_{childName}\", out var mp)\n"
+            "                                    || separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_Model_{childName}\", out mp)\n"
+            "                                    || separateMeshes.TryGetValue(childName, out mp))\n"
+            "                                {\n"
+            "                                    Logger.Info($\"Attached SeparateMesh fallback to {childName} under {rootName}\");\n"
+            "                                    if (childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                                        childGO.m_SkinnedMeshRenderer.m_Mesh = mp;\n"
+            "                                    else if (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)\n"
+            "                                        childGO.m_MeshFilter.m_Mesh = mp;\n"
+            "                                    attachedAnyLod0 = true;\n"
+            "                                }\n"
+            "                            }",
+        ),
+        (
+            "                Logger.Info($\"Found {avatars.Count} Avatars\");\n"
+            "                foreach (var avatar in avatars)\n"
+            "                {\n"
+            "                    var rootName = avatar.Name;\n"
+            "                    Logger.Verbose($\"Attempting to process SeparateMesh for {rootName}\");\n\n\n"
+            "                    if (avatar.m_Transform != null)\n"
+            "                    {\n"
+            "                        bool attachedAnyLod0 = false;\n"
+            "                        var allChildren = new List<GameObject>();\n"
+            "                        var visitedTransforms = new HashSet<Transform>();\n"
+            "                        var stack = new Stack<(PPtr<Transform> ptr, int depth)>();\n"
+            "                        for (int ci = avatar.m_Transform.m_Children.Count - 1; ci >= 0; ci--)\n"
+            "                        {\n"
+            "                            stack.Push((avatar.m_Transform.m_Children[ci], 1));\n"
+            "                        }\n\n"
+            "                        while (stack.Count > 0)\n"
+            "                        {\n"
+            "                            var (childPtr, depth) = stack.Pop();\n"
+            "                            if (depth > 48 || !childPtr.TryGet(out var child) || !visitedTransforms.Add(child))\n"
+            "                                continue;\n\n"
+            "                            if (child.m_Children != null)\n"
+            "                            {\n"
+            "                                for (int ci = child.m_Children.Count - 1; ci >= 0; ci--)\n"
+            "                                {\n"
+            "                                    stack.Push((child.m_Children[ci], depth + 1));\n"
+            "                                }\n"
+            "                            }\n\n"
+            "                            if (!child.m_GameObject.TryGet(out var childGO))\n"
+            "                                continue;\n\n"
+            "                            allChildren.Add(childGO);\n"
+            "                            var childName = childGO.Name;\n"
+            "                            bool childAttached = false;\n\n"
+            "                            foreach (var i in childGO.m_Components)\n"
+            "                            {\n"
+            "                                if (i.TryGet<MonoBehaviour>(out var comp) && comp.Name == \"NapLodController\")\n"
+            "                                {\n"
+            "                                    var raw = comp.GetRawData();\n"
+            "                                    string rawPath = raw != null ? System.Text.Encoding.UTF8.GetString(raw) : string.Empty;\n"
+            "                                    if (string.IsNullOrEmpty(rawPath))\n"
+            "                                        continue;\n\n"
+            "                                    int assetIndex = rawPath.IndexOf(\"Assets\", StringComparison.Ordinal);\n"
+            "                                    string trimmed;\n"
+            "                                    if (assetIndex != -1)\n"
+            "                                    {\n"
+            "                                        trimmed = rawPath.Substring(assetIndex);\n"
+            "                                    }\n"
+            "                                    else if (rawPath.Length > 40)\n"
+            "                                    {\n"
+            "                                        trimmed = rawPath.Substring(40);\n"
+            "                                    }\n"
+            "                                    else\n"
+            "                                    {\n"
+            "                                        Logger.Verbose($\"NapLodController path too short ({rawPath.Length}), skipping\");\n"
+            "                                        continue;\n"
+            "                                    }\n\n"
+            "                                    trimmed = trimmed?.Trim();\n"
+            "                                    if (string.IsNullOrEmpty(trimmed))\n"
+            "                                        continue;\n\n"
+            "                                    int meshIndex = trimmed.IndexOf(\".mesh\", StringComparison.OrdinalIgnoreCase);\n"
+            "                                    if (meshIndex <= 0)\n"
+            "                                    {\n"
+            "                                        Logger.Verbose($\".mesh not found in '{trimmed}', skipping\");\n"
+            "                                        continue;\n"
+            "                                    }\n\n"
+            "                                    trimmed = trimmed.Substring(0, meshIndex);\n"
+            "                                    int lastSlash = trimmed.LastIndexOf('/');\n"
+            "                                    if (lastSlash >= 0 && lastSlash < trimmed.Length - 1)\n"
+            "                                        trimmed = trimmed.Substring(lastSlash + 1);\n\n"
+            "                                    trimmed = trimmed.Trim();\n"
+            "                                    if (string.IsNullOrEmpty(trimmed))\n"
+            "                                        continue;\n\n"
+            "                                    if (separateMeshes.TryGetValue(trimmed, out var meshPPtr))\n"
+            "                                    {\n"
+            "                                        Logger.Verbose($\"Trying to attach {trimmed} to {childName}\");\n"
+            "                                        if (childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                                        {\n"
+            "                                            Logger.Info($\"Attached {trimmed} to {childName}\");\n"
+            "                                            childGO.m_SkinnedMeshRenderer.m_Mesh = meshPPtr;\n"
+            "                                            childAttached = true;\n"
+            "                                            attachedAnyLod0 = true;\n"
+            "                                        }\n"
+            "                                        else if (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)\n"
+            "                                        {\n"
+            "                                            Logger.Info($\"Attached {trimmed} to {childName}\");\n"
+            "                                            childGO.m_MeshFilter.m_Mesh = meshPPtr;\n"
+            "                                            childAttached = true;\n"
+            "                                            attachedAnyLod0 = true;\n"
+            "                                        }\n"
+            "                                    }\n"
+            "                                    else if (separateMeshes.TryGetValue(childName, out meshPPtr))\n"
+            "                                    {\n"
+            "                                        Logger.Verbose($\"Trying to attach {childName} to {childName}\");\n"
+            "                                        if (childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                                        {\n"
+            "                                            Logger.Info($\"Attached {childName} to {childName}\");\n"
+            "                                            childGO.m_SkinnedMeshRenderer.m_Mesh = meshPPtr;\n"
+            "                                            childAttached = true;\n"
+            "                                            attachedAnyLod0 = true;\n"
+            "                                        }\n"
+            "                                        else if (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)\n"
+            "                                        {\n"
+            "                                            Logger.Info($\"Attached {childName} to {childName}\");\n"
+            "                                            childGO.m_MeshFilter.m_Mesh = meshPPtr;\n"
+            "                                            childAttached = true;\n"
+            "                                            attachedAnyLod0 = true;\n"
+            "                                        }\n"
+            "                                    }\n"
+            "                                }\n"
+            "                            }\n\n"
+            "                            if (!childAttached && ((childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull) || (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)))\n"
+            "                            {\n"
+            "                                if (separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_{childName}\", out var mp)\n"
+            "                                    || separateMeshes.TryGetValue($\"SeparateMesh_{rootName}_Model_{childName}\", out mp)\n"
+            "                                    || separateMeshes.TryGetValue(childName, out mp))\n"
+            "                                {\n"
+            "                                    Logger.Info($\"Attached SeparateMesh fallback to {childName} under {rootName}\");\n"
+            "                                    if (childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                                        childGO.m_SkinnedMeshRenderer.m_Mesh = mp;\n"
+            "                                    else if (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)\n"
+            "                                        childGO.m_MeshFilter.m_Mesh = mp;\n"
+            "                                    attachedAnyLod0 = true;\n"
+            "                                }\n"
+            "                            }\n"
+            "                        }\n\n"
+            "                        if (attachedAnyLod0)\n"
+            "                        {\n"
+            "                            foreach (var go in allChildren)\n"
+            "                            {\n"
+            "                                var goName = go.Name;\n"
+            "                                if (!string.IsNullOrEmpty(goName)\n"
+            "                                    && (goName.EndsWith(\"_LOD3\", StringComparison.OrdinalIgnoreCase)\n"
+            "                                        || goName.IndexOf(\"HairShadow\", StringComparison.OrdinalIgnoreCase) >= 0))\n"
+            "                                {\n"
+            "                                    go.m_SuppressExport = true;\n"
+            "                                }\n"
+            "                            }\n"
+            "                        }\n"
+            "                    }\n"
+            "                }",
+            "                Logger.Info($\"Found {avatars.Count} Avatars\");\n"
+            "                var pendingFallbacks = new List<(string rootName, GameObject childGO, string childName, List<GameObject> allChildren)>();\n"
+            "                bool TryAttachSeparateMeshFallback(string rName, GameObject cGo, string cName)\n"
+            "                {\n"
+            "                    if ((cGo.m_SkinnedMeshRenderer != null && cGo.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                        || (cGo.m_MeshFilter != null && cGo.m_MeshFilter.m_Mesh.IsNull))\n"
+            "                    {\n"
+            "                        if (separateMeshes.TryGetValue($\"SeparateMesh_{rName}_{cName}\", out var mp)\n"
+            "                            || separateMeshes.TryGetValue($\"SeparateMesh_{rName}_Model_{cName}\", out mp)\n"
+            "                            || separateMeshes.TryGetValue(cName, out mp))\n"
+            "                        {\n"
+            "                            Logger.Info($\"Attached SeparateMesh fallback to {cName} under {rName}\");\n"
+            "                            if (cGo.m_SkinnedMeshRenderer != null && cGo.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                                cGo.m_SkinnedMeshRenderer.m_Mesh = mp;\n"
+            "                            else if (cGo.m_MeshFilter != null && cGo.m_MeshFilter.m_Mesh.IsNull)\n"
+            "                                cGo.m_MeshFilter.m_Mesh = mp;\n"
+            "                            return true;\n"
+            "                        }\n"
+            "                    }\n"
+            "                    return false;\n"
+            "                }\n"
+            "                void SuppressLowerLodChildren(List<GameObject> children)\n"
+            "                {\n"
+            "                    foreach (var go in children)\n"
+            "                    {\n"
+            "                        var goName = go.Name;\n"
+            "                        if (!string.IsNullOrEmpty(goName)\n"
+            "                            && (goName.EndsWith(\"_LOD3\", StringComparison.OrdinalIgnoreCase)\n"
+            "                                || goName.IndexOf(\"HairShadow\", StringComparison.OrdinalIgnoreCase) >= 0))\n"
+            "                        {\n"
+            "                            go.m_SuppressExport = true;\n"
+            "                        }\n"
+            "                    }\n"
+            "                }\n"
+            "                foreach (var avatar in avatars)\n"
+            "                {\n"
+            "                    var rootName = avatar.Name;\n"
+            "                    Logger.Verbose($\"Attempting to process SeparateMesh for {rootName}\");\n\n\n"
+            "                    if (avatar.m_Transform != null)\n"
+            "                    {\n"
+            "                        bool attachedAnyLod0 = false;\n"
+            "                        var allChildren = new List<GameObject>();\n"
+            "                        var visitedTransforms = new HashSet<Transform>();\n"
+            "                        var stack = new Stack<(PPtr<Transform> ptr, int depth)>();\n"
+            "                        for (int ci = avatar.m_Transform.m_Children.Count - 1; ci >= 0; ci--)\n"
+            "                        {\n"
+            "                            stack.Push((avatar.m_Transform.m_Children[ci], 1));\n"
+            "                        }\n\n"
+            "                        while (stack.Count > 0)\n"
+            "                        {\n"
+            "                            var (childPtr, depth) = stack.Pop();\n"
+            "                            if (depth > 48 || !childPtr.TryGet(out var child) || !visitedTransforms.Add(child))\n"
+            "                                continue;\n\n"
+            "                            if (child.m_Children != null)\n"
+            "                            {\n"
+            "                                for (int ci = child.m_Children.Count - 1; ci >= 0; ci--)\n"
+            "                                {\n"
+            "                                    stack.Push((child.m_Children[ci], depth + 1));\n"
+            "                                }\n"
+            "                            }\n\n"
+            "                            if (!child.m_GameObject.TryGet(out var childGO))\n"
+            "                                continue;\n\n"
+            "                            allChildren.Add(childGO);\n"
+            "                            var childName = childGO.Name;\n"
+            "                            bool childAttached = false;\n\n"
+            "                            foreach (var i in childGO.m_Components)\n"
+            "                            {\n"
+            "                                if (i.TryGet<MonoBehaviour>(out var comp) && comp.Name == \"NapLodController\")\n"
+            "                                {\n"
+            "                                    var raw = comp.GetRawData();\n"
+            "                                    string rawPath = raw != null ? System.Text.Encoding.UTF8.GetString(raw) : string.Empty;\n"
+            "                                    if (string.IsNullOrEmpty(rawPath))\n"
+            "                                        continue;\n\n"
+            "                                    int assetIndex = rawPath.IndexOf(\"Assets\", StringComparison.Ordinal);\n"
+            "                                    string trimmed;\n"
+            "                                    if (assetIndex != -1)\n"
+            "                                    {\n"
+            "                                        trimmed = rawPath.Substring(assetIndex);\n"
+            "                                    }\n"
+            "                                    else if (rawPath.Length > 40)\n"
+            "                                    {\n"
+            "                                        trimmed = rawPath.Substring(40);\n"
+            "                                    }\n"
+            "                                    else\n"
+            "                                    {\n"
+            "                                        Logger.Verbose($\"NapLodController path too short ({rawPath.Length}), skipping\");\n"
+            "                                        continue;\n"
+            "                                    }\n\n"
+            "                                    trimmed = trimmed?.Trim();\n"
+            "                                    if (string.IsNullOrEmpty(trimmed))\n"
+            "                                        continue;\n\n"
+            "                                    int meshIndex = trimmed.IndexOf(\".mesh\", StringComparison.OrdinalIgnoreCase);\n"
+            "                                    if (meshIndex <= 0)\n"
+            "                                    {\n"
+            "                                        Logger.Verbose($\".mesh not found in '{trimmed}', skipping\");\n"
+            "                                        continue;\n"
+            "                                    }\n\n"
+            "                                    trimmed = trimmed.Substring(0, meshIndex);\n"
+            "                                    string lodFolder = string.Empty;\n"
+            "                                    int lastSlash = trimmed.LastIndexOf('/');\n"
+            "                                    if (lastSlash >= 0 && lastSlash < trimmed.Length - 1)\n"
+            "                                    {\n"
+            "                                        int prevSlash = lastSlash > 0 ? trimmed.LastIndexOf('/', lastSlash - 1) : -1;\n"
+            "                                        lodFolder = (prevSlash >= 0 ? trimmed.Substring(prevSlash + 1, lastSlash - prevSlash - 1) : trimmed.Substring(0, lastSlash)).Trim();\n"
+            "                                        trimmed = trimmed.Substring(lastSlash + 1);\n"
+            "                                    }\n\n"
+            "                                    trimmed = trimmed.Trim();\n"
+            "                                    if (string.IsNullOrEmpty(trimmed))\n"
+            "                                        continue;\n\n"
+            "                                    if (separateMeshes.TryGetValue(trimmed, out var meshPPtr))\n"
+            "                                    {\n"
+            "                                        Logger.Verbose($\"Trying to attach {trimmed} to {childName}\");\n"
+            "                                        bool attachedNow = false;\n"
+            "                                        if (childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                                        {\n"
+            "                                            Logger.Info($\"Attached {trimmed} to {childName}\");\n"
+            "                                            childGO.m_SkinnedMeshRenderer.m_Mesh = meshPPtr;\n"
+            "                                            attachedNow = true;\n"
+            "                                        }\n"
+            "                                        else if (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)\n"
+            "                                        {\n"
+            "                                            Logger.Info($\"Attached {trimmed} to {childName}\");\n"
+            "                                            childGO.m_MeshFilter.m_Mesh = meshPPtr;\n"
+            "                                            attachedNow = true;\n"
+            "                                        }\n"
+            "                                        if (attachedNow)\n"
+            "                                        {\n"
+            "                                            if (!childAttached)\n"
+            "                                            {\n"
+            "                                                if (!string.IsNullOrEmpty(lodFolder))\n"
+            "                                                    separateMeshes.TryAdd($\"SeparateMesh_{lodFolder}_{childName}\", meshPPtr);\n"
+            "                                                if (!string.IsNullOrEmpty(rootName))\n"
+            "                                                    separateMeshes.TryAdd($\"SeparateMesh_{rootName}_{childName}\", meshPPtr);\n"
+            "                                                if (!string.IsNullOrEmpty(childName))\n"
+            "                                                    separateMeshes.TryAdd(childName, meshPPtr);\n"
+            "                                            }\n"
+            "                                            childAttached = true;\n"
+            "                                            attachedAnyLod0 = true;\n"
+            "                                        }\n"
+            "                                    }\n"
+            "                                    else if (separateMeshes.TryGetValue(childName, out meshPPtr))\n"
+            "                                    {\n"
+            "                                        Logger.Verbose($\"Trying to attach {childName} to {childName}\");\n"
+            "                                        if (childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull)\n"
+            "                                        {\n"
+            "                                            Logger.Info($\"Attached {childName} to {childName}\");\n"
+            "                                            childGO.m_SkinnedMeshRenderer.m_Mesh = meshPPtr;\n"
+            "                                            childAttached = true;\n"
+            "                                            attachedAnyLod0 = true;\n"
+            "                                        }\n"
+            "                                        else if (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)\n"
+            "                                        {\n"
+            "                                            Logger.Info($\"Attached {childName} to {childName}\");\n"
+            "                                            childGO.m_MeshFilter.m_Mesh = meshPPtr;\n"
+            "                                            childAttached = true;\n"
+            "                                            attachedAnyLod0 = true;\n"
+            "                                        }\n"
+            "                                    }\n"
+            "                                }\n"
+            "                            }\n\n"
+            "                            if (!childAttached && ((childGO.m_SkinnedMeshRenderer != null && childGO.m_SkinnedMeshRenderer.m_Mesh.IsNull) || (childGO.m_MeshFilter != null && childGO.m_MeshFilter.m_Mesh.IsNull)))\n"
+            "                            {\n"
+            "                                if (TryAttachSeparateMeshFallback(rootName, childGO, childName))\n"
+            "                                    attachedAnyLod0 = true;\n"
+            "                                else\n"
+            "                                    pendingFallbacks.Add((rootName, childGO, childName, allChildren));\n"
+            "                            }\n"
+            "                        }\n\n"
+            "                        if (attachedAnyLod0)\n"
+            "                            SuppressLowerLodChildren(allChildren);\n"
+            "                    }\n"
+            "                }\n"
+            "                foreach (var (pRootName, pChildGO, pChildName, pAllChildren) in pendingFallbacks)\n"
+            "                {\n"
+            "                    if (TryAttachSeparateMeshFallback(pRootName, pChildGO, pChildName))\n"
+            "                        SuppressLowerLodChildren(pAllChildren);\n"
+            "                }",
+        ),
     ])
 
     _replace_in_file("AnimeStudio/SerializedFile.cs", [
@@ -2815,6 +3191,52 @@ def _patch_animestudio_cli(studio_dir: Path, log_cb=None) -> bool:
             "            if (ObjectsDic.TryAdd(obj.m_PathID, obj))\n"
             "                Objects.Add(obj);\n"
             "        }",
+        ),
+    ])
+
+    _replace_in_file("AnimeStudio/Classes/Avatar.cs", [
+        (
+            "                m_TOS.Add(reader.ReadUInt32(), reader.ReadAlignedString());",
+            "                var tosKey = reader.ReadUInt32();\n"
+            "                var tosVal = reader.ReadAlignedString();\n"
+            "                m_TOS[tosKey] = tosVal;",
+        ),
+    ])
+
+    _replace_in_file("AnimeStudio/Classes/NapAssetBundleIndexAsset.cs", [
+        (
+            "        public NapAssetBundleIndexAsset(ObjectReader reader) : base(reader)\n"
+            "        {\n"
+            "            var m_AssetArraySize = reader.ReadInt32();",
+            "        public NapAssetBundleIndexAsset(ObjectReader reader) : base(reader)\n"
+            "        {\n"
+            "            m_AssetArray = new List<IndexAssetRef>();\n"
+            "            m_BundleArray = new List<IndexBundleRef>();\n"
+            "            m_BlockArray = new List<IndexBlockRef>();\n"
+            "            m_ChildrenIndexArray = new List<uint>();\n"
+            "            try\n"
+            "            {\n"
+            "                var m_AssetArraySize = reader.ReadInt32();",
+        ),
+        (
+            "            for (int i = 0; i < m_ChildrenIndexArraySize; i++)\n"
+            "                m_ChildrenIndexArray.Add(reader.ReadUInt32());\n"
+            "        }",
+            "                for (int i = 0; i < m_ChildrenIndexArraySize; i++)\n"
+            "                    m_ChildrenIndexArray.Add(reader.ReadUInt32());\n"
+            "            }\n"
+            "            catch { }\n"
+            "        }",
+        ),
+        (
+            "                childrenStartIndex = reader.ReadUInt32();\n"
+            "                childrenEndIndex = reader.ReadUInt32();\n"
+            "                fileSize = reader.ReadUInt32();",
+            "                childrenStartIndex = reader.ReadUInt32();\n"
+            "                childrenEndIndex = reader.ReadUInt32();\n"
+            "                reader.ReadUInt32();\n"
+            "                reader.ReadUInt32();\n"
+            "                fileSize = reader.ReadUInt32();",
         ),
     ])
 
@@ -2933,6 +3355,34 @@ def _has_dotnet9_sdk(dotnet_bin: str) -> bool:
         return False
 
 
+def ensure_runtime_python_packages(log_cb=None) -> bool:
+    """Verify required runtime Python dependencies and auto-install any missing packages via pip."""
+    reqs = [
+        ("PySide6", "PySide6>=6.6.0"),
+        ("PIL", "Pillow>=10.0.0"),
+        ("numpy", "numpy>=1.24.0"),
+        ("OpenGL", "PyOpenGL>=3.1.6"),
+        ("pygltflib", "pygltflib>=1.16.0"),
+    ]
+    if sys.version_info < (3, 14):
+        reqs.append(("zstandard", "zstandard>=0.22.0"))
+    missing: list[str] = []
+    for imp_name, pkg_spec in reqs:
+        try:
+            __import__(imp_name)
+        except Exception:
+            missing.append(pkg_spec)
+    if not missing:
+        return True
+    _emit(log_cb, f"Installing missing Python package(s): {', '.join(missing)}")
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet", *missing]
+    rc = _stream_cmd(cmd, log_cb=log_cb)
+    if rc != 0:
+        _emit(log_cb, f"Retrying pip install with --no-cache-dir (previous rc={rc})...")
+        rc = _stream_cmd([sys.executable, "-m", "pip", "install", "--no-cache-dir", "--quiet", *missing], log_cb=log_cb)
+    return rc == 0
+
+
 def ensure_dotnet(log_cb=None, progress_cb=None, cancel_event: threading.Event | None = None) -> str | None:
     """Install portable .NET 9.0 SDK into TOOLS_DIR/dotnet if no .NET 9 SDK is present."""
     existing = cfg.find_dotnet()
@@ -2958,16 +3408,19 @@ def ensure_dotnet(log_cb=None, progress_cb=None, cancel_event: threading.Event |
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("Cancelled .NET 9 installation.")
         _emit(log_cb, f"Installing portable .NET 9.0 SDK to {dotnet_dir}...")
+        cmd_env = cfg.build_cli_env()
         if cfg.is_windows():
             ps = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+            cmd_env = {**cmd_env, "OZ_DOTNET_SCRIPT": str(script_path), "OZ_DOTNET_DIR": str(dotnet_dir)}
             cmd = [
-                ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
-                "-File", str(script_path), "-Channel", "9.0", "-InstallDir", str(dotnet_dir),
+                ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+                "& $env:OZ_DOTNET_SCRIPT -Channel 9.0 -InstallDir $env:OZ_DOTNET_DIR",
             ]
         else:
             _chmod_exec(script_path)
             cmd = ["bash", str(script_path), "--channel", "9.0", "--install-dir", str(dotnet_dir)]
-        rc = _stream_cmd(cmd, log_cb=log_cb)
+        rc = _stream_cmd(cmd, log_cb=log_cb, env=cmd_env)
         if rc != 0:
             _emit(log_cb, f"[WARN] .NET 9 installer exited with code {rc}.")
         exe_path = dotnet_dir / exe_name
@@ -3206,6 +3659,15 @@ def _build_animestudio_cli(as_dir: Path, dotnet: str, log_cb=None, progress_cb=N
         for dst_dir in acl_dst_dirs:
             if dst_dir.is_dir():
                 shutil.copy2(bundled_acl, dst_dir / "AnimeStudio.ACL.ZZZV2.dll")
+
+    # Preserve previously generated CAB Maps (e.g. ZZZ.bin) when upgrading from non-publish to publish layout
+    if (
+        pub_dir.is_dir()
+        and (bin_base / "Maps" / "ZZZ.bin").is_file()
+        and not (pub_dir / "Maps" / "ZZZ.bin").is_file()
+    ):
+        _emit(log_cb, "Preserving existing Maps cache in publish directory...")
+        shutil.copytree(bin_base / "Maps", pub_dir / "Maps", dirs_exist_ok=True)
 
     cfg._resolve_tool_paths()
     return cfg.CLI_EXE.is_file()
@@ -3461,4 +3923,5 @@ def get_environment_status() -> dict:
         "tools_dir": str(cfg.TOOLS_DIR),
         "python_modules": py_mods,
         "tools": tools_list,
+        "hardware": cfg.get_hardware_profile(),
     }
