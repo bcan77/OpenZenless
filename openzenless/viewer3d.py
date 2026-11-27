@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image
 from pygltflib import GLTF2
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QOpenGLContext
 from PySide6.QtOpenGL import QOpenGLShader, QOpenGLShaderProgram
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
@@ -38,9 +39,44 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from OpenGL import GL as gl
 
 from . import config as cfg
+
+cfg.configure_gpu_env()
+
+import OpenGL.contextdata as _gl_ctxdata
+import OpenGL.platform as _gl_plat
+from OpenGL import GL as gl
+
+_orig_plat_get_ctx = getattr(_gl_plat.PLATFORM, "GetCurrentContext", None) or getattr(_gl_plat, "GetCurrentContext", None)
+
+
+def _safe_gl_get_current_context():
+    try:
+        c = _orig_plat_get_ctx() if _orig_plat_get_ctx is not None else None
+    except Exception:
+        c = None
+    if not c:
+        qctx = QOpenGLContext.currentContext()
+        return id(qctx) if qctx is not None else 1
+    return c
+
+
+def _safe_gl_get_context(context=None):
+    if context is not None:
+        return context
+    return _safe_gl_get_current_context()
+
+
+_gl_ctxdata.getContext = _safe_gl_get_context
+_gl_plat.GetCurrentContext = _safe_gl_get_current_context
+_gl_plat.CurrentContextIsValid = _safe_gl_get_current_context
+if _gl_plat.PLATFORM is not None:
+    try:
+        _gl_plat.PLATFORM.GetCurrentContext = _safe_gl_get_current_context
+        _gl_plat.PLATFORM.CurrentContextIsValid = _safe_gl_get_current_context
+    except Exception:
+        pass
 
 
 def _release_os_memory() -> None:

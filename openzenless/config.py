@@ -874,6 +874,13 @@ def configure_gpu_env(apply: bool = True) -> dict[str, str]:
             if os.environ.get("OPENZENLESS_WAYLAND", "").strip().lower() not in ("1", "true", "yes"):
                 env_vars["QT_QPA_PLATFORM"] = "xcb"
 
+        qpa = (env_vars.get("QT_QPA_PLATFORM") or os.environ.get("QT_QPA_PLATFORM", "")).strip().lower()
+        if not os.environ.get("PYOPENGL_PLATFORM"):
+            if qpa.startswith("xcb") or (os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")):
+                env_vars["PYOPENGL_PLATFORM"] = "glx"
+            elif qpa.startswith("wayland"):
+                env_vars["PYOPENGL_PLATFORM"] = "egl"
+
         gpu = detect_gpu_info()
         if gpu_pref in ("cpu", "0", "off", "software"):
             env_vars.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")

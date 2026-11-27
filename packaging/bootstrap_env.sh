@@ -41,6 +41,10 @@ if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${DISPLAY:-}" ] && [ -z "${QT_QPA_PLAT
   esac
 fi
 
+if [ "${QT_QPA_PLATFORM:-}" = "xcb" ] && [ -z "${PYOPENGL_PLATFORM:-}" ]; then
+  export PYOPENGL_PLATFORM="glx"
+fi
+
 case "${OPENZENLESS_GPU:-}" in
   igpu|cpu|0|off) ;;
   *)
