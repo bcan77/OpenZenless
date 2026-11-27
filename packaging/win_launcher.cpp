@@ -113,7 +113,7 @@ static bool RunProcessWaitW(const std::wstring& cmdline, const std::wstring& cwd
         mutable_cmd.data(),
         nullptr,
         nullptr,
-        (flags & CREATE_NO_WINDOW) ? FALSE : TRUE,
+        FALSE,
         flags,
         nullptr,
         cwd.empty() ? nullptr : cwd.c_str(),
@@ -346,7 +346,7 @@ static bool LaunchGuiAndCheckStartupW(
     std::vector<wchar_t> mutable_cmd(gui_cmd.begin(), gui_cmd.end());
     mutable_cmd.push_back(L'\0');
     DWORD flags = hidden ? CREATE_NO_WINDOW : 0;
-    if (!CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, hidden ? FALSE : TRUE, flags, nullptr, app_dir.c_str(), &si, &pi)) {
+    if (!CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE, flags, nullptr, app_dir.c_str(), &si, &pi)) {
         return false;
     }
     DWORD wait_res = WaitForSingleObject(pi.hProcess, 1500);
@@ -380,6 +380,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     std::wstring launch_log = data_dir + L"\\launch.log";
     SetEnvironmentVariableW(L"OPENZENLESS_LAUNCH_LOG", launch_log.c_str());
+    SetEnvironmentVariableW(L"PYTHONUTF8", L"1");
+    SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -451,7 +453,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     if (flag_setup_only) {
         DWORD code = 1;
-        std::wstring cmd = L"cmd.exe /c " + QuoteArgW(run_bat) + (flag_repair ? L" --repair --setup-only" : L" --setup-only");
+        std::wstring inner = QuoteArgW(run_bat) + (flag_repair ? L" --repair --setup-only" : L" --setup-only");
+        std::wstring cmd = L"cmd.exe /d /s /c \"" + inner + L"\"";
         RunProcessWaitW(cmd, app_dir, 0, &code);
         if (code == 0 && ProbeVenvHealthW(venv_py, app_dir)) {
             WriteMarkerW(venv_ready_marker, "ok\n");
@@ -468,7 +471,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             }
         }
         DWORD code = 0;
-        std::wstring cmd = L"cmd.exe /c " + QuoteArgW(run_bat) + L" " + extra_args;
+        std::wstring cmd = L"cmd.exe /d /s /c \"" + QuoteArgW(run_bat) + L" " + extra_args + L"\"";
         RunProcessWaitW(cmd, app_dir, 0, &code);
         return static_cast<int>(code);
     }
@@ -485,8 +488,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     if (!venv_ok) {
         DWORD setup_rc = 1;
-        std::wstring setup_cmd = L"cmd.exe /c " + QuoteArgW(run_bat) +
-                                 (flag_repair ? L" --repair --setup-only --no-pause" : L" --setup-only --no-pause");
+        std::wstring inner = QuoteArgW(run_bat) +
+                             (flag_repair ? L" --repair --setup-only --no-pause" : L" --setup-only --no-pause");
+        std::wstring setup_cmd = L"cmd.exe /d /s /c \"" + inner + L"\"";
         RunProcessWaitW(setup_cmd, app_dir, 0, &setup_rc);
         if (setup_rc == 0 && ProbeVenvHealthW(venv_py, app_dir)) {
             EnsureDirTreeW(venv_dir);
@@ -526,7 +530,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     // Fallback to run.bat (e.g. if user has global system python or portable venv failed)
     SetEnvironmentVariableW(L"OPENZENLESS_NO_CONSOLE", flag_console ? L"0" : L"1");
-    std::wstring fallback_cmd = L"cmd.exe /c " + QuoteArgW(run_bat) + L" gui";
+    std::wstring fallback_cmd = L"cmd.exe /d /s /c \"" + QuoteArgW(run_bat) + L" gui\"";
     DWORD code = 0;
     RunProcessWaitW(fallback_cmd, app_dir, 0, &code);
     if (code != 0) {

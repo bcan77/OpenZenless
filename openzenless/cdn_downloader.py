@@ -595,9 +595,19 @@ def download_pc_build(
     session_bytes = 0
 
     def _save_state():
+        payload = json.dumps({"version": version, "files": state_files})
         tmp = state_path.with_name(state_path.name + ".tmp")
-        tmp.write_text(json.dumps({"version": version, "files": state_files}), encoding="utf-8")
-        tmp.replace(state_path)
+        for attempt in range(3):
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                tmp.replace(state_path)
+                return
+            except OSError:
+                time.sleep(0.05 * (attempt + 1))
+        try:
+            state_path.write_text(payload, encoding="utf-8")
+        except OSError:
+            pass
 
     def _report_progress(cur_name: str = "", force: bool = False):
         nonlocal last_emit_t

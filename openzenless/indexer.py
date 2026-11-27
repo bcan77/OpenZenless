@@ -601,7 +601,7 @@ def load_character_index() -> dict[str, list[str]]:
     ):
         if cand.exists():
             try:
-                data = json.loads(cand.read_text())
+                data = json.loads(cand.read_text(encoding="utf-8", errors="ignore"))
                 chars = data.get("characters", data)
                 return {k: v.get("blocks", []) for k, v in chars.items() if isinstance(v, dict)}
             except Exception:
@@ -637,7 +637,7 @@ def load_stage_index() -> dict[str, list[str]]:
     ):
         if inv.exists():
             try:
-                data = json.loads(inv.read_text())
+                data = json.loads(inv.read_text(encoding="utf-8", errors="ignore"))
                 for k, v in (data.get("stages") or {}).items():
                     dst = stages.setdefault(k, [])
                     for b in v.get("blocks", []):
@@ -667,7 +667,7 @@ def load_stage_index() -> dict[str, list[str]]:
     owners_data: dict[str, list] = {}
     if owners_p.is_file():
         try:
-            owners_data = json.loads(owners_p.read_text())
+            owners_data = json.loads(owners_p.read_text(encoding="utf-8", errors="ignore"))
         except Exception:
             owners_data = {}
     nap_blocks_by_stage: dict[str, set[str]] = {}
@@ -684,7 +684,7 @@ def load_stage_index() -> dict[str, list[str]]:
     }
     if mm_p.is_file():
         try:
-            mm_data = json.loads(mm_p.read_text())
+            mm_data = json.loads(mm_p.read_text(encoding="utf-8", errors="ignore"))
             for sname, blks in stages.items():
                 clean = re.sub(r"^(?:Stage|Env|Scene|Map)_", "", sname)
                 toks = [t.lower() for t in clean.split("_") if len(t) >= 3 and not t.isdigit()]
@@ -750,7 +750,7 @@ def load_curated_map_index() -> dict[str, list[str]]:
         vd = cfg.FINAL_ROOT / "Viewer" / "viewer_data.json"
         if vd.exists():
             try:
-                data = json.loads(vd.read_text())
+                data = json.loads(vd.read_text(encoding="utf-8", errors="ignore"))
                 for m in data.get("maps", []):
                     mid = m.get("id") or m.get("name")
                     if mid:
@@ -788,7 +788,7 @@ def load_character_names() -> dict[str, str]:
     if not p.exists():
         return {}
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
         return {k: v for k, v in data.items() if isinstance(v, str)}
     except Exception:
         return {}
@@ -816,7 +816,7 @@ def has_asset_map(game_root: Path) -> bool:
     manifest = cfg.CACHE_DIR / "asset_map" / "manifest.json"
     if manifest.is_file():
         try:
-            data = json.loads(manifest.read_text())
+            data = json.loads(manifest.read_text(encoding="utf-8", errors="ignore"))
             if data.get("files_root") == str(files_root):
                 has_core = (cfg.CACHE_DIR / "asset_map" / "oz_maps_index.json").is_file() and (cfg.CACHE_DIR / "asset_map" / "oz_characters_index.json").is_file()
                 has_supp = (cfg.CACHE_DIR / "asset_map" / "oz_entities_index.json").is_file() and (cfg.CACHE_DIR / "asset_map" / "oz_media_index.json").is_file()
@@ -981,36 +981,39 @@ def _parse_cli_asset_map(
 
     if chars_auto:
         (map_dir / "character_index_auto.json").write_text(
-            json.dumps({"characters": {k: {"blocks": sorted(v)} for k, v in sorted(chars_auto.items())}}, indent=2)
+            json.dumps({"characters": {k: {"blocks": sorted(v)} for k, v in sorted(chars_auto.items())}}, indent=2),
+            encoding="utf-8",
         )
     if stages_auto:
         (map_dir / "stage_index_auto.json").write_text(
-            json.dumps({"stages": {k: {"blocks": sorted(v)} for k, v in sorted(stages_auto.items())}}, indent=2)
+            json.dumps({"stages": {k: {"blocks": sorted(v)} for k, v in sorted(stages_auto.items())}}, indent=2),
+            encoding="utf-8",
         )
     if font_blocks:
         (map_dir / "fonts_index_auto.json").write_text(
-            json.dumps({"blocks": sorted(font_blocks)}, indent=2)
+            json.dumps({"blocks": sorted(font_blocks)}, indent=2),
+            encoding="utf-8",
         )
     if tex_prefix_blocks:
         compact_tex = {
             k: [b for b, _c in sorted(v.items(), key=lambda it: -it[1])[:256]]
             for k, v in sorted(tex_prefix_blocks.items())
         }
-        (map_dir / "stage_prefix_blocks_auto.json").write_text(json.dumps(compact_tex))
+        (map_dir / "stage_prefix_blocks_auto.json").write_text(json.dumps(compact_tex), encoding="utf-8")
     if tex_key_blocks:
         compact_keys = {
             k: [b for b, _c in sorted(v.items(), key=lambda it: -it[1])]
             for k, v in sorted(tex_key_blocks.items())
         }
-        (map_dir / "tex_key_blocks_auto.json").write_text(json.dumps(compact_keys))
+        (map_dir / "tex_key_blocks_auto.json").write_text(json.dumps(compact_keys), encoding="utf-8")
     if tex_noun_blocks:
         compact_nouns = {
             k: [b for b, _c in sorted(v.items(), key=lambda it: -it[1])[:12]]
             for k, v in sorted(tex_noun_blocks.items())
         }
-        (map_dir / "tex_noun_blocks_auto.json").write_text(json.dumps(compact_nouns))
+        (map_dir / "tex_noun_blocks_auto.json").write_text(json.dumps(compact_nouns), encoding="utf-8")
     if tex_pathid:
-        (map_dir / "tex_pathid_auto.json").write_text(json.dumps(tex_pathid))
+        (map_dir / "tex_pathid_auto.json").write_text(json.dumps(tex_pathid), encoding="utf-8")
     blk_owners: dict[str, list] = {}
     for blk_name, pcounts in mesh_pref_counts.items():
         if not pcounts:
@@ -1019,7 +1022,7 @@ def _parse_cli_asset_map(
         tot_cnt = sum(pcounts.values())
         blk_owners[blk_name] = [top_pref, top_cnt, tot_cnt]
     if blk_owners:
-        (map_dir / "stage_blk_owners_auto.json").write_text(json.dumps(blk_owners))
+        (map_dir / "stage_blk_owners_auto.json").write_text(json.dumps(blk_owners), encoding="utf-8")
     if mat_mesh_blocks:
         compact_mm = {}
         for k, v in sorted(mat_mesh_blocks.items()):
@@ -1038,7 +1041,7 @@ def _parse_cli_asset_map(
                     break
             if keep:
                 compact_mm[k] = keep
-        (map_dir / "stage_mat_mesh_blocks_auto.json").write_text(json.dumps(compact_mm))
+        (map_dir / "stage_mat_mesh_blocks_auto.json").write_text(json.dumps(compact_mm), encoding="utf-8")
     _emit(
         log_cb,
         f"Parsed AnimeStudio AssetMap ({entry_count} entries): "
@@ -1064,7 +1067,7 @@ def resolve_material_textures(dest_dir: Path) -> tuple[dict[str, str], list[str]
     if not pid_p.is_file():
         return {}, [], []
     try:
-        pid_map = json.loads(pid_p.read_text())
+        pid_map = json.loads(pid_p.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
         return {}, [], []
 
@@ -1123,7 +1126,7 @@ def load_stage_texture_blocks(stage_name: str) -> tuple[list[str], str]:
     if not p.is_file():
         return [], ""
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
         return [], ""
     clean = re.sub(r"^(?:Stage|Env|Scene|Map)_", "", stage_name)
@@ -1161,7 +1164,7 @@ def load_stage_texture_blocks_for_dir(stage_name: str, stage_dir: Path) -> tuple
     for fp, dst in ((key_p, key_data), (noun_p, noun_data), (pref_p, pref_data)):
         if fp.is_file():
             try:
-                dst.update(json.loads(fp.read_text()))
+                dst.update(json.loads(fp.read_text(encoding="utf-8", errors="ignore")))
             except Exception:
                 pass
 
@@ -1423,6 +1426,8 @@ def extract_nap_res_dat(blk_path: Path, cache_file: Path | None = None) -> bytes
             env=cfg.build_cli_env(),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             **cfg.subprocess_no_window_kwargs(),
         )
         if res.returncode != 0:
@@ -2870,7 +2875,7 @@ def build_asset_map(
     prev_ver = 0
     if manifest_file.is_file():
         try:
-            prev_ver = int(json.loads(manifest_file.read_text()).get("oz_index_version", 0))
+            prev_ver = int(json.loads(manifest_file.read_text(encoding="utf-8", errors="ignore")).get("oz_index_version", 0))
         except Exception:
             prev_ver = 0
     cab_bin = cfg.CLI_DIR / "Maps" / "ZZZ.bin"
@@ -2878,7 +2883,7 @@ def build_asset_map(
     need_cab = not cab_bin.is_file()
     if not need_cab:
         try:
-            cm = json.loads(cab_meta.read_text()) if cab_meta.is_file() else {}
+            cm = json.loads(cab_meta.read_text(encoding="utf-8", errors="ignore")) if cab_meta.is_file() else {}
             if cm.get("version", 0) < 2 or cm.get("files_root") != str(files_root) or cm.get("blk_count") != len(blk_files):
                 need_cab = True
         except Exception:
@@ -3096,11 +3101,13 @@ def build_asset_map(
 
     if not (cfg.EXTRACTOR_ROOT / "data" / "asset_map" / "character_index_lean.json").is_file():
         (map_dir / "character_index_fallback.json").write_text(
-            json.dumps({"characters": chars_fallback}, indent=2)
+            json.dumps({"characters": chars_fallback}, indent=2),
+            encoding="utf-8",
         )
     if not (cfg.EXTRACTOR_ROOT / "data" / "all_maps_inventory.json").is_file():
         (map_dir / "stage_index_fallback.json").write_text(
-            json.dumps({"stages": stages_fallback}, indent=2)
+            json.dumps({"stages": stages_fallback}, indent=2),
+            encoding="utf-8",
         )
 
     was_cancelled = bool(cancel_event is not None and cancel_event.is_set())
@@ -3136,7 +3143,7 @@ def build_asset_map(
         "ran_scripts": ran_scripts,
         "built_at": int(time.time()),
     }
-    (map_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (map_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     invalidate_index_cache()
     cfg.release_os_memory()
     _prog(

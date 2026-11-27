@@ -87,6 +87,13 @@ def export_blk_asset_types(
             shutil.copy2(b, out_dir / b.name)
         _emit(log_cb, f"Copied {len(blks)} raw .blk container(s) -> {out_dir}")
         return 0
+    if not cfg.CLI_EXE.exists() or not cfg.can_run_cli():
+        try:
+            from . import tools
+
+            tools.ensure_extractor_tools(log_cb=log_cb)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] Automatic tool setup attempt finished with note: {exc}")
     if not cfg.CLI_EXE.exists():
         raise FileNotFoundError(f"AnimeStudio.CLI.exe not found at {cfg.CLI_EXE}")
     if not cfg.can_run_cli():
@@ -1427,6 +1434,11 @@ if _is_char_dir and _master_arm is not None and _anim_dir and os.path.isdir(_ani
 
         if _master_arm.animation_data is None:
             _master_arm.animation_data_create()
+        try:
+            bpy.context.scene.render.fps = 60
+            bpy.context.scene.render.fps_base = 1.0
+        except Exception:
+            pass
 
         for _ap in _anim_files:
             try:
@@ -1752,6 +1764,14 @@ def _convert_dir_to_glb(
     anim_dir: Path | None = None,
 ) -> int:
     blender = cfg.find_blender()
+    if not blender:
+        try:
+            from . import tools
+
+            blender = tools.ensure_blender(log_cb=log_cb)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] Blender auto-install skipped: {exc}")
+            blender = None
     if not blender:
         _emit(log_cb, "WARNING: blender not found in PATH; skipping GLB conversion.")
         return 0
@@ -3070,12 +3090,35 @@ def _decode_wav_jobs(wav_jobs: list[tuple[Path, Path]]) -> None:
         proc = subprocess.run(
             [str(cfg.VGMSTREAM_CLI), "-o", str(w_dst), str(w_src)],
             capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             **cfg.subprocess_no_window_kwargs(),
         )
         if proc.returncode == 0 and w_dst.is_file():
             w_src.unlink(missing_ok=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.adaptive_worker_count("audio", max_workers=12)) as pool:
         list(pool.map(_decode_one, wav_jobs))
+
+
+def _ensure_audio_tools(need_map: bool, decode_wav: bool, log_cb=None) -> bool:
+    """Auto-install AnimeWwise nap.map / vgmstream-cli when needed and return effective decode_wav flag."""
+    if need_map and not cfg.NAP_MAP_FILE.is_file():
+        try:
+            from . import tools
+
+            tools.ensure_extractor_tools(log_cb=log_cb, install_wine=False, install_vgmstream=False)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] AnimeWwise auto-fetch note: {exc}")
+    if decode_wav and not cfg.VGMSTREAM_CLI.is_file():
+        try:
+            from . import tools
+
+            tools.ensure_vgmstream(log_cb=log_cb)
+        except Exception as exc:
+            _emit(log_cb, f"[WARN] vgmstream auto-install note: {exc}")
+    if decode_wav and not cfg.VGMSTREAM_CLI.is_file():
+        _emit(log_cb, f"WARNING: vgmstream-cli not found at {cfg.VGMSTREAM_CLI}; keeping .wem files.")
+        return False
+    return decode_wav
 
 
 def export_audio_pck(
@@ -3093,15 +3136,13 @@ def export_audio_pck(
     pcks = [] if is_single_bnk else ([source_path] if source_path.is_file() else sorted(source_path.rglob("*.pck")))
     if not is_single_bnk and not pcks:
         raise FileNotFoundError(f"No .pck files found in {source_path}")
+    decode_wav = _ensure_audio_tools(use_wwise_map, decode_wav, log_cb=log_cb)
     mapper = None
     if use_wwise_map:
         _emit(log_cb, f"Loading AnimeWwise map: {cfg.NAP_MAP_FILE.name}...")
         mapper = load_wwise_mapper()
         if mapper is None:
             _emit(log_cb, "WARNING: nap.map not found; falling back to raw AKPK filenames.")
-    if decode_wav and not cfg.VGMSTREAM_CLI.is_file():
-        _emit(log_cb, f"WARNING: vgmstream-cli not found at {cfg.VGMSTREAM_CLI}; keeping .wem files.")
-        decode_wav = False
 
     out_dir.mkdir(parents=True, exist_ok=True)
     total = 0
@@ -3257,9 +3298,7 @@ def export_audio_entries(
     """Extract a selected list of ``(pck_path, offset, size, rel_dest, is_bnk)`` audio entries."""
     if not entries:
         return 0
-    if decode_wav and not cfg.VGMSTREAM_CLI.is_file():
-        _emit(log_cb, f"WARNING: vgmstream-cli not found at {cfg.VGMSTREAM_CLI}; keeping .wem files.")
-        decode_wav = False
+    decode_wav = _ensure_audio_tools(extract_bnk, decode_wav, log_cb=log_cb)
     out_dir.mkdir(parents=True, exist_ok=True)
     mapper = load_wwise_mapper() if extract_bnk else None
     by_pck: dict[str, list[tuple[int, int, str, bool]]] = {}

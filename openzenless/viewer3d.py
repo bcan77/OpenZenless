@@ -2002,7 +2002,7 @@ class GLBViewport(QOpenGLWidget):
         self._sky_idx_count: int = 0
         self._sky_cloud_high_tid: int = 0
         self._sky_cloud_low_tid: int = 0
-        self.show_skeleton = True
+        self.show_skeleton = False
         self.show_weapons = True
         self.anim_clip: UnityAnimClip | None = None
         self.anim_time: float = 0.0
@@ -4081,7 +4081,7 @@ class NativeViewerWidget(QWidget):
 
         self.btn_skel = QPushButton("Skeleton")
         self.btn_skel.setCheckable(True)
-        self.btn_skel.setChecked(True)
+        self.btn_skel.setChecked(False)
         self.btn_skel.toggled.connect(self._toggle_skeleton)
         anim_bar.addWidget(self.btn_skel)
 
@@ -4241,12 +4241,7 @@ class NativeViewerWidget(QWidget):
 
     def refresh_catalog(self):
         self.tree.clear()
-        roots = [
-            cfg.FINAL_ROOT / "Exports",
-            cfg.FINAL_ROOT / "Characters",
-            cfg.FINAL_ROOT / "Maps_Combined",
-            cfg.FINAL_ROOT,
-        ]
+        roots = cfg.get_export_search_roots()
         from . import catalog as _cat
         from .indexer import load_oz_character_index, load_oz_entities_index, load_oz_map_index
 

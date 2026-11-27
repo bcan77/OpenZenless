@@ -1,5 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 set "HERE=%~dp0"
 if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
 set "DATA_DIR=%LOCALAPPDATA%\OpenZenless"
@@ -85,8 +87,9 @@ rem Probe system Python >= 3.10 while ignoring Microsoft Store WindowsApps shim 
 set "SYS_PY="
 where py >nul 2>&1
 if %errorlevel% equ 0 (
-    py -3 -c "import sys; raise SystemExit(0 if (sys.version_info >= (3, 10) and 'WindowsApps' not in sys.executable) else 1)" >nul 2>&1
-    if !errorlevel! equ 0 set "SYS_PY=py -3"
+    for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable if (sys.version_info >= (3, 10) and 'WindowsApps' not in sys.executable) else '')" 2^>nul`) do (
+        if not defined SYS_PY if exist "%%~fP" set "SYS_PY=%%~fP"
+    )
 )
 if not defined SYS_PY (
     for /f "delims=" %%P in ('where python 2^>nul') do (
@@ -100,7 +103,7 @@ if not defined SYS_PY (
     )
 )
 
-if "%REPAIR_MODE%"=="0" if defined SYS_PY (
+if "%REPAIR_MODE%"=="0" if "%SETUP_ONLY%"=="0" if defined SYS_PY (
     "%SYS_PY%" -c "%PY_CHECK%" >nul 2>&1
     if !errorlevel! equ 0 goto :ready_sys
 )

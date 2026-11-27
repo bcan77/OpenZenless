@@ -66,7 +66,7 @@ def _download_url(
     part = dest.with_name(dest.name + ".part")
     tag = label or dest.name
     _emit(log_cb, f"Downloading {tag}: {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "OpenZenless/0.3"})
+    req = urllib.request.Request(url, headers={"User-Agent": "OpenZenless/0.4"})
     start_t = time.monotonic()
     last_cb_t = 0.0
     last_log_pct = -10
@@ -3286,19 +3286,22 @@ def ensure_adb(log_cb=None, progress_cb=None, cancel_event: threading.Event | No
         _safe_extract_zip(tmp_zip, cfg.TOOLS_DIR, strip_top_dir=False)
         adb_bin = cfg.TOOLS_DIR / "platform-tools" / exe_name
         _chmod_exec(adb_bin)
-        _chmod_exec(cfg.TOOLS_DIR / "platform-tools" / "fastboot")
+        _chmod_exec(cfg.TOOLS_DIR / "platform-tools" / ("fastboot.exe" if cfg.is_windows() else "fastboot"))
         if adb_bin.is_file():
             try:
                 res = subprocess.run(
                     [str(adb_bin), "version"], capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
                     timeout=10, **cfg.subprocess_no_window_kwargs(),
                 )
                 first_ln = (res.stdout or "").strip().splitlines()[0] if res.stdout else ""
                 _emit(log_cb, f"ADB ready: {adb_bin} ({first_ln})")
             except Exception as exc:
                 _emit(log_cb, f"ADB installed at {adb_bin} (version check note: {exc})")
+            cfg._resolve_tool_paths()
             return str(adb_bin)
         _emit(log_cb, "[WARN] ADB archive extracted, but adb executable was not found.")
+        cfg._resolve_tool_paths()
         return cfg.find_adb()
     finally:
         tmp_zip.unlink(missing_ok=True)
@@ -3348,6 +3351,7 @@ def _has_dotnet9_sdk(dotnet_bin: str) -> bool:
     try:
         res = subprocess.run(
             [dotnet_bin, "--list-sdks"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=15, **cfg.subprocess_no_window_kwargs(),
         )
         return any(line.strip().startswith("9.") for line in (res.stdout or "").splitlines())
@@ -3425,6 +3429,7 @@ def ensure_dotnet(log_cb=None, progress_cb=None, cancel_event: threading.Event |
             _emit(log_cb, f"[WARN] .NET 9 installer exited with code {rc}.")
         exe_path = dotnet_dir / exe_name
         _chmod_exec(exe_path)
+        cfg._resolve_tool_paths()
         if exe_path.is_file():
             _emit(log_cb, f".NET 9 SDK ready: {exe_path}")
             return str(exe_path)
@@ -3450,7 +3455,7 @@ def ensure_wine(log_cb=None, progress_cb=None, cancel_event: threading.Event | N
     _emit(log_cb, "Querying latest Kron4ek portable WoW64 Wine release...")
     req = urllib.request.Request(
         "https://api.github.com/repos/Kron4ek/Wine-Builds/releases/latest",
-        headers={"User-Agent": "OpenZenless/0.3"},
+        headers={"User-Agent": "OpenZenless/0.4"},
     )
     with urllib.request.urlopen(req, timeout=20) as resp:
         rel = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -3479,11 +3484,13 @@ def ensure_wine(log_cb=None, progress_cb=None, cancel_event: threading.Event | N
         wine_bin = wine_dir / "bin" / "wine"
         if not wine_bin.is_file():
             wine_bin = wine_dir / "bin" / "wine64"
+        cfg._resolve_tool_paths()
         if wine_bin.is_file():
             try:
                 res = subprocess.run(
                     [str(wine_bin), "--version"], env=cfg.build_cli_env(),
-                    capture_output=True, text=True, timeout=15,
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=15,
                     **cfg.subprocess_no_window_kwargs(),
                 )
                 _emit(log_cb, f"Portable Wine ready: {wine_bin} ({(res.stdout or '').strip()})")
@@ -3510,7 +3517,7 @@ def ensure_blender(log_cb=None, progress_cb=None, cancel_event: threading.Event 
         return None
 
     idx_url = "https://download.blender.org/release/Blender4.2/"
-    req = urllib.request.Request(idx_url, headers={"User-Agent": "OpenZenless/0.3"})
+    req = urllib.request.Request(idx_url, headers={"User-Agent": "OpenZenless/0.4"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         html = resp.read().decode("utf-8", errors="ignore")
 
@@ -3542,6 +3549,7 @@ def ensure_blender(log_cb=None, progress_cb=None, cancel_event: threading.Event 
             _safe_extract_tar(tmp_arch, bl_dir, strip_top_dir=True)
         exe_path = bl_dir / exe_name
         _chmod_exec(exe_path)
+        cfg._resolve_tool_paths()
         if exe_path.is_file():
             _emit(log_cb, f"Blender ready: {exe_path}")
             return str(exe_path)

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 if [ "$#" -lt 2 ]; then
   echo "Usage: bootstrap_env.sh <openzenless.py> <requirements.txt> [args...]" >&2
   exit 2

@@ -74,7 +74,7 @@ def _run_adb(args: list[str], serial: str | None = None, adb: str | None = None,
         cmd.extend(["-s", serial])
     cmd.extend(args)
     return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout,
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         **cfg.subprocess_no_window_kwargs(),
     )
 
@@ -496,6 +496,8 @@ def _stream_adb_cmd(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         **cfg.subprocess_no_window_kwargs(),
     )

@@ -72,6 +72,8 @@ _STDIO_LOG_FH = None
 def ensure_stdio_handles() -> None:
     """Redirect None sys.stdout / sys.stderr (e.g. under Windows pythonw.exe) to a log file."""
     global _STDIO_LOG_FH
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     if sys.stdout is not None and sys.stderr is not None:
         return
     try:
@@ -94,7 +96,7 @@ ensure_stdio_handles()
 def load_user_config() -> dict:
     try:
         if CONFIG_FILE.is_file():
-            return json.loads(CONFIG_FILE.read_text())
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         pass
     return {}
@@ -105,9 +107,57 @@ def save_user_config(cfg: dict):
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         cur = load_user_config()
         cur.update(cfg)
-        CONFIG_FILE.write_text(json.dumps(cur, indent=2))
+        CONFIG_FILE.write_text(json.dumps(cur, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def record_export_dir(path: Path) -> None:
+    """Persist up to 8 recent export destination directories in user config."""
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except Exception:
+        resolved = Path(path).expanduser()
+    target = str(resolved)
+    cur = load_user_config()
+    prev = cur.get("recent_export_dirs")
+    items = [str(p) for p in prev if isinstance(p, str) and p.strip()] if isinstance(prev, list) else []
+    deduped = [target]
+    norm_seen = {os.path.normcase(target)}
+    for item in items:
+        nc = os.path.normcase(item)
+        if nc not in norm_seen:
+            norm_seen.add(nc)
+            deduped.append(item)
+        if len(deduped) >= 8:
+            break
+    save_user_config({"recent_export_dirs": deduped})
+
+
+def get_export_search_roots() -> list[Path]:
+    """Return deduplicated roots to search for exported models (FINAL_ROOT subdirs + recent export dirs)."""
+    base = [
+        FINAL_ROOT / "Exports",
+        FINAL_ROOT / "Characters",
+        FINAL_ROOT / "Maps_Combined",
+        FINAL_ROOT,
+    ]
+    recents = load_user_config().get("recent_export_dirs")
+    if isinstance(recents, list):
+        for item in recents:
+            if isinstance(item, str) and item.strip():
+                base.append(Path(item))
+    out: list[Path] = []
+    seen: set[str] = set()
+    for p in base:
+        try:
+            key = os.path.normcase(str(p.resolve()))
+        except Exception:
+            key = os.path.normcase(str(p))
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
 
 
 def is_auto_cdn_pull_enabled() -> bool:

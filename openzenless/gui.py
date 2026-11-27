@@ -699,6 +699,7 @@ def launch_gui(root_path: Path):
                 return
 
             out = Path(out_text)
+            cfg.record_export_dir(out)
             game_root = self.parent_win.game_root
             convert_glb = self.chk_glb.isChecked()
             export_shaders = self.chk_shaders.isChecked()
@@ -760,6 +761,7 @@ def launch_gui(root_path: Path):
             if rc == 0:
                 self.parent_win.curated_maps = load_curated_map_index()
                 self.parent_win._populate_basic_categories()
+                self.parent_win.viewer_widget.refresh_catalog()
 
         def _on_err(self, msg: str):
             self.btn_run.setEnabled(True)
@@ -2382,6 +2384,9 @@ def launch_gui(root_path: Path):
             self.btn_basic_inspect = QPushButton("Open in Advanced Mode")
             self.btn_basic_inspect.clicked.connect(self._basic_inspect_in_advanced)
             self.btn_basic_inspect.setEnabled(False)
+            self.btn_basic_view3d = QPushButton("View in 3D Viewer")
+            self.btn_basic_view3d.clicked.connect(self._basic_view_in_3d)
+            self.btn_basic_view3d.setVisible(False)
             self.btn_basic_export1 = QPushButton("Export...")
             self.btn_basic_export1.setObjectName("primaryBtn")
             self.btn_basic_export1.clicked.connect(self._basic_export_primary)
@@ -2397,6 +2402,7 @@ def launch_gui(root_path: Path):
             self.chk_basic_bnk.setChecked(True)
             self.chk_basic_bnk.setVisible(False)
             btn_row.addWidget(self.btn_basic_inspect)
+            btn_row.addWidget(self.btn_basic_view3d)
             btn_row.addWidget(self.btn_basic_export1)
             btn_row.addWidget(self.btn_basic_export2)
             btn_row.addWidget(self.btn_basic_export_group)
@@ -2470,7 +2476,7 @@ def launch_gui(root_path: Path):
                 return
             cat = it.data(Qt.UserRole)
             items: list[dict] = []
-            glb_roots = [cfg.FINAL_ROOT]
+            glb_roots = cfg.get_export_search_roots()
             self.basic_kind_combo.blockSignals(True)
             self.basic_kind_combo.clear()
 
@@ -2830,7 +2836,7 @@ def launch_gui(root_path: Path):
                 f_idx = cfg.CACHE_DIR / "asset_map" / "fonts_index_auto.json"
                 if f_idx.is_file():
                     try:
-                        font_blks = json.loads(f_idx.read_text()).get("blocks") or []
+                        font_blks = json.loads(f_idx.read_text(encoding="utf-8", errors="ignore")).get("blocks") or []
                     except Exception:
                         font_blks = []
                 items.append({
@@ -2965,6 +2971,7 @@ def launch_gui(root_path: Path):
             r = self._selected_basic_item()
             if not r:
                 self.btn_basic_inspect.setEnabled(False)
+                self.btn_basic_view3d.setVisible(False)
                 self.btn_basic_export1.setEnabled(False)
                 self.btn_basic_export2.setVisible(False)
                 self.btn_basic_export_group.setVisible(False)
@@ -2978,6 +2985,7 @@ def launch_gui(root_path: Path):
                 bool(r.get("blocks")) or bool(r.get("path")) or bool(r.get("pck_paths")) or cat == "fonts"
             )
             self.btn_basic_inspect.setEnabled(can_inspect)
+            self.btn_basic_view3d.setVisible((not is_folder) and cat in ("characters", "bangboo", "monsters", "npcs", "weapons", "maps"))
             self.btn_basic_export1.setEnabled(not is_folder)
             self.btn_basic_export2.setVisible((not is_folder) and cat in ("characters", "bangboo", "monsters", "npcs"))
             mem_ids = r.get("family_member_ids") or []
@@ -3127,7 +3135,7 @@ def launch_gui(root_path: Path):
                 else:
                     self.open_directory(self.files_root / "Blocks")
 
-        def _run_basic_export(self, title: str, fn):
+        def _run_basic_export(self, title: str, fn) -> int:
             self._release_viewer_before_heavy_task("starting export")
             dlg = QDialog(self)
             dlg.setWindowTitle(title)
@@ -3141,15 +3149,72 @@ def launch_gui(root_path: Path):
             btn_close.setEnabled(False)
             btn_close.clicked.connect(dlg.accept)
             lay.addWidget(btn_close)
+            done_rc = [1]
+
+            def _on_fin(rc: int):
+                done_rc[0] = int(rc)
+                btn_close.setEnabled(True)
+                log.appendPlainText(f"\n[Done rc={rc}]")
+
             w = BatchExportWorker(fn)
             w.log_line.connect(log.appendPlainText)
-            w.finished_rc.connect(lambda rc: (btn_close.setEnabled(True), log.appendPlainText(f"\n[Done rc={rc}]")))
+            w.finished_rc.connect(_on_fin)
             w.failed.connect(lambda err: (btn_close.setEnabled(True), log.appendPlainText(f"\n[ERROR] {err}")))
             self.workers.append(w)
             w.start()
             dlg.exec()
+            self.viewer_widget.refresh_catalog()
             self._refresh_version_badge()
             self._on_basic_item_selected()
+            return int(done_rc[0])
+
+        def _basic_view_in_3d(self):
+            r = self._selected_basic_item()
+            if not r or r.get("is_folder"):
+                return
+            cat = r["cat"]
+            if cat not in ("characters", "bangboo", "monsters", "npcs", "weapons", "maps"):
+                return
+            glb_p = catalog.find_exported_glb(r["id"], cfg.get_export_search_roots())
+            if glb_p is None:
+                out_dir = cfg.FINAL_ROOT / "Exports"
+                cfg.record_export_dir(out_dir)
+                export_shaders = self.chk_basic_shaders.isChecked()
+                if cat in ("characters", "bangboo"):
+                    rc = self._run_basic_export(
+                        f"Exporting {r['name']} for 3D Viewer",
+                        lambda cb: export_character_full(
+                            r["id"], out_dir=out_dir, convert_glb=True, log_cb=cb,
+                            game_root=self.game_root, export_shaders=export_shaders,
+                        ),
+                    )
+                elif cat in ("monsters", "npcs", "weapons"):
+                    ent_cat = r.get("category_src") if cat == "weapons" else cat
+                    rc = self._run_basic_export(
+                        f"Exporting {r['name']} for 3D Viewer",
+                        lambda cb: export_entity_full(
+                            r["id"], category=ent_cat, out_dir=out_dir, convert_glb=True, log_cb=cb,
+                            game_root=self.game_root, export_shaders=export_shaders,
+                        ),
+                    )
+                else:
+                    rc = self._run_basic_export(
+                        f"Exporting Map {r['id']} for 3D Viewer",
+                        lambda cb: export_scene_map(
+                            r["id"], resume=True, workers=cfg.default_worker_count(4),
+                            out_dir=out_dir, log_cb=cb, game_root=self.game_root, export_shaders=export_shaders,
+                        ),
+                    )
+                if rc == 0:
+                    glb_p = catalog.find_exported_glb(r["id"], cfg.get_export_search_roots())
+            if glb_p is not None and glb_p.is_file():
+                self._switch_mode(2)
+                self.viewer_widget.load_model(glb_p)
+            else:
+                QMessageBox.information(
+                    self, "3D Viewer",
+                    f"Could not find an exported .glb for {r['name']}. Ensure Blender is installed so FBX/OBJ converts to GLB.",
+                )
 
         def _basic_export_primary(self):
             r = self._selected_basic_item()
@@ -3160,6 +3225,7 @@ def launch_gui(root_path: Path):
             if not out:
                 return
             out_dir = Path(out)
+            cfg.record_export_dir(out_dir)
             export_shaders = self.chk_basic_shaders.isChecked()
             extract_bnk = self.chk_basic_bnk.isChecked()
             if cat in ("characters", "bangboo"):
@@ -3235,16 +3301,18 @@ def launch_gui(root_path: Path):
             out = QFileDialog.getExistingDirectory(self, "Select Animations Destination", str(cfg.FINAL_ROOT / "Exports"))
             if not out:
                 return
+            out_dir = Path(out)
+            cfg.record_export_dir(out_dir)
             cat = r["cat"]
             if cat in ("characters", "bangboo"):
                 self._run_basic_export(
                     f"Exporting Animations: {r['name']}",
-                    lambda cb: export_character_animations_only(r["id"], self.game_root, Path(out), log_cb=cb),
+                    lambda cb: export_character_animations_only(r["id"], self.game_root, out_dir, log_cb=cb),
                 )
             else:
                 self._run_basic_export(
                     f"Exporting Animations: {r['name']}",
-                    lambda cb: export_entity_animations_only(r["id"], self.game_root, Path(out), category=cat, log_cb=cb),
+                    lambda cb: export_entity_animations_only(r["id"], self.game_root, out_dir, category=cat, log_cb=cb),
                 )
 
         def _basic_export_group(self):
@@ -3257,11 +3325,13 @@ def launch_gui(root_path: Path):
             out = QFileDialog.getExistingDirectory(self, "Select Family Export Destination", str(cfg.FINAL_ROOT / "Exports"))
             if not out:
                 return
+            out_dir = Path(out)
+            cfg.record_export_dir(out_dir)
             export_shaders = self.chk_basic_shaders.isChecked()
             self._run_basic_export(
                 f"Exporting Family: {r['name']} ({len(mem_ids)} members)",
                 lambda cb: export_character_family(
-                    mem_ids, Path(out), convert_glb=True, log_cb=cb,
+                    mem_ids, out_dir, convert_glb=True, log_cb=cb,
                     game_root=self.game_root, export_shaders=export_shaders,
                 ),
             )
@@ -3571,7 +3641,7 @@ def launch_gui(root_path: Path):
                         self.tabs.setCurrentIndex(1)
                 if ext in (".txt", ".json", ".md", ".xml", ".ini", ".cfg", ".log", ".py", ".sh", ".csv", ".yaml", ".yml"):
                     try:
-                        self.props_view.setPlainText(p.read_text(errors="replace")[:200_000])
+                        self.props_view.setPlainText(p.read_text(encoding="utf-8", errors="replace")[:200_000])
                     except Exception as exc:
                         self.props_view.setPlainText(f"Failed to read file: {exc}")
                 else:
@@ -3592,7 +3662,7 @@ def launch_gui(root_path: Path):
                 self._load_hex_chunk(0)
             elif self.current_mode == "blk" and p.is_file():
                 try:
-                    self.props_view.setPlainText(p.read_text(errors="replace")[:200_000])
+                    self.props_view.setPlainText(p.read_text(encoding="utf-8", errors="replace")[:200_000])
                 except Exception as exc:
                     self.props_view.setPlainText(f"Failed to read JSON: {exc}")
                 self.hex_file = p
