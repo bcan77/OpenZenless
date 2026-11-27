@@ -29,7 +29,7 @@
 ---
 
 > [!WARNING]
-> **RELEASE NOTES:** OpenZenless is under (somewhat) active development and may not work out of the box on every system. Native Windows support is not yet verified and the app currently targets **Linux** (with `Wine` for `AnimeStudio.CLI.exe`).
+> **RELEASE NOTES:** OpenZenless is under (somewhat) active development and may not work out of the box on every system. Native Windows support is not yet verified but will be officially supported from version **0.4.0** but the app currently targets **Linux** (with `Wine` for `AnimeStudio.CLI.exe`).
 
 ---
 
