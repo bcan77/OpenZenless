@@ -972,10 +972,28 @@ def load_glb_scene(path: Path) -> GLScene:
             ibm = np.concatenate([ibm, pad], axis=0)
         mats = np.empty((len(joints), 4, 4), dtype=np.float32)
         jb: list[int] = []
+        neutral_slots: list[int] = []
         for k, j in enumerate(joints):
             ji = int(j)
-            jb.append(node_to_bone.get(ji, -1))
+            bi = node_to_bone.get(ji, -1)
+            jb.append(bi)
             mats[k] = _world_of(ji) @ ibm[k]
+            if 0 <= bi < len(bones) and bones[bi].name.lower().startswith("neutral_bone"):
+                neutral_slots.append(k)
+        if neutral_slots:
+            skin_non_neutral = [
+                bi for bi in jb if 0 <= bi < len(bones) and not bones[bi].name.lower().startswith("neutral_bone")
+            ]
+            fallback_bi = next(
+                (bi for bi in skin_non_neutral if bones[bi].name.lower() in ("bip001 head", "bip002 head", "head")),
+                skin_non_neutral[0] if skin_non_neutral else next(
+                    (bi for bi, b in enumerate(bones) if b.name.lower() in ("bip001 head", "bip002 head", "bip001 pelvis")),
+                    -1,
+                ),
+            )
+            if fallback_bi >= 0:
+                for k in neutral_slots:
+                    jb[k] = fallback_bi
         scene_skins.append((jb, mats))
 
     game_mats = _load_game_materials(path.parent)

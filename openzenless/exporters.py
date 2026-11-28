@@ -812,6 +812,17 @@ if _non_proxy:
         if o not in _non_proxy:
             bpy.data.objects.remove(o, do_unlink=True)
 
+if _is_char_dir and _non_proxy:
+    _has_full_hair = any(
+        _re.search(r'(?:^|_)hair(?:\.[0-9]+)?$', o.name.lower())
+        for o in _non_proxy
+    )
+    if _has_full_hair:
+        for o in list(_non_proxy):
+            if '_parthair' in o.name.lower():
+                bpy.data.objects.remove(o, do_unlink=True)
+                _non_proxy.remove(o)
+
 if not _is_char_dir and _non_proxy:
     _seen_geo = set()
     _dup_removed = 0
@@ -907,6 +918,34 @@ if _is_char_dir:
                                 if _g.group == _vg.index:
                                     _dst_vg.add([_v.index], _g.weight, 'ADD')
                         _mo.vertex_groups.remove(_vg)
+            # Ensure no vertices in rigged meshes are completely unweighted (avoids Blender glTF 'neutral_bone')
+            if len(_mo.vertex_groups) > 0 and len(_mo.data.vertices) > 0:
+                _valid_vg_map = {_vg.index: _vg for _vg in _mo.vertex_groups if _vg.name in _master_bone_names}
+                _vg_totals = {}
+                _unweighted = []
+                for _v in _mo.data.vertices:
+                    _wsum = 0.0
+                    for _g in _v.groups:
+                        if _g.group in _valid_vg_map and _g.weight > 0.0:
+                            _wsum += _g.weight
+                            _vg_totals[_g.group] = _vg_totals.get(_g.group, 0.0) + _g.weight
+                    if _wsum < 1e-4:
+                        _unweighted.append(_v.index)
+                if _unweighted:
+                    _ml = _mo.name.lower()
+                    _fbone = None
+                    if any(k in _ml for k in ('face', 'head', 'hair', 'eye', 'teeth', 'mouth', 'brow', 'lash')):
+                        _fbone = next((_bn for _bn in ('Bip001 Head', 'Bip002 Head', 'Head') if _bn in _master_bone_names), None)
+                    if not _fbone and _vg_totals:
+                        _fbone = _valid_vg_map[max(_vg_totals, key=_vg_totals.get)].name
+                    if not _fbone:
+                        _fbone = next((_bn for _bn in ('Bip001 Pelvis', 'Bip001 Spine2', 'Bip001') if _bn in _master_bone_names), None)
+                    if not _fbone and _master_arm.data.bones:
+                        _fbone = _master_arm.data.bones[0].name
+                    if _fbone:
+                        _fvg = _mo.vertex_groups.get(_fbone) or _mo.vertex_groups.new(name=_fbone)
+                        _fvg.add(_unweighted, 1.0, 'REPLACE')
+                        print(f'Bound {len(_unweighted)} unweighted vertices on {_mo.name} -> {_fbone}', flush=True)
             # Deduplicate / retarget ARMATURE modifiers to _master_arm
             _kept_mod = None
             for _mod in list(_mo.modifiers):
