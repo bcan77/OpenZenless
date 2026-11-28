@@ -7,6 +7,9 @@
     <a href="https://github.com/bcan77/OpenZenless/releases">
       <img src="https://img.shields.io/github/v/release/bcan77/OpenZenless?include_prereleases&style=for-the-badge&color=F59E0B&label=Latest%20Build" alt="Latest Build" />
     </a>
+    <a href="https://github.com/bcan77/OpenZenless/releases">
+      <img src="https://img.shields.io/github/downloads/bcan77/OpenZenless/total?style=for-the-badge&color=10B981&label=Downloads" alt="Downloads" />
+    </a>
     <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+" />
     <img src="https://img.shields.io/badge/UI-PySide6%20%2B%20OpenGL%204.6-41CD52?style=for-the-badge&logo=qt&logoColor=white" alt="PySide6 + OpenGL 4.6" />
     <img src="https://img.shields.io/badge/Containers-.blk%20%7C%20.pck%20%7C%20.bnk-38BDF8?style=for-the-badge" alt="Containers" />
